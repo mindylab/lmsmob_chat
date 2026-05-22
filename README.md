@@ -15,16 +15,15 @@ or open the current
 ## Demo
 
 <p align="center">
+  <a href="https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4">Watch the LMSMOB Chat Android demo video</a>
+</p>
+
   _____________________________________________________<video 
     src="https://github.com/user-attachments/assets/2233ddcb-c7a8-4783-b36d-9838fa2aa6b3"
     width="360"
-    controls>DEMO
+    controls style="margin-left: 200px;">DEMO
   </video>
-</p>
 
-<p align="center">
-  <a href="https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4">Watch the LMSMOB Chat Android demo video</a>
-</p>
 
 ## Preview
 
