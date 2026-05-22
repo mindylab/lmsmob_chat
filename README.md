@@ -58,10 +58,18 @@ or open the current
 
 ## Roadmap
 
-The 2026 roadmap focuses on richer MCP and phone-assistant tools, including web
-tool packaging, maps/location tools, cron-style scheduled tasks with
-notifications, and opt-in phone action tools. See
-[docs/roadmap-2026.md](docs/roadmap-2026.md).
+The 2026 roadmap focuses on richer MCP and phone-assistant tools:
+
+- Web tools already work through compatible LM Studio MCP/plugin setup, with a
+  packaged LMS/LM Studio web plugin planned to make setup easier.
+- Maps and phone location tools are planned with explicit Android permission
+  controls.
+- Cron-style scheduled tasks are planned for reminders, notifications, and
+  safe phone actions.
+- Phone assistant tools are planned for opt-in device context and confirmable
+  on-phone actions.
+
+See the full [2026 roadmap](docs/roadmap-2026.md).
 
 ## Quick Setup
 
@@ -187,6 +195,7 @@ Compose AI chat, local server chat app.
 
 ## License
 
-LMSMOB Chat is proprietary software owned by MindyLab MB. Use,
-redistribution, modification, commercialization, or rebranding requires prior
-written permission. See [LICENSE.md](LICENSE.md).
+Official LMSMOB Chat app builds are free for personal, non-commercial use.
+The source code remains proprietary to MindyLab MB. Redistribution,
+modification, commercialization, rebranding, company use, or source-code use
+requires prior written permission. See [LICENSE.md](LICENSE.md).

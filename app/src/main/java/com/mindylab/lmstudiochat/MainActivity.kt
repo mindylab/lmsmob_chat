@@ -3896,7 +3896,11 @@ private fun InfoSheet(onDismiss: () -> Unit) {
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
-                        text = "This software and its source code are proprietary to MindyLab. Use, redistribution, modification, commercialization, or rebranding requires prior written permission.",
+                        text = "Official LMSMOB Chat app builds are free for personal, non-commercial use. The source code, project assets, and brand remain proprietary to MindyLab MB.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Text(
+                        text = "Redistribution, modification, commercialization, rebranding, company use, or source-code use requires prior written permission.",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
