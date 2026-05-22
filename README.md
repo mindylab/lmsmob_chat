@@ -56,6 +56,13 @@ or open the current
 - Supports image attachments for vision-capable models.
 - Includes emulator and physical-device LAN setup paths.
 
+## Roadmap
+
+The 2026 roadmap focuses on richer MCP and phone-assistant tools, including web
+tool packaging, maps/location tools, cron-style scheduled tasks with
+notifications, and opt-in phone action tools. See
+[docs/roadmap-2026.md](docs/roadmap-2026.md).
+
 ## Quick Setup
 
 1. Install the APK from the
