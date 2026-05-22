@@ -14,7 +14,17 @@ or open the current
 
 ## Demo
 
-[Watch the LMSMOB Chat Android demo video](https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4)
+<p align="center">
+  <video
+    src="https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4"
+    width="360"
+    controls>
+  </video>
+</p>
+
+<p align="center">
+  <a href="https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4">Watch the LMSMOB Chat Android demo video</a>
+</p>
 
 ## Preview
 
