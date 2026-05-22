@@ -7,3 +7,7 @@ captures/
 *.apk
 *.aab
 app/build/
+keystore.properties
+*.jks
+*.keystore
+*.p12

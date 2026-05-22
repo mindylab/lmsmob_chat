@@ -3892,15 +3892,15 @@ private fun InfoSheet(onDismiss: () -> Unit) {
                         fontWeight = FontWeight.SemiBold,
                     )
                     Text(
-                        text = "Copyright © 2026 MINDYLAB MB. All rights reserved.",
+                        text = "Copyright (c) 2026 MindyLab MB. All rights reserved.",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
-                        text = "This app is free to use for personal use. Company use, commercial use, redistribution, or commercialization of this app under a different brand requires a separate license from MINDYLAB MB.",
+                        text = "This software and its source code are proprietary to MindyLab. Use, redistribution, modification, commercialization, or rebranding requires prior written permission.",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
-                        text = "For licensing and company-use permission, contact info@mindylab.com.",
+                        text = "For licensing requests or commercial use, contact MindyLab MB info@mindylab.com.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.SemiBold,
