@@ -1,4 +1,4 @@
-# LMSMOB Chat
+# LMSMOB Chat (LM Studio Android App)
 
 [![Release](https://img.shields.io/github/v/release/mindylab/lmsmob_chat?label=latest%20APK)](https://github.com/mindylab/lmsmob_chat/releases/latest)
 [![Android](https://img.shields.io/badge/Android-26%2B-3DDC84?logo=android&logoColor=white)](app/build.gradle.kts)
@@ -16,7 +16,7 @@ or open the current
 
 <p align="center">
   <video
-    src="https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4"
+    src="https://github.com/user-attachments/assets/2233ddcb-c7a8-4783-b36d-9838fa2aa6b3"
     width="360"
     controls>DEMO
   </video>
