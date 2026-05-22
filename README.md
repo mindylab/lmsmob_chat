@@ -18,7 +18,7 @@ or open the current
   <video
     src="https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4"
     width="360"
-    controls>
+    controls>DEMO
   </video>
 </p>
 
