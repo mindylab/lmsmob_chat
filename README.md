@@ -18,11 +18,20 @@ or open the current
   <a href="https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4">Watch the LMSMOB Chat Android demo video</a>
 </p>
 
-  _____________________________________________________<video 
-    src="https://github.com/user-attachments/assets/2233ddcb-c7a8-4783-b36d-9838fa2aa6b3"
-    width="360"
-    controls style="margin-left: 200px;">DEMO
-  </video>
+<div align="center">
+  <table>
+    <tr>
+      <td bgcolor="black" align="center">
+        <video
+          src="https://github.com/user-attachments/assets/2233ddcb-c7a8-4783-b36d-9838fa2aa6b3"
+          width="360"
+          controls>
+          DEMO
+        </video>
+      </td>
+    </tr>
+  </table>
+</div>
 
 
 ## Preview
