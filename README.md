@@ -14,8 +14,8 @@ or open the current
 
 ## Demo
 
-<p align="center" style="padding-left: 121px;">
-  <video
+<p align="center">
+  <video style="padding-left: 121px;"
     src="https://github.com/user-attachments/assets/2233ddcb-c7a8-4783-b36d-9838fa2aa6b3"
     width="360"
     controls>DEMO
