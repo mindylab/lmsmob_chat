@@ -18,6 +18,9 @@ https://github.com/mindylab/lmsmob_chat
 Latest APK:
 https://github.com/mindylab/lmsmob_chat/releases/latest
 
+Demo video:
+https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4
+
 ## Reddit / Discord Post
 
 I built an Android client for LM Studio called LMSMOB Chat.
@@ -41,6 +44,9 @@ https://github.com/mindylab/lmsmob_chat
 
 Release APK:
 https://github.com/mindylab/lmsmob_chat/releases/latest
+
+Demo video:
+https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4
 
 I would appreciate feedback from anyone using LM Studio from Android.
 

@@ -12,6 +12,10 @@ running on your PC and chat with local LLMs over your LAN.
 or open the current
 [v1.16 APK asset](https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob_chat-v1.16-debug.apk).
 
+## Demo
+
+[Watch the LMSMOB Chat Android demo video](https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4)
+
 ## Preview
 
 | Chat | LM Studio settings |
