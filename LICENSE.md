@@ -1,6 +1,6 @@
 # LMSMOB Chat Proprietary License
 
-Copyright (c) 2026 MindyLab.
+Copyright (c) 2026 MindyLab MB.
 
 All rights reserved.
 
@@ -13,4 +13,4 @@ rights, or other intellectual property rights. Any third-party libraries,
 frameworks, SDKs, and tools used by this project remain governed by their
 respective licenses.
 
-For licensing requests or commercial use, contact MindyLab.
+For licensing requests or commercial use, contact MindyLab MB info@mindylab.com.
