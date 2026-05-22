@@ -37,12 +37,6 @@ or open the current
   </table>
 </div>
 
-## Preview
-
-| Chat | LM Studio settings |
-| --- | --- |
-| ![LMSMOB Chat conversation preview](docs/assets/screenshot-chat.svg) | ![LMSMOB Chat settings preview](docs/assets/screenshot-settings.svg) |
-
 ## Features
 
 - Native Android app built with Kotlin and Jetpack Compose.
