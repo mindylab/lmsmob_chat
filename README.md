@@ -25,6 +25,10 @@ or open the current
         <video
           src="https://github.com/user-attachments/assets/2233ddcb-c7a8-4783-b36d-9838fa2aa6b3"
           width="360"
+          autoplay
+          loop
+          muted
+          playsinline
           controls>
           DEMO
         </video>
@@ -32,7 +36,6 @@ or open the current
     </tr>
   </table>
 </div>
-
 
 ## Preview
 
