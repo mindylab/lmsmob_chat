@@ -24,6 +24,20 @@ or open the current
   <table>
     <tr>
       <td bgcolor="black" align="center">
+        New vesion 1.28<br>
+        <video
+          src="[https://github.com/user-attachments/assets/2233ddcb-c7a8-4783-b36d-9838fa2aa6b3](https://github.com/user-attachments/assets/ca5dc8f1-5717-471b-908d-27d3ab2877e2)"
+          width="360"
+          autoplay
+          loop
+          muted
+          playsinline
+          controls>
+          DEMO
+        </video>
+      </td>
+      <td bgcolor="black" align="center">
+        Old vesion 1.26<br>
         <video
           src="https://github.com/user-attachments/assets/2233ddcb-c7a8-4783-b36d-9838fa2aa6b3"
           width="360"
