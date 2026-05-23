@@ -59,6 +59,8 @@ or open the current
 - Works with LM Studio's OpenAI-compatible local server at `/v1`.
 - Supports LM Studio's native `/api/v1/chat` endpoint for server tools.
 - Connects to LM Studio MCP/plugin integrations such as `mcp/local-web`.
+- Tested companion LM Studio tools are published at
+  [mindylab/lm_studio_tools](https://github.com/mindylab/lm_studio_tools).
 - Refreshes loaded LM Studio models from the app settings.
 - Keeps chat sessions locally with search and session switching.
 - Supports copy, edit, delete, and cancel actions in chat.
@@ -83,7 +85,9 @@ The 2026 roadmap now builds on the first phone-assistant tools shipped in
 v1.28:
 
 - Web tools already work through compatible LM Studio MCP/plugin setup, with a
-  packaged LMS/LM Studio web plugin planned to make setup easier.
+  tested local-web MCP server available in
+  [mindylab/lm_studio_tools](https://github.com/mindylab/lm_studio_tools).
+  A packaged LMS/LM Studio web plugin is still planned to make setup easier.
 - Maps route drafts, contact lookup, notification digest, local file search,
   device status, and confirmable phone action drafts are available now.
 - Phone location tools are still planned with explicit Android permission
@@ -127,6 +131,12 @@ http://192.168.1.25:1234/v1
 LM Studio 0.4.0+ can call MCP/plugin tools through its native
 `/api/v1/chat` endpoint. In LMSMOB Chat, open settings, enable
 **Server tools**, and add the LM Studio integration IDs you want to allow.
+
+The tested LM Studio tools repo is
+[mindylab/lm_studio_tools](https://github.com/mindylab/lm_studio_tools). It
+contains the `local-web` MCP server used with LMSMOB Chat, including
+`web_search`, `web_fetch`, `web_page_to_images`, and `web_search_and_fetch`,
+plus ready-to-copy `mcp.json` examples.
 
 Server-side tools require an LM Studio API token. In LM Studio, create a
 permission token from **Developer > Server Settings > Manage Tokens**, then
