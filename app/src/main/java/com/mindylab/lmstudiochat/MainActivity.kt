@@ -1,12 +1,39 @@
 package com.mindylab.lmstudiochat
 
+import android.Manifest
+import android.app.Notification
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.pdf.PdfRenderer
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.os.StatFs
+import android.provider.OpenableColumns
+import android.provider.CalendarContract
+import android.provider.ContactsContract
+import android.provider.DocumentsContract
+import android.provider.Settings
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
 import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -55,16 +82,20 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -85,6 +116,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -103,6 +135,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -130,17 +163,21 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -150,12 +187,38 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.SocketTimeoutException
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
 import java.util.UUID
+import java.util.zip.ZipInputStream
 
 private const val DefaultApiUrl = "http://10.0.2.2:1234/v1"
 private const val DefaultSystemPrompt = "You are a helpful assistant running locally through LM Studio."
 private const val DefaultSystemProfileId = "default"
+private const val MaxDocumentTextChars = 24000
+private const val DefaultContextLength = 8000
+
+private data class IncomingShareIntent(
+    val id: Long,
+    val intent: Intent,
+)
+
+data class NativeToolAction(
+    val id: String = UUID.randomUUID().toString(),
+    val tool: String,
+    val args: JSONObject,
+)
+
+private val NativeActionRegex = Regex(
+    "<lmsmob_action>(.*?)</lmsmob_action>",
+    setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+)
 private val IntegrationPresets = listOf(
     "mcp/local-web",
     "mcp/gemma4-audio-python",
@@ -168,6 +231,9 @@ private val AllowedToolPresets = listOf(
 )
 
 class MainActivity : ComponentActivity() {
+    private val shareIntentIds = AtomicLong()
+    private val shareIntentRequests = MutableStateFlow<IncomingShareIntent?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -176,11 +242,13 @@ class MainActivity : ComponentActivity() {
             this,
             ChatViewModel.factory(applicationContext),
         )[ChatViewModel::class.java]
+        publishShareIntent(intent)
 
         setContent {
             LmStudioChatTheme {
                 val context = LocalContext.current
                 val state by viewModel.uiState.collectAsStateWithLifecycle()
+                val shareIntentRequest by shareIntentRequests.collectAsStateWithLifecycle()
                 val exportLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.CreateDocument("application/json"),
                 ) { uri: Uri? ->
@@ -216,11 +284,84 @@ class MainActivity : ComponentActivity() {
                         runCatching {
                             context.imageUriToAttachment(uri)
                         }.onSuccess { attachment ->
-                            viewModel.attachImage(attachment)
+                            viewModel.attachImages(listOf(attachment))
                         }.onFailure { throwable ->
                             viewModel.showError(throwable.friendlyMessage())
                         }
                     }
+                }
+                var pendingDocumentUri by remember { mutableStateOf<Uri?>(null) }
+                val uiScope = rememberCoroutineScope()
+                val mainHandler = remember { Handler(Looper.getMainLooper()) }
+                var ttsReady by remember { mutableStateOf(false) }
+                var speakingMessageId by remember { mutableStateOf<String?>(null) }
+                val textToSpeech = remember {
+                    TextToSpeech(context.applicationContext) { status ->
+                        mainHandler.post {
+                            ttsReady = status == TextToSpeech.SUCCESS
+                        }
+                    }
+                }
+                DisposableEffect(textToSpeech) {
+                    textToSpeech.setOnUtteranceProgressListener(
+                        object : UtteranceProgressListener() {
+                            override fun onStart(utteranceId: String?) = Unit
+
+                            override fun onDone(utteranceId: String?) {
+                                mainHandler.post {
+                                    if (speakingMessageId == utteranceId) {
+                                        speakingMessageId = null
+                                    }
+                                }
+                            }
+
+                            override fun onError(utteranceId: String?) {
+                                mainHandler.post {
+                                    if (speakingMessageId == utteranceId) {
+                                        speakingMessageId = null
+                                    }
+                                }
+                            }
+                        },
+                    )
+                    onDispose {
+                        textToSpeech.stop()
+                        textToSpeech.shutdown()
+                    }
+                }
+                fun stopSpeaking() {
+                    textToSpeech.stop()
+                    speakingMessageId = null
+                }
+                fun speakAssistantMessage(messageId: String, content: String) {
+                    if (!state.voiceOutputEnabled) return
+                    val text = content.speakableAnswerText()
+                    if (text.isBlank()) return
+                    if (!ttsReady) {
+                        viewModel.showError("Text-to-speech is not ready yet. Try again in a moment.")
+                        return
+                    }
+                    textToSpeech.language = Locale.getDefault()
+                    val result = textToSpeech.speak(
+                        text,
+                        TextToSpeech.QUEUE_FLUSH,
+                        null,
+                        messageId,
+                    )
+                    if (result == TextToSpeech.ERROR) {
+                        speakingMessageId = null
+                        viewModel.showError("Could not start text-to-speech on this device.")
+                    } else {
+                        speakingMessageId = messageId
+                    }
+                }
+                var speechRecognizer by remember { mutableStateOf<SpeechRecognizer?>(null) }
+                var isListening by remember { mutableStateOf(false) }
+                var startListeningAfterPermission by remember { mutableStateOf(false) }
+                val documentLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocument(),
+                ) { uri: Uri? ->
+                    pendingDocumentUri = uri
                 }
                 val cameraLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.TakePicturePreview(),
@@ -229,21 +370,159 @@ class MainActivity : ComponentActivity() {
                         runCatching {
                             bitmap.toAttachment("Camera photo")
                         }.onSuccess { attachment ->
-                            viewModel.attachImage(attachment)
+                            viewModel.attachImages(listOf(attachment))
                         }.onFailure { throwable ->
                             viewModel.showError(throwable.friendlyMessage())
                         }
                     }
                 }
+                val audioPermissionLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestPermission(),
+                ) { granted ->
+                    if (granted) {
+                        startListeningAfterPermission = true
+                    } else {
+                        viewModel.showError("Microphone permission is required for voice input.")
+                    }
+                }
+                fun stopVoiceInput() {
+                    speechRecognizer?.stopListening()
+                    isListening = false
+                }
+                fun startVoiceInput() {
+                    if (!state.voiceInputEnabled) return
+                    if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+                        viewModel.showError("Speech recognition is not available on this device.")
+                        return
+                    }
+                    if (!context.hasRecordAudioPermission()) {
+                        audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        return
+                    }
+                    val recognizer = speechRecognizer
+                        ?: SpeechRecognizer.createSpeechRecognizer(context.applicationContext).also {
+                            speechRecognizer = it
+                        }
+                    recognizer.setRecognitionListener(
+                        object : RecognitionListener {
+                            override fun onReadyForSpeech(params: Bundle?) {
+                                isListening = true
+                            }
+
+                            override fun onBeginningOfSpeech() = Unit
+                            override fun onRmsChanged(rmsdB: Float) = Unit
+                            override fun onBufferReceived(buffer: ByteArray?) = Unit
+                            override fun onEndOfSpeech() {
+                                isListening = false
+                            }
+
+                            override fun onError(error: Int) {
+                                isListening = false
+                                viewModel.showError(error.speechRecognitionMessage())
+                            }
+
+                            override fun onResults(results: Bundle?) {
+                                isListening = false
+                                val text = results
+                                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                    ?.firstOrNull()
+                                    .orEmpty()
+                                if (text.isBlank()) {
+                                    viewModel.showError("I did not catch that. Try voice input again.")
+                                } else {
+                                    viewModel.receiveVoiceText(text)
+                                }
+                            }
+
+                            override fun onPartialResults(partialResults: Bundle?) = Unit
+                            override fun onEvent(eventType: Int, params: Bundle?) = Unit
+                        },
+                    )
+                    recognizer.startListening(
+                        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
+                            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+                        },
+                    )
+                    isListening = true
+                }
+                LaunchedEffect(startListeningAfterPermission) {
+                    if (startListeningAfterPermission) {
+                        startListeningAfterPermission = false
+                        startVoiceInput()
+                    }
+                }
+                DisposableEffect(Unit) {
+                    onDispose {
+                        speechRecognizer?.destroy()
+                    }
+                }
+                var lastAutoSpokenMessageId by remember { mutableStateOf<String?>(null) }
+                LaunchedEffect(
+                    state.messages.lastOrNull()?.id,
+                    state.messages.lastOrNull()?.isStreaming,
+                    state.voiceOutputEnabled,
+                    state.autoReadAnswersEnabled,
+                ) {
+                    val lastMessage = state.messages.lastOrNull()
+                    if (
+                        state.voiceOutputEnabled &&
+                        state.autoReadAnswersEnabled &&
+                        lastMessage != null &&
+                        lastMessage.role == MessageRole.Assistant &&
+                        !lastMessage.isStreaming &&
+                        lastMessage.id != lastAutoSpokenMessageId
+                    ) {
+                        lastAutoSpokenMessageId = lastMessage.id
+                        speakAssistantMessage(lastMessage.id, lastMessage.content)
+                    }
+                }
+                val contactsPermissionLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestPermission(),
+                ) { granted ->
+                    viewModel.updateContactsToolEnabled(granted)
+                    if (!granted) {
+                        viewModel.showError("Contacts permission is required before the contacts lookup tool can be used.")
+                    }
+                }
+                val localFolderLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocumentTree(),
+                ) { uri: Uri? ->
+                    if (uri == null) {
+                        viewModel.updateLocalFileSearchToolEnabled(false)
+                        return@rememberLauncherForActivityResult
+                    }
+                    runCatching {
+                        context.contentResolver.takePersistableUriPermission(
+                            uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                        )
+                    }
+                    viewModel.updateLocalFileSearchTreeUri(uri.toString())
+                    viewModel.updateLocalFileSearchToolEnabled(true)
+                }
+                LaunchedEffect(shareIntentRequest?.id) {
+                    val request = shareIntentRequest ?: return@LaunchedEffect
+                    handleIncomingShareIntent(
+                        context = context,
+                        intent = request.intent,
+                        viewModel = viewModel,
+                        onDocumentShared = { uri -> pendingDocumentUri = uri },
+                    )
+                    shareIntentRequests.value = null
+                }
                 LmStudioApp(
                     state = state,
                     onInputChange = viewModel::updateInput,
                     onSend = viewModel::sendInput,
+                    onCancelSend = viewModel::cancelSending,
                     onSuggestion = viewModel::sendPrompt,
                     onNewChat = viewModel::newChat,
                     onSelectChat = viewModel::selectChat,
                     onChatSearchChange = viewModel::updateChatSearchQuery,
                     onEditMessage = viewModel::editMessage,
+                    onDeleteMessage = viewModel::deleteMessage,
                     onDeleteChat = viewModel::deleteChat,
                     onOpenSettings = viewModel::openSettings,
                     onCloseSettings = viewModel::closeSettings,
@@ -255,22 +534,150 @@ class MainActivity : ComponentActivity() {
                     onServerToolsEnabledChange = viewModel::updateServerToolsEnabled,
                     onServerIntegrationsChange = viewModel::updateServerIntegrations,
                     onAllowedToolsChange = viewModel::updateAllowedTools,
+                    onNativeIntentToolEnabledChange = viewModel::updateNativeIntentToolEnabled,
+                    onCalendarToolEnabledChange = viewModel::updateCalendarToolEnabled,
+                    onContactsToolEnabledChange = { enabled ->
+                        if (!enabled) {
+                            viewModel.updateContactsToolEnabled(false)
+                        } else if (context.hasContactsPermission()) {
+                            viewModel.updateContactsToolEnabled(true)
+                        } else {
+                            contactsPermissionLauncher.launch(Manifest.permission.READ_CONTACTS)
+                        }
+                    },
+                    onNotificationDigestToolEnabledChange = { enabled ->
+                        viewModel.updateNotificationDigestToolEnabled(enabled)
+                        if (enabled) {
+                            context.openNotificationListenerSettings(viewModel)
+                        }
+                    },
+                    onLocalFileSearchToolEnabledChange = { enabled ->
+                        if (enabled) {
+                            localFolderLauncher.launch(null)
+                        } else {
+                            viewModel.updateLocalFileSearchToolEnabled(false)
+                        }
+                    },
+                    onPickLocalSearchFolder = { localFolderLauncher.launch(null) },
+                    onDeviceStatusToolEnabledChange = viewModel::updateDeviceStatusToolEnabled,
+                    onVoiceInputEnabledChange = viewModel::updateVoiceInputEnabled,
+                    onVoiceOutputEnabledChange = viewModel::updateVoiceOutputEnabled,
+                    onAutoReadAnswersEnabledChange = viewModel::updateAutoReadAnswersEnabled,
+                    onAppendDateTimeToSystemPromptChange = viewModel::updateAppendDateTimeToSystemPrompt,
                     onSystemProfileSelect = viewModel::selectSystemProfile,
                     onSystemProfileNameChange = viewModel::updateSystemProfileNameDraft,
                     onSystemPromptChange = viewModel::updateSystemPromptDraft,
+                    onTemperatureChange = viewModel::updateTemperature,
+                    onTopPChange = viewModel::updateTopP,
+                    onMaxTokensChange = viewModel::updateMaxTokens,
+                    onContextLengthChange = viewModel::updateContextLength,
+                    onPresencePenaltyChange = viewModel::updatePresencePenalty,
+                    onFrequencyPenaltyChange = viewModel::updateFrequencyPenalty,
+                    onSeedChange = viewModel::updateSeed,
                     onSystemProfileSave = viewModel::saveSystemProfile,
                     onSystemProfileCreate = viewModel::createSystemProfile,
                     onSystemProfileDelete = viewModel::deleteSystemProfile,
                     onReasoningEnabledChange = viewModel::updateReasoningEnabled,
                     onPickImage = { imageLauncher.launch("image/*") },
                     onTakePhoto = { cameraLauncher.launch(null) },
-                    onClearImage = viewModel::clearAttachedImage,
+                    onPickDocument = {
+                        documentLauncher.launch(
+                            arrayOf(
+                                "application/pdf",
+                                "application/msword",
+                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                "application/vnd.ms-excel",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            ),
+                        )
+                    },
+                    onVoiceInput = {
+                        if (isListening) {
+                            stopVoiceInput()
+                        } else {
+                            startVoiceInput()
+                        }
+                    },
+                    isListening = isListening,
+                    onSpeakMessage = ::speakAssistantMessage,
+                    onStopSpeaking = ::stopSpeaking,
+                    speakingMessageId = speakingMessageId,
+                    onClearImage = viewModel::clearAttachments,
                     onRefreshModels = { viewModel.refreshModels(silent = false) },
                     onExportChats = { exportLauncher.launch("lm-studio-chat-history.json") },
                     onImportChats = { importLauncher.launch(arrayOf("application/json", "text/*", "*/*")) },
                     onDismissError = viewModel::dismissError,
                 )
+                val documentUri = pendingDocumentUri
+                if (documentUri != null) {
+                    DocumentConversionDialog(
+                        canConvertToPlainText = !context.isPdfDocument(documentUri),
+                        canConvertToImages = state.selectedModelSupportsVision(),
+                        onDismiss = { pendingDocumentUri = null },
+                        onPlainText = {
+                            pendingDocumentUri = null
+                            uiScope.launch {
+                                runCatching {
+                                    withContext(Dispatchers.IO) {
+                                        context.documentUriToPlainText(documentUri)
+                                    }
+                                }.onSuccess { document ->
+                                    viewModel.attachDocumentText(document)
+                                }.onFailure { throwable ->
+                                    viewModel.showError(throwable.friendlyMessage())
+                                }
+                            }
+                        },
+                        onImages = {
+                            pendingDocumentUri = null
+                            uiScope.launch {
+                                runCatching {
+                                    withContext(Dispatchers.IO) {
+                                        context.documentUriToImageAttachments(documentUri)
+                                    }
+                                }.onSuccess { attachments ->
+                                    viewModel.attachImages(attachments)
+                                }.onFailure { throwable ->
+                                    viewModel.showError(throwable.friendlyMessage())
+                                }
+                            }
+                        },
+                    )
+                }
+                val nativeToolAction = state.pendingNativeToolAction
+                if (nativeToolAction != null) {
+                    NativeToolActionDialog(
+                        action = nativeToolAction,
+                        onDismiss = { viewModel.setPendingNativeToolAction(null) },
+                        onConfirm = {
+                            viewModel.setPendingNativeToolAction(null)
+                            uiScope.launch {
+                                executeNativeToolAction(
+                                    context = context,
+                                    state = state,
+                                    action = nativeToolAction,
+                                    viewModel = viewModel,
+                                )
+                            }
+                        },
+                    )
+                }
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        publishShareIntent(intent)
+    }
+
+    private fun publishShareIntent(intent: Intent?) {
+        if (intent?.isSupportedShareAction() == true) {
+            shareIntentRequests.value = IncomingShareIntent(
+                id = shareIntentIds.incrementAndGet(),
+                intent = Intent(intent),
+            )
         }
     }
 }
@@ -294,6 +701,12 @@ data class ChatImageAttachment(
     val mimeType: String = "image/jpeg",
 )
 
+data class ChatDocumentAttachment(
+    val name: String,
+    val text: String,
+    val mimeType: String = "text/plain",
+)
+
 data class ChatSession(
     val id: String = UUID.randomUUID().toString(),
     val title: String = "New chat",
@@ -307,6 +720,16 @@ data class SystemPromptProfile(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
     val prompt: String,
+)
+
+data class GenerationSettings(
+    val temperature: Double? = 0.7,
+    val topP: Double? = null,
+    val maxTokens: Int? = null,
+    val contextLength: Int? = null,
+    val presencePenalty: Double? = null,
+    val frequencyPenalty: Double? = null,
+    val seed: Int? = null,
 )
 
 data class ChatUiState(
@@ -325,6 +748,17 @@ data class ChatUiState(
     val serverToolsEnabled: Boolean = false,
     val serverIntegrations: String = "",
     val allowedTools: String = "",
+    val nativeIntentToolEnabled: Boolean = false,
+    val calendarToolEnabled: Boolean = false,
+    val contactsToolEnabled: Boolean = false,
+    val notificationDigestToolEnabled: Boolean = false,
+    val localFileSearchToolEnabled: Boolean = false,
+    val localFileSearchTreeUri: String = "",
+    val deviceStatusToolEnabled: Boolean = false,
+    val voiceInputEnabled: Boolean = false,
+    val voiceOutputEnabled: Boolean = false,
+    val autoReadAnswersEnabled: Boolean = false,
+    val appendDateTimeToSystemPrompt: Boolean = false,
     val systemProfiles: List<SystemPromptProfile> = listOf(
         SystemPromptProfile(
             id = DefaultSystemProfileId,
@@ -335,11 +769,20 @@ data class ChatUiState(
     val activeSystemProfileId: String = DefaultSystemProfileId,
     val systemProfileNameDraft: String = "Default",
     val systemPromptDraft: String = DefaultSystemPrompt,
-    val attachedImage: ChatImageAttachment? = null,
+    val temperatureDraft: String = "0.7",
+    val topPDraft: String = "",
+    val maxTokensDraft: String = "",
+    val contextLengthDraft: String = "",
+    val presencePenaltyDraft: String = "",
+    val frequencyPenaltyDraft: String = "",
+    val seedDraft: String = "",
+    val attachedImages: List<ChatImageAttachment> = emptyList(),
+    val attachedDocumentText: ChatDocumentAttachment? = null,
     val reasoningEnabled: Boolean = true,
     val previousResponseId: String? = null,
     val isSettingsOpen: Boolean = false,
     val isInfoOpen: Boolean = false,
+    val pendingNativeToolAction: NativeToolAction? = null,
     val error: String? = null,
     val modelLoadError: String? = null,
 )
@@ -347,14 +790,25 @@ data class ChatUiState(
 data class ModelInfo(
     val id: String,
     val supportsVision: Boolean = false,
+    val contextLength: Int? = null,
     val reasoningOptions: List<String> = emptyList(),
     val defaultReasoning: String = "",
+)
+
+private data class ContextUsage(
+    val usedTokens: Int,
+    val availableTokens: Int,
+    val fraction: Float,
 )
 
 class ChatViewModel(
     private val settingsStore: SettingsStore,
     private val client: LmStudioClient,
 ) : ViewModel() {
+    private var currentSendJob: Job? = null
+    @Volatile
+    private var stopRequested = false
+
     private val initialSessions = settingsStore.loadChatSessions().ifEmpty { listOf(ChatSession()) }
     private val initialActiveSession = initialSessions.firstOrNull { it.id == settingsStore.activeSessionId }
         ?: initialSessions.first()
@@ -374,6 +828,24 @@ class ChatViewModel(
             serverToolsEnabled = settingsStore.serverToolsEnabled,
             serverIntegrations = settingsStore.serverIntegrations,
             allowedTools = settingsStore.allowedTools,
+            nativeIntentToolEnabled = settingsStore.nativeIntentToolEnabled,
+            calendarToolEnabled = settingsStore.calendarToolEnabled,
+            contactsToolEnabled = settingsStore.contactsToolEnabled,
+            notificationDigestToolEnabled = settingsStore.notificationDigestToolEnabled,
+            localFileSearchToolEnabled = settingsStore.localFileSearchToolEnabled,
+            localFileSearchTreeUri = settingsStore.localFileSearchTreeUri,
+            deviceStatusToolEnabled = settingsStore.deviceStatusToolEnabled,
+            voiceInputEnabled = settingsStore.voiceInputEnabled,
+            voiceOutputEnabled = settingsStore.voiceOutputEnabled,
+            autoReadAnswersEnabled = settingsStore.autoReadAnswersEnabled,
+            appendDateTimeToSystemPrompt = settingsStore.appendDateTimeToSystemPrompt,
+            temperatureDraft = settingsStore.temperature,
+            topPDraft = settingsStore.topP,
+            maxTokensDraft = settingsStore.maxTokens,
+            contextLengthDraft = settingsStore.contextLength,
+            presencePenaltyDraft = settingsStore.presencePenalty,
+            frequencyPenaltyDraft = settingsStore.frequencyPenalty,
+            seedDraft = settingsStore.seed,
             systemProfiles = initialProfiles,
             activeSystemProfileId = initialActiveProfile.id,
             systemProfileNameDraft = initialActiveProfile.name,
@@ -393,6 +865,20 @@ class ChatViewModel(
 
     fun updateInput(value: String) {
         _uiState.update { it.copy(input = value) }
+    }
+
+    fun receiveSharedText(value: String) {
+        val text = value.trim()
+        if (text.isBlank()) return
+        _uiState.update { current ->
+            val mergedInput = listOf(current.input.trim(), text)
+                .filter { it.isNotBlank() }
+                .joinToString("\n\n")
+            current.copy(
+                input = mergedInput,
+                error = null,
+            )
+        }
     }
 
     fun updateChatSearchQuery(value: String) {
@@ -417,15 +903,57 @@ class ChatViewModel(
         sendPrompt(_uiState.value.input)
     }
 
+    fun cancelSending() {
+        if (!_uiState.value.isSending) return
+        stopRequested = true
+        client.cancelActiveChat()
+        currentSendJob?.cancel()
+        markCurrentResponseStopped()
+    }
+
+    private fun markCurrentResponseStopped() {
+        _uiState.update { current ->
+            val now = System.currentTimeMillis()
+            val responseSessions = current.sessions.map { session ->
+                if (session.id == current.activeSessionId) {
+                    session.copy(
+                        messages = session.messages.map { message ->
+                            if (message.isStreaming) {
+                                message.copy(
+                                    content = message.content.ifBlank { "Request stopped." },
+                                    isStreaming = false,
+                                )
+                            } else {
+                                message
+                            }
+                        },
+                        updatedAt = now,
+                    )
+                } else {
+                    session
+                }
+            }.sortedByDescending { it.updatedAt }
+            settingsStore.saveChatSessions(responseSessions)
+            val activeSessionNow = responseSessions.firstOrNull { it.id == current.activeSessionId }
+            current.copy(
+                sessions = responseSessions,
+                messages = activeSessionNow?.messages ?: current.messages,
+                isSending = false,
+                error = null,
+            )
+        }
+    }
+
     fun sendPrompt(prompt: String) {
         val trimmedPrompt = prompt.trim()
         val state = _uiState.value
-        val attachedImage = state.attachedImage
-        if ((trimmedPrompt.isBlank() && attachedImage == null) || state.isSending) return
+        val attachedImages = state.attachedImages
+        val attachedDocument = state.attachedDocumentText
+        if ((trimmedPrompt.isBlank() && attachedImages.isEmpty() && attachedDocument == null) || state.isSending) return
 
-        if (attachedImage != null && !state.selectedModelSupportsVision()) {
+        if (attachedImages.isNotEmpty() && !state.selectedModelSupportsVision()) {
             _uiState.update {
-                it.copy(error = "The selected model does not report vision support. Pick a vision model, then attach the image again.")
+                it.copy(error = "The selected model does not report vision support. Pick a vision model, then attach images again.")
             }
             return
         }
@@ -444,17 +972,40 @@ class ChatViewModel(
             return
         }
 
-        val userPrompt = trimmedPrompt.ifBlank { "Please describe this image." }
+        val userPrompt = trimmedPrompt.ifBlank {
+            when {
+                attachedDocument != null && attachedImages.isEmpty() -> "Please summarize this document."
+                attachedImages.isNotEmpty() -> "Please describe this image."
+                else -> ""
+            }
+        }
+        val requestPrompt = buildString {
+            append(userPrompt)
+            if (attachedDocument != null) {
+                append("\n\n[Document: ")
+                append(attachedDocument.name)
+                append("]\n")
+                append(attachedDocument.text)
+            }
+        }
         val userMessage = ChatMessage(
             role = MessageRole.User,
-            content = userPrompt,
-            attachments = listOfNotNull(attachedImage),
+            content = requestPrompt,
+            attachments = attachedImages + listOfNotNull(
+                attachedDocument?.let {
+                    ChatImageAttachment(
+                        dataUrl = "",
+                        label = it.name,
+                        mimeType = it.mimeType,
+                    )
+                },
+            ),
         )
         val activeSessionId = state.activeSessionId
         val activeSession = state.sessions.firstOrNull { it.id == activeSessionId } ?: ChatSession(id = activeSessionId)
         val requestMessages = activeSession.messages + userMessage
         val reasoning = state.reasoningRequestValue()
-        val useNativeChat = state.serverToolsEnabled || attachedImage != null || reasoning != null
+        val useNativeChat = state.serverToolsEnabled || attachedImages.isNotEmpty() || reasoning != null
         val assistantPlaceholder = if (useNativeChat) {
             ChatMessage(role = MessageRole.Assistant, content = "", isStreaming = true)
         } else {
@@ -478,8 +1029,10 @@ class ChatViewModel(
         val serverIntegrations = state.serverIntegrations
         val allowedTools = state.allowedTools
         val previousResponseId = activeSession.previousResponseId
-        val promptAttachments = listOfNotNull(attachedImage)
+        val promptAttachments = attachedImages
         val systemPrompt = state.activeSystemPrompt()
+        val generationSettings = state.generationSettings()
+        stopRequested = false
 
         settingsStore.saveChatSessions(updatedSessions)
         _uiState.update {
@@ -487,14 +1040,16 @@ class ChatViewModel(
                 sessions = updatedSessions,
                 messages = visibleMessages,
                 input = "",
-                attachedImage = null,
+                attachedImages = emptyList(),
+                attachedDocumentText = null,
                 isSending = true,
                 error = null,
             )
         }
 
-        viewModelScope.launch {
-            if (useNativeChat && assistantPlaceholder != null) {
+        currentSendJob = viewModelScope.launch {
+            try {
+                if (useNativeChat && assistantPlaceholder != null) {
                 val toolCalls = mutableListOf<String>()
                 val toolErrors = mutableListOf<String>()
                 val reasoningBuffer = StringBuilder()
@@ -546,6 +1101,11 @@ class ChatViewModel(
                             isSending = isStreaming,
                             previousResponseId = activeSessionNow?.previousResponseId ?: current.previousResponseId,
                             model = answer?.modelId ?: current.model,
+                            pendingNativeToolAction = if (!isStreaming && answer != null) {
+                                answer.content.extractNativeToolAction(current)
+                            } else {
+                                current.pendingNativeToolAction
+                            },
                         )
                     }
                 }
@@ -577,13 +1137,14 @@ class ChatViewModel(
                     apiUrl = apiUrl,
                     model = model,
                     apiToken = apiToken,
-                    prompt = userPrompt,
+                    prompt = requestPrompt,
                     attachments = promptAttachments,
                     systemPrompt = systemPrompt,
                     previousResponseId = previousResponseId,
                     integrations = if (serverToolsEnabled) serverIntegrations else "",
                     allowedTools = allowedTools,
                     reasoning = reasoning,
+                    generationSettings = generationSettings,
                 ) { event ->
                     when (event.type) {
                         ChatStreamEventType.MessageDelta -> {
@@ -628,58 +1189,71 @@ class ChatViewModel(
                             persist = true,
                         )
                     },
-                    onFailure = { throwable ->
-                        removeAssistantWithError(throwable)
-                    },
-                )
-            } else {
-                val result = client.sendChatCompletions(
+                        onFailure = { throwable ->
+                            if (stopRequested || throwable.isChatCancellation()) {
+                                markCurrentResponseStopped()
+                            } else {
+                                removeAssistantWithError(throwable)
+                            }
+                        },
+                    )
+                } else {
+                    val result = client.sendChatCompletions(
                     apiUrl = apiUrl,
                     model = model,
                     apiToken = apiToken,
                     messages = requestMessages,
                     systemPrompt = systemPrompt,
+                    generationSettings = generationSettings,
                 )
 
-                _uiState.update { current ->
-                    result.fold(
-                        onSuccess = { answer ->
-                            if (!answer.modelId.isNullOrBlank()) {
-                                settingsStore.model = answer.modelId
-                            }
-                            val assistantMessage = ChatMessage(
-                                role = MessageRole.Assistant,
-                                content = answer.content,
-                            )
-                            val responseSessions = current.sessions.map { session ->
-                                if (session.id == activeSessionId) {
-                                    session.copy(
-                                        messages = session.messages + assistantMessage,
-                                        previousResponseId = answer.responseId ?: session.previousResponseId,
-                                        updatedAt = System.currentTimeMillis(),
+                    if (result.exceptionOrNull()?.let { stopRequested || it.isChatCancellation() } == true) {
+                        markCurrentResponseStopped()
+                    } else {
+                        _uiState.update { current ->
+                            result.fold(
+                                onSuccess = { answer ->
+                                    if (!answer.modelId.isNullOrBlank()) {
+                                        settingsStore.model = answer.modelId
+                                    }
+                                    val assistantMessage = ChatMessage(
+                                        role = MessageRole.Assistant,
+                                        content = answer.content,
                                     )
-                                } else {
-                                    session
-                                }
-                            }
-                            settingsStore.saveChatSessions(responseSessions)
-                            val activeSessionNow = responseSessions.firstOrNull { it.id == current.activeSessionId }
-                            current.copy(
-                                sessions = responseSessions,
-                                messages = activeSessionNow?.messages ?: current.messages,
-                                isSending = false,
-                                previousResponseId = activeSessionNow?.previousResponseId ?: current.previousResponseId,
-                                model = answer.modelId ?: current.model,
+                                    val responseSessions = current.sessions.map { session ->
+                                        if (session.id == activeSessionId) {
+                                            session.copy(
+                                                messages = session.messages + assistantMessage,
+                                                previousResponseId = answer.responseId ?: session.previousResponseId,
+                                                updatedAt = System.currentTimeMillis(),
+                                            )
+                                        } else {
+                                            session
+                                        }
+                                    }
+                                    settingsStore.saveChatSessions(responseSessions)
+                                    val activeSessionNow = responseSessions.firstOrNull { it.id == current.activeSessionId }
+                                    current.copy(
+                                        sessions = responseSessions,
+                                        messages = activeSessionNow?.messages ?: current.messages,
+                                        isSending = false,
+                                        previousResponseId = activeSessionNow?.previousResponseId ?: current.previousResponseId,
+                                        model = answer.modelId ?: current.model,
+                                        pendingNativeToolAction = answer.content.extractNativeToolAction(current),
+                                    )
+                                },
+                                onFailure = { throwable ->
+                                    current.copy(
+                                        isSending = false,
+                                        error = throwable.friendlyMessage(),
+                                    )
+                                },
                             )
-                        },
-                        onFailure = { throwable ->
-                            current.copy(
-                                isSending = false,
-                                error = throwable.friendlyMessage(),
-                            )
-                        },
-                    )
+                        }
+                    }
                 }
+            } finally {
+                currentSendJob = null
             }
         }
     }
@@ -721,6 +1295,49 @@ class ChatViewModel(
                 messages = activeSession.messages,
                 input = "",
                 previousResponseId = activeSession.previousResponseId,
+                error = null,
+            )
+        }
+    }
+
+    fun deleteMessage(messageId: String) {
+        val state = _uiState.value
+        val activeSession = state.sessions.firstOrNull { it.id == state.activeSessionId } ?: return
+        val message = activeSession.messages.firstOrNull { it.id == messageId } ?: return
+        if (message.isStreaming) return
+
+        val remainingMessages = activeSession.messages.filterNot { it.id == messageId }
+        val updatedSession = activeSession.copy(
+            title = remainingMessages.firstOrNull { it.role == MessageRole.User }?.content?.toChatTitle()
+                ?: "New chat",
+            messages = remainingMessages,
+            previousResponseId = null,
+            updatedAt = System.currentTimeMillis(),
+        )
+        val sessions = state.sessions.replaceSession(updatedSession)
+        settingsStore.saveChatSessions(sessions)
+        _uiState.update {
+            it.copy(
+                sessions = sessions,
+                messages = updatedSession.messages,
+                previousResponseId = null,
+                pendingNativeToolAction = null,
+                error = null,
+            )
+        }
+    }
+
+    fun receiveVoiceText(value: String) {
+        val text = value.trim()
+        if (text.isBlank()) return
+        _uiState.update { current ->
+            val mergedInput = if (current.input.isBlank()) {
+                text
+            } else {
+                "${current.input.trimEnd()} $text"
+            }
+            current.copy(
+                input = mergedInput,
                 error = null,
             )
         }
@@ -828,6 +1445,65 @@ class ChatViewModel(
         }
     }
 
+    fun updateNativeIntentToolEnabled(value: Boolean) {
+        settingsStore.nativeIntentToolEnabled = value
+        _uiState.update { it.copy(nativeIntentToolEnabled = value, previousResponseId = null) }
+    }
+
+    fun updateCalendarToolEnabled(value: Boolean) {
+        settingsStore.calendarToolEnabled = value
+        _uiState.update { it.copy(calendarToolEnabled = value, previousResponseId = null) }
+    }
+
+    fun updateContactsToolEnabled(value: Boolean) {
+        settingsStore.contactsToolEnabled = value
+        _uiState.update { it.copy(contactsToolEnabled = value, previousResponseId = null) }
+    }
+
+    fun updateNotificationDigestToolEnabled(value: Boolean) {
+        settingsStore.notificationDigestToolEnabled = value
+        _uiState.update { it.copy(notificationDigestToolEnabled = value, previousResponseId = null) }
+    }
+
+    fun updateLocalFileSearchToolEnabled(value: Boolean) {
+        settingsStore.localFileSearchToolEnabled = value
+        _uiState.update { it.copy(localFileSearchToolEnabled = value, previousResponseId = null) }
+    }
+
+    fun updateLocalFileSearchTreeUri(value: String) {
+        settingsStore.localFileSearchTreeUri = value
+        _uiState.update { it.copy(localFileSearchTreeUri = value, previousResponseId = null) }
+    }
+
+    fun updateDeviceStatusToolEnabled(value: Boolean) {
+        settingsStore.deviceStatusToolEnabled = value
+        _uiState.update { it.copy(deviceStatusToolEnabled = value, previousResponseId = null) }
+    }
+
+    fun updateVoiceInputEnabled(value: Boolean) {
+        settingsStore.voiceInputEnabled = value
+        _uiState.update { it.copy(voiceInputEnabled = value) }
+    }
+
+    fun updateVoiceOutputEnabled(value: Boolean) {
+        settingsStore.voiceOutputEnabled = value
+        _uiState.update { it.copy(voiceOutputEnabled = value) }
+    }
+
+    fun updateAutoReadAnswersEnabled(value: Boolean) {
+        settingsStore.autoReadAnswersEnabled = value
+        _uiState.update { it.copy(autoReadAnswersEnabled = value) }
+    }
+
+    fun updateAppendDateTimeToSystemPrompt(value: Boolean) {
+        settingsStore.appendDateTimeToSystemPrompt = value
+        _uiState.update { it.copy(appendDateTimeToSystemPrompt = value, previousResponseId = null) }
+    }
+
+    fun setPendingNativeToolAction(action: NativeToolAction?) {
+        _uiState.update { it.copy(pendingNativeToolAction = action) }
+    }
+
     fun selectSystemProfile(profileId: String) {
         val profile = _uiState.value.systemProfiles.firstOrNull { it.id == profileId } ?: return
         settingsStore.activeSystemProfileId = profile.id
@@ -846,6 +1522,41 @@ class ChatViewModel(
 
     fun updateSystemPromptDraft(value: String) {
         _uiState.update { it.copy(systemPromptDraft = value) }
+    }
+
+    fun updateTemperature(value: String) {
+        settingsStore.temperature = value
+        _uiState.update { it.copy(temperatureDraft = value, previousResponseId = null) }
+    }
+
+    fun updateTopP(value: String) {
+        settingsStore.topP = value
+        _uiState.update { it.copy(topPDraft = value, previousResponseId = null) }
+    }
+
+    fun updateMaxTokens(value: String) {
+        settingsStore.maxTokens = value
+        _uiState.update { it.copy(maxTokensDraft = value, previousResponseId = null) }
+    }
+
+    fun updateContextLength(value: String) {
+        settingsStore.contextLength = value
+        _uiState.update { it.copy(contextLengthDraft = value, previousResponseId = null) }
+    }
+
+    fun updatePresencePenalty(value: String) {
+        settingsStore.presencePenalty = value
+        _uiState.update { it.copy(presencePenaltyDraft = value, previousResponseId = null) }
+    }
+
+    fun updateFrequencyPenalty(value: String) {
+        settingsStore.frequencyPenalty = value
+        _uiState.update { it.copy(frequencyPenaltyDraft = value, previousResponseId = null) }
+    }
+
+    fun updateSeed(value: String) {
+        settingsStore.seed = value
+        _uiState.update { it.copy(seedDraft = value, previousResponseId = null) }
     }
 
     fun saveSystemProfile() {
@@ -922,18 +1633,34 @@ class ChatViewModel(
         _uiState.update { it.copy(reasoningEnabled = value) }
     }
 
-    fun attachImage(attachment: ChatImageAttachment) {
+    fun attachImages(attachments: List<ChatImageAttachment>) {
+        if (attachments.isEmpty()) return
         _uiState.update {
             if (it.selectedModelSupportsVision()) {
-                it.copy(attachedImage = attachment, error = null)
+                it.copy(attachedImages = attachments, attachedDocumentText = null, error = null)
             } else {
                 it.copy(error = "The selected model does not report vision support. Pick a vision model first.")
             }
         }
     }
 
-    fun clearAttachedImage() {
-        _uiState.update { it.copy(attachedImage = null) }
+    fun attachDocumentText(document: ChatDocumentAttachment) {
+        _uiState.update {
+            it.copy(
+                attachedDocumentText = document,
+                attachedImages = emptyList(),
+                error = null,
+            )
+        }
+    }
+
+    fun clearAttachments() {
+        _uiState.update {
+            it.copy(
+                attachedImages = emptyList(),
+                attachedDocumentText = null,
+            )
+        }
     }
 
     fun refreshModels(silent: Boolean) {
@@ -969,9 +1696,9 @@ class ChatViewModel(
                             availableModels = models,
                             availableModelInfos = modelInfos,
                             model = selectedModel,
-                            attachedImage = current.attachedImage.takeIf {
+                            attachedImages = current.attachedImages.takeIf {
                                 modelInfos.firstOrNull { modelInfo -> modelInfo.id == selectedModel }?.supportsVision == true
-                            },
+                            } ?: emptyList(),
                             isLoadingModels = false,
                             modelLoadError = null,
                         )
@@ -1074,6 +1801,114 @@ class SettingsStore(context: Context) {
         get() = preferences.getString("allowed_tools", "") ?: ""
         set(value) {
             preferences.edit().putString("allowed_tools", value).apply()
+        }
+
+    var nativeIntentToolEnabled: Boolean
+        get() = preferences.getBoolean("native_intent_tool_enabled", false)
+        set(value) {
+            preferences.edit().putBoolean("native_intent_tool_enabled", value).apply()
+        }
+
+    var calendarToolEnabled: Boolean
+        get() = preferences.getBoolean("calendar_tool_enabled", false)
+        set(value) {
+            preferences.edit().putBoolean("calendar_tool_enabled", value).apply()
+        }
+
+    var contactsToolEnabled: Boolean
+        get() = preferences.getBoolean("contacts_tool_enabled", false)
+        set(value) {
+            preferences.edit().putBoolean("contacts_tool_enabled", value).apply()
+        }
+
+    var notificationDigestToolEnabled: Boolean
+        get() = preferences.getBoolean("notification_digest_tool_enabled", false)
+        set(value) {
+            preferences.edit().putBoolean("notification_digest_tool_enabled", value).apply()
+        }
+
+    var localFileSearchToolEnabled: Boolean
+        get() = preferences.getBoolean("local_file_search_tool_enabled", false)
+        set(value) {
+            preferences.edit().putBoolean("local_file_search_tool_enabled", value).apply()
+        }
+
+    var localFileSearchTreeUri: String
+        get() = preferences.getString("local_file_search_tree_uri", "") ?: ""
+        set(value) {
+            preferences.edit().putString("local_file_search_tree_uri", value).apply()
+        }
+
+    var deviceStatusToolEnabled: Boolean
+        get() = preferences.getBoolean("device_status_tool_enabled", false)
+        set(value) {
+            preferences.edit().putBoolean("device_status_tool_enabled", value).apply()
+        }
+
+    var voiceInputEnabled: Boolean
+        get() = preferences.getBoolean("voice_input_enabled", false)
+        set(value) {
+            preferences.edit().putBoolean("voice_input_enabled", value).apply()
+        }
+
+    var voiceOutputEnabled: Boolean
+        get() = preferences.getBoolean("voice_output_enabled", false)
+        set(value) {
+            preferences.edit().putBoolean("voice_output_enabled", value).apply()
+        }
+
+    var autoReadAnswersEnabled: Boolean
+        get() = preferences.getBoolean("auto_read_answers_enabled", false)
+        set(value) {
+            preferences.edit().putBoolean("auto_read_answers_enabled", value).apply()
+        }
+
+    var appendDateTimeToSystemPrompt: Boolean
+        get() = preferences.getBoolean("append_date_time_to_system_prompt", false)
+        set(value) {
+            preferences.edit().putBoolean("append_date_time_to_system_prompt", value).apply()
+        }
+
+    var temperature: String
+        get() = preferences.getString("temperature", "0.7") ?: "0.7"
+        set(value) {
+            preferences.edit().putString("temperature", value).apply()
+        }
+
+    var topP: String
+        get() = preferences.getString("top_p", "") ?: ""
+        set(value) {
+            preferences.edit().putString("top_p", value).apply()
+        }
+
+    var maxTokens: String
+        get() = preferences.getString("max_tokens", "") ?: ""
+        set(value) {
+            preferences.edit().putString("max_tokens", value).apply()
+        }
+
+    var contextLength: String
+        get() = preferences.getString("context_length", "") ?: ""
+        set(value) {
+            preferences.edit().putString("context_length", value).apply()
+        }
+
+    var presencePenalty: String
+        get() = preferences.getString("presence_penalty", "") ?: ""
+        set(value) {
+            preferences.edit().putString("presence_penalty", value).apply()
+        }
+
+    var frequencyPenalty: String
+        get() = preferences.getString("frequency_penalty", "") ?: ""
+        set(value) {
+            preferences.edit().putString("frequency_penalty", value).apply()
+        }
+
+    var seed: String
+        get() = preferences.getString("seed", "") ?: ""
+        set(value) {
+            preferences.edit().putString("seed", value).apply()
         }
 
     var reasoningEnabled: Boolean
@@ -1355,15 +2190,360 @@ private fun ChatUiState.reasoningRequestValue(): String? {
     }
 }
 
+private fun ChatUiState.generationSettings(): GenerationSettings =
+    GenerationSettings(
+        temperature = temperatureDraft.toNullableDouble(),
+        topP = topPDraft.toNullableDouble(),
+        maxTokens = maxTokensDraft.toNullableInt(),
+        contextLength = contextLengthDraft.toNullableInt(),
+        presencePenalty = presencePenaltyDraft.toNullableDouble(),
+        frequencyPenalty = frequencyPenaltyDraft.toNullableDouble(),
+        seed = seedDraft.toNullableInt(),
+    )
+
+private fun String.toNullableDouble(): Double? =
+    trim().takeIf { it.isNotBlank() }?.toDoubleOrNull()
+
+private fun String.toNullableInt(): Int? =
+    trim().takeIf { it.isNotBlank() }?.toIntOrNull()
+
 private fun ChatUiState.activeSystemPrompt(): String =
-    systemProfiles.firstOrNull { it.id == activeSystemProfileId }?.prompt
+    (systemProfiles.firstOrNull { it.id == activeSystemProfileId }?.prompt
         ?.takeIf { it.isNotBlank() }
         ?: systemPromptDraft.takeIf { it.isNotBlank() }
-        ?: DefaultSystemPrompt
+        ?: DefaultSystemPrompt)
+        .withPhoneDateTimePrompt(this)
+        .withNativeToolPrompt(this)
+
+private fun String.withPhoneDateTimePrompt(state: ChatUiState): String {
+    if (!state.appendDateTimeToSystemPrompt) return this
+    val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z", Locale.getDefault())
+    val phoneDateTime = LocalDateTime.now()
+        .atZone(ZoneId.systemDefault())
+        .format(formatter)
+    return "$this\n\nCurrent phone date/time: $phoneDateTime."
+}
+
+private fun String.withNativeToolPrompt(state: ChatUiState): String {
+    val prompt = state.nativeToolSystemPrompt()
+    return if (prompt.isBlank()) this else "$this\n\n$prompt"
+}
+
+private fun ChatUiState.nativeToolSystemPrompt(): String {
+    val tools = mutableListOf<String>()
+    if (nativeIntentToolEnabled) {
+        tools += "open_url {url}"
+        tools += "maps_route {query}"
+        tools += "email_draft {to, subject, body}"
+        tools += "phone_dial {phone}"
+        tools += "sms_draft {phone, body}"
+    }
+    if (calendarToolEnabled) {
+        tools += "calendar_event {title, start, end, location, description}"
+        tools += "reminder {title, time, notes}"
+    }
+    if (contactsToolEnabled) tools += "contacts_lookup {name}"
+    if (notificationDigestToolEnabled) tools += "notification_digest {limit}"
+    if (localFileSearchToolEnabled) tools += "local_file_search {query}"
+    if (deviceStatusToolEnabled) tools += "device_status {}"
+    if (tools.isEmpty()) return ""
+
+    return """
+        LMSMOB phone-side tools are available, but only when the user confirms inside the Android app.
+        If one of these tools is needed, reply with a short explanation and exactly one action block:
+        <lmsmob_action>{"tool":"tool_name","args":{"key":"value"}}</lmsmob_action>
+        Available phone-side tools: ${tools.joinToString("; ")}.
+        Do not claim the action is complete until the app returns a tool result or the user confirms the draft.
+        Phone-side tools are drafts only for calls, SMS, email, calendar, maps, and URLs; the user performs the final send/call/save.
+    """.trimIndent()
+}
+
+private fun String.extractNativeToolAction(state: ChatUiState): NativeToolAction? {
+    val match = NativeActionRegex.find(this) ?: return null
+    return runCatching {
+        val json = JSONObject(match.groupValues[1].trim())
+        val tool = json.optString("tool")
+            .ifBlank { json.optString("name") }
+            .trim()
+        val args = json.optJSONObject("args") ?: JSONObject()
+        if (tool.isBlank() || !state.isNativeToolEnabled(tool)) {
+            null
+        } else {
+            NativeToolAction(tool = tool, args = args)
+        }
+    }.getOrNull()
+}
+
+private fun String.withoutNativeActionBlocks(): String =
+    NativeActionRegex.replace(this, "").trim()
+
+private fun ChatMessage.deletePreview(): String =
+    content
+        .withoutNativeActionBlocks()
+        .replace(Regex("\\s+"), " ")
+        .trim()
+        .take(220)
+        .ifBlank {
+            if (attachments.isNotEmpty()) {
+                attachments.joinToString(", ") { it.label }
+            } else {
+                "Empty message"
+            }
+        }
+
+private fun ChatUiState.isNativeToolEnabled(tool: String): Boolean =
+    when (tool) {
+        "open_url",
+        "maps_route",
+        "email_draft",
+        "phone_dial",
+        "sms_draft" -> nativeIntentToolEnabled
+        "calendar_event",
+        "reminder" -> calendarToolEnabled
+        "contacts_lookup" -> contactsToolEnabled
+        "notification_digest" -> notificationDigestToolEnabled
+        "local_file_search" -> localFileSearchToolEnabled
+        "device_status" -> deviceStatusToolEnabled
+        else -> false
+    }
+
+private fun NativeToolAction.displayTitle(): String =
+    when (tool) {
+        "open_url" -> "Open URL"
+        "maps_route" -> "Open Maps Route"
+        "email_draft" -> "Create Email Draft"
+        "phone_dial" -> "Open Phone Dialer"
+        "sms_draft" -> "Create SMS Draft"
+        "calendar_event" -> "Create Calendar Event"
+        "reminder" -> "Create Reminder"
+        "contacts_lookup" -> "Look Up Contacts"
+        "notification_digest" -> "Read Notification Digest"
+        "local_file_search" -> "Search Local Files"
+        "device_status" -> "Read Device Status"
+        else -> tool
+    }
+
+private fun NativeToolAction.displaySummary(): String =
+    when (tool) {
+        "open_url" -> args.arg("url")
+        "maps_route" -> args.arg("query", "destination")
+        "email_draft" -> listOf(args.arg("to"), args.arg("subject")).filter { it.isNotBlank() }.joinToString(" - ")
+        "phone_dial" -> args.arg("phone", "phone_number", "number")
+        "sms_draft" -> listOf(args.arg("phone", "phone_number", "number"), args.arg("body", "message")).filter { it.isNotBlank() }.joinToString(" - ")
+        "calendar_event" -> listOf(args.arg("title"), args.arg("start")).filter { it.isNotBlank() }.joinToString(" - ")
+        "reminder" -> listOf(args.arg("title"), args.arg("time", "start")).filter { it.isNotBlank() }.joinToString(" - ")
+        "contacts_lookup" -> args.arg("name", "query")
+        "notification_digest" -> "Summarize recent notifications stored by LMSMOB Chat"
+        "local_file_search" -> args.arg("query")
+        "device_status" -> "Battery, network, storage, app and LM Studio connectivity"
+        else -> args.toString()
+    }.ifBlank { "No extra details provided." }
+
+private fun JSONObject.arg(vararg names: String): String {
+    names.forEach { name ->
+        optString(name).takeIf { it.isNotBlank() }?.let { return it }
+    }
+    return ""
+}
 
 private fun Context.copyToClipboard(text: String) {
     val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     clipboard.setPrimaryClip(ClipData.newPlainText("LM Studio message", text))
+}
+
+private suspend fun handleIncomingShareIntent(
+    context: Context,
+    intent: Intent,
+    viewModel: ChatViewModel,
+    onDocumentShared: (Uri) -> Unit,
+) {
+    intent.sharedTextPayload()
+        ?.takeIf { it.isNotBlank() }
+        ?.let(viewModel::receiveSharedText)
+
+    val uris = intent.sharedStreamUris()
+    if (uris.isEmpty()) return
+
+    val imageUris = uris.filter { uri -> context.isSharedImage(uri, intent.type) }
+    val documentUris = uris.filterNot { uri -> uri in imageUris }
+
+    if (imageUris.isNotEmpty()) {
+        runCatching {
+            withContext(Dispatchers.IO) {
+                imageUris.map { uri -> context.imageUriToAttachment(uri) }
+            }
+        }.onSuccess(viewModel::attachImages)
+            .onFailure { throwable -> viewModel.showError(throwable.friendlyMessage()) }
+    }
+
+    if (documentUris.size > 1) {
+        viewModel.showError("Only one shared document can be prepared at a time.")
+    }
+    documentUris.firstOrNull()?.let(onDocumentShared)
+}
+
+private fun Intent.isSupportedShareAction(): Boolean =
+    action == Intent.ACTION_SEND ||
+        action == Intent.ACTION_SEND_MULTIPLE ||
+        action == Intent.ACTION_PROCESS_TEXT
+
+private fun Intent.sharedTextPayload(): String? {
+    val processText = getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()
+    val sharedText = getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
+    val subject = getCharSequenceExtra(Intent.EXTRA_SUBJECT)?.toString()
+    return listOfNotNull(subject, processText ?: sharedText)
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .distinct()
+        .joinToString("\n\n")
+        .ifBlank { null }
+}
+
+@Suppress("DEPRECATION")
+private fun Intent.sharedStreamUris(): List<Uri> =
+    when (action) {
+        Intent.ACTION_SEND -> listOfNotNull(getParcelableExtra(Intent.EXTRA_STREAM))
+        Intent.ACTION_SEND_MULTIPLE -> getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM).orEmpty()
+        else -> emptyList()
+    }
+
+private fun Context.isSharedImage(uri: Uri, fallbackMimeType: String?): Boolean {
+    val mimeType = contentResolver.getType(uri) ?: fallbackMimeType.orEmpty()
+    return mimeType.startsWith("image/")
+}
+
+private suspend fun executeNativeToolAction(
+    context: Context,
+    state: ChatUiState,
+    action: NativeToolAction,
+    viewModel: ChatViewModel,
+) {
+    runCatching {
+        when (action.tool) {
+            "open_url" -> context.openUrlDraft(action.args.arg("url"))
+            "maps_route" -> context.openMapsDraft(action.args.arg("query", "destination", "address"))
+            "email_draft" -> context.openEmailDraft(action.args)
+            "phone_dial" -> context.openDialerDraft(action.args.arg("phone", "phone_number", "number"))
+            "sms_draft" -> context.openSmsDraft(action.args)
+            "calendar_event" -> context.openCalendarDraft(action.args, reminder = false)
+            "reminder" -> context.openCalendarDraft(action.args, reminder = true)
+            "contacts_lookup" -> {
+                val result = withContext(Dispatchers.IO) {
+                    context.lookupContacts(action.args.arg("name", "query"))
+                }
+                viewModel.receiveSharedText(result.asNativeToolResult("contacts_lookup"))
+            }
+            "notification_digest" -> {
+                val result = withContext(Dispatchers.IO) {
+                    if (!context.isNotificationListenerEnabled()) {
+                        throw IOException("Notification access is not enabled. Turn it on in Android notification access settings.")
+                    }
+                    NotificationDigestStore.digest(context, action.args.optInt("limit", 20))
+                }
+                viewModel.receiveSharedText(result.asNativeToolResult("notification_digest"))
+            }
+            "local_file_search" -> {
+                val result = withContext(Dispatchers.IO) {
+                    context.searchLocalFiles(
+                        treeUriString = state.localFileSearchTreeUri,
+                        query = action.args.arg("query"),
+                    )
+                }
+                viewModel.receiveSharedText(result.asNativeToolResult("local_file_search"))
+            }
+            "device_status" -> {
+                val result = withContext(Dispatchers.IO) {
+                    context.deviceStatusText(state)
+                }
+                viewModel.receiveSharedText(result.asNativeToolResult("device_status"))
+            }
+            else -> throw IOException("Unsupported phone-side tool: ${action.tool}")
+        }
+    }.onFailure { throwable ->
+        viewModel.showError(throwable.friendlyMessage())
+    }
+}
+
+private fun String.asNativeToolResult(tool: String): String =
+    "Phone-side tool result: $tool\n$this\n\nUse this result to continue answering my request."
+
+private fun Context.openUrlDraft(url: String) {
+    val normalized = url.trim().let { value ->
+        when {
+            value.isBlank() -> throw IOException("URL is missing.")
+            value.startsWith("http://", true) || value.startsWith("https://", true) -> value
+            else -> "https://$value"
+        }
+    }
+    startSafeActivity(Intent(Intent.ACTION_VIEW, Uri.parse(normalized)))
+}
+
+private fun Context.openMapsDraft(query: String) {
+    if (query.isBlank()) throw IOException("Map destination is missing.")
+    val uri = Uri.parse("geo:0,0?q=${Uri.encode(query)}")
+    startSafeActivity(Intent(Intent.ACTION_VIEW, uri))
+}
+
+private fun Context.openEmailDraft(args: JSONObject) {
+    val to = args.arg("to", "email")
+    val intent = Intent(Intent.ACTION_SENDTO).apply {
+        data = Uri.parse("mailto:${Uri.encode(to)}")
+        putExtra(Intent.EXTRA_SUBJECT, args.arg("subject"))
+        putExtra(Intent.EXTRA_TEXT, args.arg("body", "message"))
+    }
+    startSafeActivity(intent)
+}
+
+private fun Context.openDialerDraft(phone: String) {
+    if (phone.isBlank()) throw IOException("Phone number is missing.")
+    startSafeActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")))
+}
+
+private fun Context.openSmsDraft(args: JSONObject) {
+    val phone = args.arg("phone", "phone_number", "number")
+    if (phone.isBlank()) throw IOException("SMS phone number is missing.")
+    val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(phone)}")).apply {
+        putExtra("sms_body", args.arg("body", "message"))
+    }
+    startSafeActivity(intent)
+}
+
+private fun Context.openCalendarDraft(args: JSONObject, reminder: Boolean) {
+    val title = args.arg("title").ifBlank {
+        if (reminder) "Reminder" else "Calendar event"
+    }
+    val startText = args.arg("start", "time")
+    val startMillis = startText.toEventMillis()
+    val endMillis = args.arg("end").toEventMillis()
+    val intent = Intent(Intent.ACTION_INSERT).apply {
+        data = CalendarContract.Events.CONTENT_URI
+        putExtra(CalendarContract.Events.TITLE, if (reminder) "Reminder: $title" else title)
+        putExtra(CalendarContract.Events.DESCRIPTION, args.arg("description", "notes", "body"))
+        putExtra(CalendarContract.Events.EVENT_LOCATION, args.arg("location"))
+        if (startMillis != null) putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, startMillis)
+        if (endMillis != null) putExtra(CalendarContract.EXTRA_EVENT_END_TIME, endMillis)
+    }
+    startSafeActivity(intent)
+}
+
+private fun Context.startSafeActivity(intent: Intent) {
+    try {
+        startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    } catch (_: ActivityNotFoundException) {
+        throw IOException("No Android app is available to handle this action.")
+    }
+}
+
+private fun String.toEventMillis(): Long? {
+    val value = trim()
+    if (value.isBlank()) return null
+    return runCatching { Instant.parse(value).toEpochMilli() }.getOrNull()
+        ?: runCatching {
+            LocalDateTime.parse(value)
+                .atZone(ZoneId.systemDefault())
+                .toInstant()
+                .toEpochMilli()
+        }.getOrNull()
 }
 
 private fun Context.imageUriToAttachment(uri: Uri): ChatImageAttachment {
@@ -1401,6 +2581,483 @@ private fun Bitmap.scaledForVision(maxDimension: Int = 1568): Bitmap {
     )
 }
 
+private fun Context.documentUriToPlainText(uri: Uri): ChatDocumentAttachment {
+    val name = documentDisplayName(uri)
+    val mimeType = contentResolver.getType(uri).orEmpty()
+    val extension = name.substringAfterLast('.', "").lowercase()
+    if (extension == "pdf" || mimeType == "application/pdf") {
+        throw IOException("PDF plain-text extraction is not available on-device. Choose Images to render PDF pages for a vision model.")
+    }
+    val bytes = contentResolver.openInputStream(uri)?.use { input -> input.readBytes() }
+        ?: throw IOException("Could not read document")
+    val text = when (extension) {
+        "docx" -> extractDocxText(bytes)
+        "xlsx" -> extractXlsxText(bytes)
+        "doc", "xls" -> extractBinaryStrings(bytes)
+        else -> bytes.toString(Charsets.UTF_8)
+    }.normalizeExtractedText()
+
+    if (text.isBlank()) {
+        throw IOException("Could not extract readable text from $name.")
+    }
+
+    return ChatDocumentAttachment(
+        name = name,
+        text = text.take(MaxDocumentTextChars),
+        mimeType = mimeType.ifBlank { "text/plain" },
+    )
+}
+
+private fun Context.documentUriToImageAttachments(uri: Uri): List<ChatImageAttachment> {
+    val name = documentDisplayName(uri)
+    val mimeType = contentResolver.getType(uri).orEmpty()
+    val extension = name.substringAfterLast('.', "").lowercase()
+    return if (extension == "pdf" || mimeType == "application/pdf") {
+        renderPdfPages(uri, name)
+    } else {
+        val document = documentUriToPlainText(uri)
+        textToImageAttachments(document.text, document.name)
+    }
+}
+
+private fun Context.documentDisplayName(uri: Uri): String {
+    contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+        val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        if (index >= 0 && cursor.moveToFirst()) {
+            val name = cursor.getString(index)
+            if (!name.isNullOrBlank()) return name
+        }
+    }
+    return uri.lastPathSegment?.substringAfterLast('/')?.ifBlank { null } ?: "Document"
+}
+
+private fun Context.isPdfDocument(uri: Uri): Boolean {
+    val name = documentDisplayName(uri)
+    val mimeType = contentResolver.getType(uri).orEmpty()
+    return name.substringAfterLast('.', "").equals("pdf", ignoreCase = true) ||
+        mimeType == "application/pdf"
+}
+
+private fun Context.renderPdfPages(uri: Uri, name: String): List<ChatImageAttachment> {
+    val descriptor = contentResolver.openFileDescriptor(uri, "r")
+        ?: throw IOException("Could not open PDF")
+    descriptor.use { pfd ->
+        PdfRenderer(pfd).use { renderer ->
+            if (renderer.pageCount == 0) throw IOException("PDF has no pages")
+            return buildList {
+                val pagesToRender = minOf(renderer.pageCount, 4)
+                for (index in 0 until pagesToRender) {
+                    renderer.openPage(index).use { page ->
+                        val targetWidth = 1280
+                        val ratio = targetWidth.toFloat() / page.width.toFloat()
+                        val bitmap = Bitmap.createBitmap(
+                            targetWidth,
+                            (page.height * ratio).toInt().coerceAtLeast(1),
+                            Bitmap.Config.ARGB_8888,
+                        )
+                        Canvas(bitmap).drawColor(android.graphics.Color.WHITE)
+                        page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        add(bitmap.toAttachment("$name page ${index + 1}"))
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun textToImageAttachments(text: String, name: String): List<ChatImageAttachment> {
+    val chunks = text.chunked(1800).take(4)
+    return chunks.mapIndexed { index, chunk ->
+        val bitmap = Bitmap.createBitmap(1280, 1720, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        canvas.drawColor(android.graphics.Color.WHITE)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.rgb(20, 25, 40)
+            textSize = 30f
+        }
+        val x = 56f
+        var y = 76f
+        val lineHeight = 42f
+        chunk.lines().flatMap { it.wrapForPaint(paint, 1168f) }.forEach { line ->
+            if (y < 1660f) {
+                canvas.drawText(line, x, y, paint)
+                y += lineHeight
+            }
+        }
+        bitmap.toAttachment("$name text ${index + 1}")
+    }
+}
+
+private fun String.wrapForPaint(paint: Paint, maxWidth: Float): List<String> {
+    if (isBlank()) return listOf("")
+    val words = split(Regex("\\s+"))
+    val lines = mutableListOf<String>()
+    var current = ""
+    words.forEach { word ->
+        val candidate = if (current.isBlank()) word else "$current $word"
+        if (paint.measureText(candidate) <= maxWidth) {
+            current = candidate
+        } else {
+            if (current.isNotBlank()) lines += current
+            current = word
+        }
+    }
+    if (current.isNotBlank()) lines += current
+    return lines.ifEmpty { listOf(this) }
+}
+
+private fun extractDocxText(bytes: ByteArray): String {
+    val entries = extractZipTextEntries(bytes) { name ->
+        name == "word/document.xml" ||
+            name.startsWith("word/header") ||
+            name.startsWith("word/footer")
+    }
+    return entries.values.joinToString("\n\n") { it.xmlBodyText() }
+}
+
+private fun extractXlsxText(bytes: ByteArray): String {
+    val entries = extractZipTextEntries(bytes) { name ->
+        name == "xl/sharedStrings.xml" ||
+            (name.startsWith("xl/worksheets/") && name.endsWith(".xml"))
+    }
+    val sharedStrings = entries["xl/sharedStrings.xml"]
+        ?.let(::extractSharedStrings)
+        .orEmpty()
+    val cellRegex = Regex("<c\\b([^>]*)>(.*?)</c>", RegexOption.DOT_MATCHES_ALL)
+    val rowRegex = Regex("<row\\b[^>]*>(.*?)</row>", RegexOption.DOT_MATCHES_ALL)
+    val valueRegex = Regex("<v[^>]*>(.*?)</v>", RegexOption.DOT_MATCHES_ALL)
+    val textRegex = Regex("<t[^>]*>(.*?)</t>", RegexOption.DOT_MATCHES_ALL)
+
+    return entries
+        .filterKeys { it.startsWith("xl/worksheets/") && it.endsWith(".xml") }
+        .toSortedMap()
+        .mapNotNull { (name, xml) ->
+            val rows = rowRegex.findAll(xml).mapNotNull { row ->
+                val cells = cellRegex.findAll(row.groupValues[1]).map { cell ->
+                    val attributes = cell.groupValues[1]
+                    val body = cell.groupValues[2]
+                    val inlineText = textRegex.findAll(body)
+                        .joinToString(" ") { it.groupValues[1].decodeXmlEntities() }
+                        .trim()
+                    val rawValue = valueRegex.find(body)?.groupValues?.get(1).orEmpty().decodeXmlEntities()
+                    when {
+                        inlineText.isNotBlank() -> inlineText
+                        attributes.contains("t=\"s\"") -> sharedStrings.getOrNull(rawValue.toIntOrNull() ?: -1).orEmpty()
+                        else -> rawValue
+                    }
+                }.filter { it.isNotBlank() }.toList()
+                cells.takeIf { it.isNotEmpty() }?.joinToString("\t")
+            }.toList()
+
+            if (rows.isEmpty()) {
+                null
+            } else {
+                buildString {
+                    appendLine(name.substringAfterLast('/').removeSuffix(".xml"))
+                    append(rows.joinToString("\n"))
+                }
+            }
+        }
+        .joinToString("\n\n")
+}
+
+private fun extractSharedStrings(xml: String): List<String> {
+    val itemRegex = Regex("<si\\b[^>]*>(.*?)</si>", RegexOption.DOT_MATCHES_ALL)
+    val textRegex = Regex("<t[^>]*>(.*?)</t>", RegexOption.DOT_MATCHES_ALL)
+    return itemRegex.findAll(xml)
+        .map { item ->
+            textRegex.findAll(item.groupValues[1])
+                .joinToString("") { it.groupValues[1].decodeXmlEntities() }
+                .trim()
+        }
+        .toList()
+}
+
+private fun extractZipTextEntries(
+    bytes: ByteArray,
+    shouldRead: (String) -> Boolean,
+): Map<String, String> {
+    val output = linkedMapOf<String, String>()
+    ZipInputStream(bytes.inputStream()).use { zip ->
+        while (true) {
+            val entry = zip.nextEntry ?: break
+            val name = entry.name
+            if (!entry.isDirectory && shouldRead(name)) {
+                output[name] = zip.readBytes().toString(Charsets.UTF_8)
+            }
+        }
+    }
+    return output
+}
+
+private fun String.xmlBodyText(): String =
+    replace(Regex("<(w:p|row|sheetData|si|c|v|t)[^>]*>"), "\n")
+        .replace(Regex("<[^>]+>"), " ")
+        .decodeXmlEntities()
+
+private fun String.decodeXmlEntities(): String =
+    replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+
+private fun extractBinaryStrings(bytes: ByteArray): String {
+    val ascii = Regex("[\\x20-\\x7E\\r\\n\\t]{4,}")
+        .findAll(bytes.toString(Charsets.ISO_8859_1))
+        .joinToString("\n") { it.value }
+    val utf16 = runCatching {
+        Regex("[\\p{L}\\p{N}\\p{Punct} ]{4,}")
+            .findAll(bytes.toString(Charsets.UTF_16LE))
+            .joinToString("\n") { it.value }
+    }.getOrDefault("")
+    return "$ascii\n$utf16"
+}
+
+private fun String.normalizeExtractedText(): String =
+    lines()
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .joinToString("\n")
+        .replace(Regex("[ \\t]{2,}"), " ")
+
+private fun Context.hasContactsPermission(): Boolean =
+    ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+
+private fun Context.hasRecordAudioPermission(): Boolean =
+    ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+private fun Context.lookupContacts(query: String): String {
+    if (!hasContactsPermission()) throw IOException("Contacts permission is not granted.")
+    if (query.isBlank()) throw IOException("Contact search query is missing.")
+
+    val phones = mutableListOf<String>()
+    contentResolver.query(
+        ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+        arrayOf(
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY,
+            ContactsContract.CommonDataKinds.Phone.NUMBER,
+        ),
+        "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY} LIKE ?",
+        arrayOf("%$query%"),
+        "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY} ASC",
+    )?.use { cursor ->
+        val nameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY)
+        val phoneIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+        while (cursor.moveToNext() && phones.size < 8) {
+            val name = cursor.getString(nameIndex).orEmpty()
+            val phone = cursor.getString(phoneIndex).orEmpty()
+            if (name.isNotBlank() || phone.isNotBlank()) {
+                phones += "$name - $phone"
+            }
+        }
+    }
+
+    val emails = mutableListOf<String>()
+    contentResolver.query(
+        ContactsContract.CommonDataKinds.Email.CONTENT_URI,
+        arrayOf(
+            ContactsContract.CommonDataKinds.Email.DISPLAY_NAME_PRIMARY,
+            ContactsContract.CommonDataKinds.Email.ADDRESS,
+        ),
+        "${ContactsContract.CommonDataKinds.Email.DISPLAY_NAME_PRIMARY} LIKE ?",
+        arrayOf("%$query%"),
+        "${ContactsContract.CommonDataKinds.Email.DISPLAY_NAME_PRIMARY} ASC",
+    )?.use { cursor ->
+        val nameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Email.DISPLAY_NAME_PRIMARY)
+        val emailIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Email.ADDRESS)
+        while (cursor.moveToNext() && emails.size < 8) {
+            val name = cursor.getString(nameIndex).orEmpty()
+            val email = cursor.getString(emailIndex).orEmpty()
+            if (name.isNotBlank() || email.isNotBlank()) {
+                emails += "$name - $email"
+            }
+        }
+    }
+
+    return buildString {
+        appendLine("Contacts matching \"$query\":")
+        if (phones.isEmpty() && emails.isEmpty()) {
+            append("No matching contacts found.")
+        } else {
+            if (phones.isNotEmpty()) {
+                appendLine("Phone numbers:")
+                phones.distinct().forEach { appendLine("- $it") }
+            }
+            if (emails.isNotEmpty()) {
+                appendLine("Email addresses:")
+                emails.distinct().forEach { appendLine("- $it") }
+            }
+        }
+    }
+}
+
+private fun Context.openNotificationListenerSettings(viewModel: ChatViewModel) {
+    runCatching {
+        startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }.onFailure {
+        viewModel.showError("Open Android Settings and enable notification access for LMSMOB Chat.")
+    }
+}
+
+private fun Context.isNotificationListenerEnabled(): Boolean {
+    val enabled = Settings.Secure.getString(contentResolver, "enabled_notification_listeners").orEmpty()
+    return enabled.contains(packageName, ignoreCase = true)
+}
+
+private fun Context.searchLocalFiles(treeUriString: String, query: String): String {
+    if (treeUriString.isBlank()) throw IOException("Choose a search folder in settings first.")
+    val treeUri = Uri.parse(treeUriString)
+    val rootDocumentId = DocumentsContract.getTreeDocumentId(treeUri)
+    val normalizedQuery = query.trim()
+    val matches = mutableListOf<String>()
+    var scanned = 0
+
+    fun visit(parentDocumentId: String, depth: Int) {
+        if (depth > 4 || scanned > 180 || matches.size >= 20) return
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
+        contentResolver.query(
+            childrenUri,
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+            ),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            val idIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            while (cursor.moveToNext() && scanned <= 180 && matches.size < 20) {
+                val documentId = cursor.getString(idIndex).orEmpty()
+                val name = cursor.getString(nameIndex).orEmpty()
+                val mimeType = cursor.getString(mimeIndex).orEmpty()
+                scanned += 1
+                if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
+                    visit(documentId, depth + 1)
+                } else {
+                    val documentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
+                    val snippet = runCatching {
+                        documentUriToPlainText(documentUri).text.take(420)
+                    }.getOrDefault("")
+                    val matched = normalizedQuery.isBlank() ||
+                        name.contains(normalizedQuery, ignoreCase = true) ||
+                        snippet.contains(normalizedQuery, ignoreCase = true)
+                    if (matched) {
+                        matches += buildString {
+                            append(name.ifBlank { documentId })
+                            if (mimeType.isNotBlank()) append(" [$mimeType]")
+                            if (snippet.isNotBlank()) append("\n").append(snippet)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    visit(rootDocumentId, depth = 0)
+    return buildString {
+        appendLine("Local file search query: ${normalizedQuery.ifBlank { "(all readable files)" }}")
+        appendLine("Scanned files/folders: $scanned")
+        if (matches.isEmpty()) {
+            append("No matches found in the selected folder.")
+        } else {
+            appendLine("Matches:")
+            matches.forEachIndexed { index, match ->
+                appendLine("${index + 1}. $match")
+            }
+        }
+    }
+}
+
+private suspend fun Context.deviceStatusText(state: ChatUiState): String {
+    val batteryManager = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+    val battery = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+    val connectivity = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+    val network = when {
+        capabilities == null -> "offline or unknown"
+        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+        else -> "connected"
+    }
+    val storage = StatFs(Environment.getDataDirectory().path)
+    val freeGb = storage.availableBytes.toDouble() / 1024.0 / 1024.0 / 1024.0
+    val totalGb = storage.totalBytes.toDouble() / 1024.0 / 1024.0 / 1024.0
+    val lmStudio = LmStudioClient().listModels(state.apiUrl, state.apiToken).fold(
+        onSuccess = { models -> "reachable (${models.size} models returned)" },
+        onFailure = { throwable -> "not reachable: ${throwable.friendlyMessage()}" },
+    )
+    return """
+        Device status:
+        Battery: $battery%
+        Network: $network
+        Storage: ${"%.1f".format(freeGb)} GB free of ${"%.1f".format(totalGb)} GB
+        App: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})
+        LM Studio URL: ${state.apiUrl}
+        LM Studio connection: $lmStudio
+    """.trimIndent()
+}
+
+class LmNotificationListenerService : NotificationListenerService() {
+    override fun onNotificationPosted(sbn: StatusBarNotification) {
+        NotificationDigestStore.record(applicationContext, sbn)
+    }
+}
+
+private object NotificationDigestStore {
+    private const val PreferencesName = "lm_studio_notification_digest"
+    private const val NotificationsKey = "notifications"
+
+    fun record(context: Context, sbn: StatusBarNotification) {
+        val extras = sbn.notification.extras
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
+        val subText = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString().orEmpty()
+        if (title.isBlank() && text.isBlank()) return
+
+        val preferences = context.getSharedPreferences(PreferencesName, Context.MODE_PRIVATE)
+        val existing = runCatching {
+            JSONArray(preferences.getString(NotificationsKey, "[]").orEmpty())
+        }.getOrDefault(JSONArray())
+        val next = JSONArray()
+        next.put(
+            JSONObject()
+                .put("time", System.currentTimeMillis())
+                .put("package", sbn.packageName)
+                .put("title", title)
+                .put("text", text)
+                .put("sub_text", subText),
+        )
+        for (index in 0 until minOf(existing.length(), 79)) {
+            next.put(existing.optJSONObject(index))
+        }
+        preferences.edit().putString(NotificationsKey, next.toString()).apply()
+    }
+
+    fun digest(context: Context, limit: Int): String {
+        val preferences = context.getSharedPreferences(PreferencesName, Context.MODE_PRIVATE)
+        val notifications = runCatching {
+            JSONArray(preferences.getString(NotificationsKey, "[]").orEmpty())
+        }.getOrDefault(JSONArray())
+        if (notifications.length() == 0) {
+            return "No notifications have been captured yet. Notification access may have just been enabled."
+        }
+        return buildString {
+            appendLine("Recent notifications:")
+            for (index in 0 until minOf(notifications.length(), limit.coerceIn(1, 50))) {
+                val item = notifications.optJSONObject(index) ?: continue
+                appendLine(
+                    "- ${item.optString("package")}: ${item.optString("title")} - ${item.optString("text")}",
+                )
+            }
+        }
+    }
+}
+
 class LmStudioClient(
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -1410,6 +3067,22 @@ class LmStudioClient(
         .build(),
 ) {
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+    private val activeChatCall = AtomicReference<Call?>()
+
+    fun cancelActiveChat() {
+        activeChatCall.getAndSet(null)?.cancel()
+    }
+
+    private fun executeChatRequest(request: Request) =
+        httpClient.newCall(request).also { call ->
+            activeChatCall.set(call)
+        }.let { call ->
+            try {
+                call.execute()
+            } finally {
+                activeChatCall.compareAndSet(call, null)
+            }
+        }
 
     suspend fun listModels(
         apiUrl: String,
@@ -1522,6 +3195,7 @@ class LmStudioClient(
                         supportsVision = capabilities?.optBoolean("vision") == true ||
                             model.optBoolean("vision") ||
                             model.optBoolean("supports_vision"),
+                        contextLength = model.contextLengthFromModelJson(capabilities, loadedInstances),
                         reasoningOptions = reasoningOptions,
                         defaultReasoning = defaultReasoning,
                     )
@@ -1543,6 +3217,7 @@ class LmStudioClient(
         apiToken: String,
         messages: List<ChatMessage>,
         systemPrompt: String,
+        generationSettings: GenerationSettings,
     ): Result<ChatCompletionResult> = withContext(Dispatchers.IO) {
         runCatching {
             val messagesJson = JSONArray()
@@ -1563,8 +3238,8 @@ class LmStudioClient(
             val payload = JSONObject()
                 .put("model", model.ifBlank { "local-model" })
                 .put("messages", messagesJson)
-                .put("temperature", 0.7)
                 .put("stream", false)
+                .applyOpenAiGenerationSettings(generationSettings)
 
             val request = Request.Builder()
                 .url(apiUrl.normalizedOpenAiBaseUrl() + "/chat/completions")
@@ -1572,7 +3247,7 @@ class LmStudioClient(
                 .post(payload.toString().toRequestBody(jsonMediaType))
                 .build()
 
-            httpClient.newCall(request).execute().use { response ->
+            executeChatRequest(request).use { response ->
                 val body = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
                     throw IOException("LM Studio returned HTTP ${response.code}: ${body.take(160)}")
@@ -1606,6 +3281,7 @@ class LmStudioClient(
         integrations: String,
         allowedTools: String,
         reasoning: String?,
+        generationSettings: GenerationSettings,
     ): Result<ChatCompletionResult> = withContext(Dispatchers.IO) {
         runCatching {
             val integrationsJson = integrations.toIntegrationsJsonArray(allowedTools)
@@ -1619,8 +3295,8 @@ class LmStudioClient(
                 .put("input", prompt.toNativeInput(attachments))
                 .put("system_prompt", systemPrompt.ifBlank { DefaultSystemPrompt })
                 .put("integrations", integrationsJson)
-                .put("temperature", 0.7)
                 .put("store", true)
+                .applyNativeGenerationSettings(generationSettings)
 
             if (!reasoning.isNullOrBlank()) {
                 payload.put("reasoning", reasoning)
@@ -1636,7 +3312,7 @@ class LmStudioClient(
                 .post(payload.toString().toRequestBody(jsonMediaType))
                 .build()
 
-            httpClient.newCall(request).execute().use { response ->
+            executeChatRequest(request).use { response ->
                 val body = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
                     throw IOException("LM Studio returned HTTP ${response.code}: ${body.take(160)}")
@@ -1658,6 +3334,7 @@ class LmStudioClient(
         integrations: String,
         allowedTools: String,
         reasoning: String?,
+        generationSettings: GenerationSettings,
         onEvent: (ChatStreamEvent) -> Unit,
     ): Result<ChatCompletionResult> = withContext(Dispatchers.IO) {
         runCatching {
@@ -1672,9 +3349,9 @@ class LmStudioClient(
                 .put("input", prompt.toNativeInput(attachments))
                 .put("system_prompt", systemPrompt.ifBlank { DefaultSystemPrompt })
                 .put("integrations", integrationsJson)
-                .put("temperature", 0.7)
                 .put("store", true)
                 .put("stream", true)
+                .applyNativeGenerationSettings(generationSettings)
 
             if (!reasoning.isNullOrBlank()) {
                 payload.put("reasoning", reasoning)
@@ -1690,7 +3367,7 @@ class LmStudioClient(
                 .post(payload.toString().toRequestBody(jsonMediaType))
                 .build()
 
-            httpClient.newCall(request).execute().use { response ->
+            executeChatRequest(request).use { response ->
                 if (!response.isSuccessful) {
                     val body = response.body?.string().orEmpty()
                     throw IOException("LM Studio returned HTTP ${response.code}: ${body.take(160)}")
@@ -1867,11 +3544,71 @@ private fun JSONObject.firstNonBlankString(vararg keys: String): String {
     return ""
 }
 
+private fun JSONObject.firstPositiveInt(vararg keys: String): Int? {
+    for (key in keys) {
+        val value = opt(key)
+        val intValue = when (value) {
+            is Number -> value.toInt()
+            is String -> value.trim().toIntOrNull()
+            else -> null
+        }
+        if (intValue != null && intValue > 0) return intValue
+    }
+    return null
+}
+
+private fun JSONObject.contextLengthFromModelJson(
+    capabilities: JSONObject?,
+    loadedInstances: JSONArray,
+): Int? {
+    val keys = arrayOf(
+        "context_length",
+        "contextLength",
+        "max_context_length",
+        "maxContextLength",
+        "context_window",
+        "contextWindow",
+        "n_ctx",
+        "max_context",
+        "trained_context_length",
+        "loaded_context_length",
+    )
+    val candidates = mutableListOf<Int>()
+    firstPositiveInt(*keys)?.let(candidates::add)
+    capabilities?.firstPositiveInt(*keys)?.let(candidates::add)
+    optJSONObject("config")?.firstPositiveInt(*keys)?.let(candidates::add)
+    optJSONObject("runtime")?.firstPositiveInt(*keys)?.let(candidates::add)
+    optJSONObject("params")?.firstPositiveInt(*keys)?.let(candidates::add)
+
+    for (index in 0 until loadedInstances.length()) {
+        loadedInstances.optJSONObject(index)
+            ?.firstPositiveInt(*keys)
+            ?.let(candidates::add)
+    }
+    return candidates.maxOrNull()
+}
+
 private fun Request.Builder.withApiToken(apiToken: String): Request.Builder {
     val trimmedToken = apiToken.trim()
     if (trimmedToken.isNotBlank()) {
         header("Authorization", "Bearer $trimmedToken")
     }
+    return this
+}
+
+private fun JSONObject.applyOpenAiGenerationSettings(settings: GenerationSettings): JSONObject {
+    settings.temperature?.let { put("temperature", it) }
+    settings.topP?.let { put("top_p", it) }
+    settings.maxTokens?.let { put("max_tokens", it) }
+    settings.presencePenalty?.let { put("presence_penalty", it) }
+    settings.frequencyPenalty?.let { put("frequency_penalty", it) }
+    settings.seed?.let { put("seed", it) }
+    return this
+}
+
+private fun JSONObject.applyNativeGenerationSettings(settings: GenerationSettings): JSONObject {
+    applyOpenAiGenerationSettings(settings)
+    settings.contextLength?.let { put("context_length", it) }
     return this
 }
 
@@ -1994,6 +3731,93 @@ private fun String.withIntegration(integrationId: String): String =
         .distinct()
         .joinToString("\n")
 
+@Composable
+private fun DocumentConversionDialog(
+    canConvertToPlainText: Boolean,
+    canConvertToImages: Boolean,
+    onDismiss: () -> Unit,
+    onPlainText: () -> Unit,
+    onImages: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Attach document") },
+        text = {
+            Text(
+                if (canConvertToPlainText || canConvertToImages) {
+                    "Choose how to prepare this document before sending it to the model."
+                } else {
+                    "Select a vision-capable model to attach this PDF as page images."
+                },
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onPlainText,
+                enabled = canConvertToPlainText,
+            ) {
+                Text("Plain text")
+            }
+        },
+        dismissButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(
+                    onClick = onImages,
+                    enabled = canConvertToImages,
+                ) {
+                    Text("Images")
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+            }
+        },
+    )
+}
+
+@Composable
+private fun NativeToolActionDialog(
+    action: NativeToolAction,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(action.displayTitle()) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("LM Studio requested a phone-side action. Review it before continuing.")
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = action.displaySummary(),
+                        modifier = Modifier.padding(12.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                Text(
+                    text = "Draft actions open Android screens only. You still press Send, Call, Save, or Navigate yourself.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("Continue")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        },
+    )
+}
+
 private fun Throwable.friendlyMessage(): String {
     val detail = message.orEmpty()
     return when {
@@ -2015,17 +3839,28 @@ private fun Throwable.friendlyMessage(): String {
     }
 }
 
+private fun Throwable.isChatCancellation(): Boolean {
+    val detail = message.orEmpty()
+    return this is CancellationException ||
+        detail.equals("Canceled", ignoreCase = true) ||
+        detail.equals("Cancelled", ignoreCase = true) ||
+        detail.contains("canceled", ignoreCase = true) ||
+        detail.contains("cancelled", ignoreCase = true)
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LmStudioApp(
     state: ChatUiState,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
+    onCancelSend: () -> Unit,
     onSuggestion: (String) -> Unit,
     onNewChat: () -> Unit,
     onSelectChat: (String) -> Unit,
     onChatSearchChange: (String) -> Unit,
     onEditMessage: (String) -> Unit,
+    onDeleteMessage: (String) -> Unit,
     onDeleteChat: (String) -> Unit,
     onOpenSettings: () -> Unit,
     onCloseSettings: () -> Unit,
@@ -2037,15 +3872,39 @@ fun LmStudioApp(
     onServerToolsEnabledChange: (Boolean) -> Unit,
     onServerIntegrationsChange: (String) -> Unit,
     onAllowedToolsChange: (String) -> Unit,
+    onNativeIntentToolEnabledChange: (Boolean) -> Unit,
+    onCalendarToolEnabledChange: (Boolean) -> Unit,
+    onContactsToolEnabledChange: (Boolean) -> Unit,
+    onNotificationDigestToolEnabledChange: (Boolean) -> Unit,
+    onLocalFileSearchToolEnabledChange: (Boolean) -> Unit,
+    onPickLocalSearchFolder: () -> Unit,
+    onDeviceStatusToolEnabledChange: (Boolean) -> Unit,
+    onVoiceInputEnabledChange: (Boolean) -> Unit,
+    onVoiceOutputEnabledChange: (Boolean) -> Unit,
+    onAutoReadAnswersEnabledChange: (Boolean) -> Unit,
+    onAppendDateTimeToSystemPromptChange: (Boolean) -> Unit,
     onSystemProfileSelect: (String) -> Unit,
     onSystemProfileNameChange: (String) -> Unit,
     onSystemPromptChange: (String) -> Unit,
+    onTemperatureChange: (String) -> Unit,
+    onTopPChange: (String) -> Unit,
+    onMaxTokensChange: (String) -> Unit,
+    onContextLengthChange: (String) -> Unit,
+    onPresencePenaltyChange: (String) -> Unit,
+    onFrequencyPenaltyChange: (String) -> Unit,
+    onSeedChange: (String) -> Unit,
     onSystemProfileSave: () -> Unit,
     onSystemProfileCreate: () -> Unit,
     onSystemProfileDelete: (String) -> Unit,
     onReasoningEnabledChange: (Boolean) -> Unit,
     onPickImage: () -> Unit,
     onTakePhoto: () -> Unit,
+    onPickDocument: () -> Unit,
+    onVoiceInput: () -> Unit,
+    isListening: Boolean,
+    onSpeakMessage: (String, String) -> Unit,
+    onStopSpeaking: () -> Unit,
+    speakingMessageId: String?,
     onClearImage: () -> Unit,
     onRefreshModels: () -> Unit,
     onExportChats: () -> Unit,
@@ -2065,9 +3924,27 @@ fun LmStudioApp(
             onServerToolsEnabledChange = onServerToolsEnabledChange,
             onServerIntegrationsChange = onServerIntegrationsChange,
             onAllowedToolsChange = onAllowedToolsChange,
+            onNativeIntentToolEnabledChange = onNativeIntentToolEnabledChange,
+            onCalendarToolEnabledChange = onCalendarToolEnabledChange,
+            onContactsToolEnabledChange = onContactsToolEnabledChange,
+            onNotificationDigestToolEnabledChange = onNotificationDigestToolEnabledChange,
+            onLocalFileSearchToolEnabledChange = onLocalFileSearchToolEnabledChange,
+            onPickLocalSearchFolder = onPickLocalSearchFolder,
+            onDeviceStatusToolEnabledChange = onDeviceStatusToolEnabledChange,
+            onVoiceInputEnabledChange = onVoiceInputEnabledChange,
+            onVoiceOutputEnabledChange = onVoiceOutputEnabledChange,
+            onAutoReadAnswersEnabledChange = onAutoReadAnswersEnabledChange,
+            onAppendDateTimeToSystemPromptChange = onAppendDateTimeToSystemPromptChange,
             onSystemProfileSelect = onSystemProfileSelect,
             onSystemProfileNameChange = onSystemProfileNameChange,
             onSystemPromptChange = onSystemPromptChange,
+            onTemperatureChange = onTemperatureChange,
+            onTopPChange = onTopPChange,
+            onMaxTokensChange = onMaxTokensChange,
+            onContextLengthChange = onContextLengthChange,
+            onPresencePenaltyChange = onPresencePenaltyChange,
+            onFrequencyPenaltyChange = onFrequencyPenaltyChange,
+            onSeedChange = onSeedChange,
             onSystemProfileSave = onSystemProfileSave,
             onSystemProfileCreate = onSystemProfileCreate,
             onSystemProfileDelete = onSystemProfileDelete,
@@ -2153,17 +4030,23 @@ fun LmStudioApp(
             },
             bottomBar = {
                 ChatComposer(
+                    state = state,
                     input = state.input,
                     isSending = state.isSending,
                     error = state.error,
                     canAttachImage = state.selectedModelSupportsVision(),
-                    attachedImage = state.attachedImage,
+                    attachedImages = state.attachedImages,
+                    attachedDocumentText = state.attachedDocumentText,
                     reasoningSupported = state.selectedModelSupportsReasoningToggle(),
                     reasoningEnabled = state.reasoningEnabled,
                     onInputChange = onInputChange,
                     onSend = onSend,
+                    onCancelSend = onCancelSend,
                     onPickImage = onPickImage,
                     onTakePhoto = onTakePhoto,
+                    onPickDocument = onPickDocument,
+                    onVoiceInput = onVoiceInput,
+                    isListening = isListening,
                     onClearImage = onClearImage,
                     onReasoningEnabledChange = onReasoningEnabledChange,
                     onDismissError = onDismissError,
@@ -2176,10 +4059,107 @@ fun LmStudioApp(
                 contentPadding = padding,
                 onSuggestion = onSuggestion,
                 onEditMessage = onEditMessage,
+                onDeleteMessage = onDeleteMessage,
+                onSpeakMessage = onSpeakMessage,
+                onStopSpeaking = onStopSpeaking,
+                speakingMessageId = speakingMessageId,
             )
         }
     }
 }
+
+@Composable
+private fun ContextUsageBar(state: ChatUiState) {
+    val usage = state.contextUsage()
+    val barColor = when {
+        usage.fraction >= 0.92f -> MaterialTheme.colorScheme.error
+        usage.fraction >= 0.72f -> Color(0xFFFFB020)
+        else -> MaterialTheme.colorScheme.primary
+    }
+
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp, vertical = 2.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Context",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = "${usage.usedTokens.formatTokenCount()} / ${usage.availableTokens.formatTokenCount()}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            LinearProgressIndicator(
+                progress = { usage.fraction.coerceIn(0f, 1f) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(3.dp)
+                    .clip(RoundedCornerShape(50.dp)),
+                color = barColor,
+                trackColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.75f),
+            )
+        }
+    }
+}
+
+private fun ChatUiState.contextUsage(): ContextUsage {
+    val available = contextLengthDraft.toNullableInt()
+        ?: selectedModelInfo()?.contextLength
+        ?: DefaultContextLength
+    val used = estimatedContextTokens().coerceAtLeast(0)
+    return ContextUsage(
+        usedTokens = used,
+        availableTokens = available,
+        fraction = used.toFloat() / available.toFloat().coerceAtLeast(1f),
+    )
+}
+
+private fun ChatUiState.estimatedContextTokens(): Int {
+    val messageTokens = messages.fold(0) { total, message ->
+        val attachmentTokens = message.attachments.fold(0) { attachmentTotal, attachment ->
+            attachmentTotal + if (attachment.dataUrl.isBlank()) 64 else 1100
+        }
+        total + message.content.estimatedTokenCount() + attachmentTokens + 4
+    }
+    val pendingInputTokens = input.estimatedTokenCount()
+    val pendingAttachmentTokens = attachedImages.size * 1100 +
+        (attachedDocumentText?.text?.estimatedTokenCount() ?: 0)
+    return activeSystemPrompt().estimatedTokenCount() +
+        messageTokens +
+        pendingInputTokens +
+        pendingAttachmentTokens
+}
+
+private fun String.estimatedTokenCount(): Int {
+    if (isBlank()) return 0
+    return (length / 4.0).toInt().coerceAtLeast(1)
+}
+
+private fun Int.formatTokenCount(): String =
+    if (this >= 1000) {
+        val compact = this / 1000.0
+        if (compact >= 10) {
+            "${compact.toInt()}k"
+        } else {
+            "%.1fk".format(compact)
+        }
+    } else {
+        toString()
+    }
 
 @Composable
 private fun DrawerContent(
@@ -2342,8 +4322,13 @@ private fun MessagesPanel(
     contentPadding: PaddingValues,
     onSuggestion: (String) -> Unit,
     onEditMessage: (String) -> Unit,
+    onDeleteMessage: (String) -> Unit,
+    onSpeakMessage: (String, String) -> Unit,
+    onStopSpeaking: () -> Unit,
+    speakingMessageId: String?,
 ) {
     val listState = rememberLazyListState()
+    var pendingDeleteMessage by remember { mutableStateOf<ChatMessage?>(null) }
 
     LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.content?.length, state.isSending) {
         if (state.messages.isNotEmpty() || state.isSending) {
@@ -2377,6 +4362,11 @@ private fun MessagesPanel(
             MessageRow(
                 message = message,
                 onEditMessage = onEditMessage,
+                onDeleteMessage = { pendingDeleteMessage = message },
+                voiceOutputEnabled = state.voiceOutputEnabled,
+                onSpeakMessage = onSpeakMessage,
+                onStopSpeaking = onStopSpeaking,
+                speakingMessageId = speakingMessageId,
             )
         }
 
@@ -2385,6 +4375,47 @@ private fun MessagesPanel(
                 TypingRow()
             }
         }
+    }
+
+    val messageToDelete = pendingDeleteMessage
+    if (messageToDelete != null) {
+        AlertDialog(
+            onDismissRequest = { pendingDeleteMessage = null },
+            title = { Text("Delete message?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("This will remove the message from this chat history.")
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = messageToDelete.deletePreview(),
+                            modifier = Modifier.padding(12.dp),
+                            maxLines = 4,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteMessage(messageToDelete.id)
+                        pendingDeleteMessage = null
+                    },
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteMessage = null }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 }
 
@@ -2437,6 +4468,11 @@ private fun EmptyConversation(onSuggestion: (String) -> Unit) {
 private fun MessageRow(
     message: ChatMessage,
     onEditMessage: (String) -> Unit,
+    onDeleteMessage: (String) -> Unit,
+    voiceOutputEnabled: Boolean,
+    onSpeakMessage: (String, String) -> Unit,
+    onStopSpeaking: () -> Unit,
+    speakingMessageId: String?,
 ) {
     val isUser = message.role == MessageRole.User
     val context = LocalContext.current
@@ -2476,8 +4512,14 @@ private fun MessageRow(
                 }
                 MessageActions(
                     canEdit = true,
+                    canDelete = !message.isStreaming,
+                    canSpeak = false,
+                    isSpeaking = false,
                     onCopy = { context.copyToClipboard(message.content) },
                     onEdit = { onEditMessage(message.id) },
+                    onDelete = { onDeleteMessage(message.id) },
+                    onSpeak = {},
+                    onStopSpeaking = {},
                 )
             }
         } else {
@@ -2496,8 +4538,16 @@ private fun MessageRow(
                 }
                 MessageActions(
                     canEdit = false,
+                    canDelete = !message.isStreaming,
+                    canSpeak = voiceOutputEnabled &&
+                        !message.isStreaming &&
+                        message.content.speakableAnswerText().isNotBlank(),
+                    isSpeaking = speakingMessageId == message.id,
                     onCopy = { context.copyToClipboard(message.content) },
                     onEdit = {},
+                    onDelete = { onDeleteMessage(message.id) },
+                    onSpeak = { onSpeakMessage(message.id, message.content) },
+                    onStopSpeaking = onStopSpeaking,
                 )
             }
         }
@@ -2522,7 +4572,11 @@ private fun MessageAttachmentSummary(attachments: List<ChatImageAttachment>) {
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(
-                        imageVector = Icons.Filled.AddPhotoAlternate,
+                        imageVector = if (attachment.dataUrl.isBlank()) {
+                            Icons.Filled.Description
+                        } else {
+                            Icons.Filled.AddPhotoAlternate
+                        },
                         contentDescription = null,
                         modifier = Modifier.size(15.dp),
                     )
@@ -2552,10 +4606,16 @@ private data class MessageBlock(
 )
 
 private fun parseMessageBlocks(rawContent: String): List<MessageBlock> {
-    val content = rawContent
+    val content = rawContent.withoutNativeActionBlocks()
         .replace("\r\n", "\n")
         .trim()
-    if (content.isBlank()) return emptyList()
+    if (content.isBlank()) {
+        return if (NativeActionRegex.containsMatchIn(rawContent)) {
+            listOf(MessageBlock(MessageBlockType.Text, "Phone-side action requested."))
+        } else {
+            emptyList()
+        }
+    }
 
     val blocks = mutableListOf<MessageBlock>()
     val bodyLines = mutableListOf<String>()
@@ -2592,6 +4652,33 @@ private fun parseMessageBlocks(rawContent: String): List<MessageBlock> {
 
     return blocks.filter { it.text.isNotBlank() }
 }
+
+private fun String.speakableAnswerText(): String =
+    parseMessageBlocks(this)
+        .filter { it.type == MessageBlockType.Text }
+        .joinToString("\n\n") { it.text }
+        .replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), ", ")
+        .replace("**", "")
+        .replace("__", "")
+        .replace(Regex("`([^`]+)`"), "$1")
+        .replace(Regex("\\[([^\\]]+)]\\([^)]*\\)"), "$1")
+        .replace(Regex("\\|\\s*:?-{3,}:?\\s*"), " ")
+        .replace(Regex("[ \\t]{2,}"), " ")
+        .trim()
+
+private fun Int.speechRecognitionMessage(): String =
+    when (this) {
+        SpeechRecognizer.ERROR_AUDIO -> "Voice input had an audio recording problem."
+        SpeechRecognizer.ERROR_CLIENT -> "Voice input was cancelled."
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission is required for voice input."
+        SpeechRecognizer.ERROR_NETWORK,
+        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Voice recognition could not reach the speech service."
+        SpeechRecognizer.ERROR_NO_MATCH -> "I did not catch that. Try voice input again."
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Speech recognizer is busy. Try again in a moment."
+        SpeechRecognizer.ERROR_SERVER -> "The speech service returned an error."
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech was detected."
+        else -> "Voice input failed. Try again."
+    }
 
 private fun MutableList<MessageBlock>.addTextAndCode(
     rawText: String,
@@ -3153,8 +5240,14 @@ private fun StreamingIndicator(text: String) {
 @Composable
 private fun MessageActions(
     canEdit: Boolean,
+    canDelete: Boolean,
+    canSpeak: Boolean,
+    isSpeaking: Boolean,
     onCopy: () -> Unit,
     onEdit: () -> Unit,
+    onDelete: () -> Unit,
+    onSpeak: () -> Unit,
+    onStopSpeaking: () -> Unit,
 ) {
     Row(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
@@ -3171,6 +5264,32 @@ private fun MessageActions(
                 modifier = Modifier.size(17.dp),
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+        if (canDelete) {
+            IconButton(
+                onClick = onDelete,
+                modifier = Modifier.size(34.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Delete,
+                    contentDescription = "Delete message",
+                    modifier = Modifier.size(17.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (canSpeak) {
+            IconButton(
+                onClick = if (isSpeaking) onStopSpeaking else onSpeak,
+                modifier = Modifier.size(34.dp),
+            ) {
+                Icon(
+                    imageVector = if (isSpeaking) Icons.Filled.Stop else Icons.AutoMirrored.Filled.VolumeUp,
+                    contentDescription = if (isSpeaking) "Stop speaking" else "Read aloud",
+                    modifier = Modifier.size(17.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
         if (canEdit) {
             IconButton(
@@ -3271,6 +5390,48 @@ private fun ImageAttachButton(
 }
 
 @Composable
+private fun DocumentAttachButton(onPickDocument: () -> Unit) {
+    IconButton(
+        onClick = onPickDocument,
+        colors = IconButtonDefaults.filledTonalIconButtonColors(),
+        modifier = Modifier.size(42.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Filled.Description,
+            contentDescription = "Attach document",
+        )
+    }
+}
+
+@Composable
+private fun VoiceInputButton(
+    isListening: Boolean,
+    onVoiceInput: () -> Unit,
+) {
+    IconButton(
+        onClick = onVoiceInput,
+        colors = IconButtonDefaults.filledTonalIconButtonColors(
+            containerColor = if (isListening) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                MaterialTheme.colorScheme.secondaryContainer
+            },
+            contentColor = if (isListening) {
+                MaterialTheme.colorScheme.onPrimary
+            } else {
+                MaterialTheme.colorScheme.onSecondaryContainer
+            },
+        ),
+        modifier = Modifier.size(42.dp),
+    ) {
+        Icon(
+            imageVector = if (isListening) Icons.Filled.Stop else Icons.Filled.Mic,
+            contentDescription = if (isListening) "Stop voice input" else "Voice input",
+        )
+    }
+}
+
+@Composable
 private fun AttachedImageChip(
     attachment: ChatImageAttachment,
     onClear: () -> Unit,
@@ -3312,24 +5473,79 @@ private fun AttachedImageChip(
 }
 
 @Composable
+private fun AttachedDocumentChip(
+    document: ChatDocumentAttachment,
+    onClear: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.75f),
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        shape = RoundedCornerShape(16.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 7.dp, bottom = 7.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Description,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+            )
+            Column(modifier = Modifier.widthIn(max = 260.dp)) {
+                Text(
+                    text = document.name,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Text(
+                    text = "${document.text.length.coerceAtMost(99999)} chars extracted",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            IconButton(
+                onClick = onClear,
+                modifier = Modifier.size(30.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Close,
+                    contentDescription = "Remove document",
+                    modifier = Modifier.size(17.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun ChatComposer(
+    state: ChatUiState,
     input: String,
     isSending: Boolean,
     error: String?,
     canAttachImage: Boolean,
-    attachedImage: ChatImageAttachment?,
+    attachedImages: List<ChatImageAttachment>,
+    attachedDocumentText: ChatDocumentAttachment?,
     reasoningSupported: Boolean,
     reasoningEnabled: Boolean,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
+    onCancelSend: () -> Unit,
     onPickImage: () -> Unit,
     onTakePhoto: () -> Unit,
+    onPickDocument: () -> Unit,
+    onVoiceInput: () -> Unit,
+    isListening: Boolean,
     onClearImage: () -> Unit,
     onReasoningEnabledChange: (Boolean) -> Unit,
     onDismissError: () -> Unit,
 ) {
     val focusManager = LocalFocusManager.current
-    val canSend = (input.isNotBlank() || attachedImage != null) && !isSending
+    val canSend = (input.isNotBlank() || attachedImages.isNotEmpty() || attachedDocumentText != null) && !isSending
 
     Surface(
         color = MaterialTheme.colorScheme.surface,
@@ -3367,11 +5583,16 @@ private fun ChatComposer(
                 }
             }
 
-            AnimatedVisibility(visible = canAttachImage || reasoningSupported || attachedImage != null) {
+            AnimatedVisibility(
+                visible = true,
+            ) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (attachedImage != null) {
-                        AttachedImageChip(
-                            attachment = attachedImage,
+                    attachedImages.forEach { attachment ->
+                        AttachedImageChip(attachment = attachment, onClear = onClearImage)
+                    }
+                    if (attachedDocumentText != null) {
+                        AttachedDocumentChip(
+                            document = attachedDocumentText,
                             onClear = onClearImage,
                         )
                     }
@@ -3379,17 +5600,26 @@ private fun ChatComposer(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        DocumentAttachButton(onPickDocument = onPickDocument)
                         if (canAttachImage) {
                             ImageAttachButton(
                                 onPickImage = onPickImage,
                                 onTakePhoto = onTakePhoto,
                             )
                         }
+                        if (state.voiceInputEnabled) {
+                            VoiceInputButton(
+                                isListening = isListening,
+                                onVoiceInput = onVoiceInput,
+                            )
+                        }
                         if (reasoningSupported) {
                             FilterChip(
                                 selected = reasoningEnabled,
                                 onClick = { onReasoningEnabledChange(!reasoningEnabled) },
-                                label = { Text("Thinking") },
+                                label = {
+                                    Text(if (reasoningEnabled) "Thinking on" else "Thinking off")
+                                },
                                 leadingIcon = {
                                     Icon(
                                         imageVector = Icons.Filled.Lightbulb,
@@ -3454,19 +5684,30 @@ private fun ChatComposer(
                     IconButton(
                         onClick = {
                             focusManager.clearFocus()
-                            onSend()
+                            if (isSending) {
+                                onCancelSend()
+                            } else {
+                                onSend()
+                            }
                         },
-                        enabled = canSend,
+                        enabled = isSending || canSend,
                         colors = IconButtonDefaults.filledIconButtonColors(
-                            containerColor = MaterialTheme.colorScheme.primary,
-                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                            containerColor = if (isSending) {
+                                MaterialTheme.colorScheme.errorContainer
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            },
+                            contentColor = if (isSending) {
+                                MaterialTheme.colorScheme.onErrorContainer
+                            } else {
+                                MaterialTheme.colorScheme.onPrimary
+                            },
                         ),
                     ) {
                         if (isSending) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                strokeWidth = 2.dp,
-                                color = MaterialTheme.colorScheme.onPrimary,
+                            Icon(
+                                imageVector = Icons.Filled.Stop,
+                                contentDescription = "Stop response",
                             )
                         } else {
                             Icon(
@@ -3477,8 +5718,62 @@ private fun ChatComposer(
                     }
                 }
             }
+            ContextUsageBar(state = state)
         }
     }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ToolToggleRow(
+    title: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+        )
+    }
+}
+
+@Composable
+private fun GenerationNumberField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    modifier: Modifier = Modifier,
+    decimal: Boolean,
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = modifier,
+        singleLine = true,
+        label = { Text(label) },
+        keyboardOptions = KeyboardOptions(
+            keyboardType = if (decimal) KeyboardType.Decimal else KeyboardType.Number,
+            imeAction = ImeAction.Next,
+        ),
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -3492,9 +5787,27 @@ private fun SettingsSheet(
     onServerToolsEnabledChange: (Boolean) -> Unit,
     onServerIntegrationsChange: (String) -> Unit,
     onAllowedToolsChange: (String) -> Unit,
+    onNativeIntentToolEnabledChange: (Boolean) -> Unit,
+    onCalendarToolEnabledChange: (Boolean) -> Unit,
+    onContactsToolEnabledChange: (Boolean) -> Unit,
+    onNotificationDigestToolEnabledChange: (Boolean) -> Unit,
+    onLocalFileSearchToolEnabledChange: (Boolean) -> Unit,
+    onPickLocalSearchFolder: () -> Unit,
+    onDeviceStatusToolEnabledChange: (Boolean) -> Unit,
+    onVoiceInputEnabledChange: (Boolean) -> Unit,
+    onVoiceOutputEnabledChange: (Boolean) -> Unit,
+    onAutoReadAnswersEnabledChange: (Boolean) -> Unit,
+    onAppendDateTimeToSystemPromptChange: (Boolean) -> Unit,
     onSystemProfileSelect: (String) -> Unit,
     onSystemProfileNameChange: (String) -> Unit,
     onSystemPromptChange: (String) -> Unit,
+    onTemperatureChange: (String) -> Unit,
+    onTopPChange: (String) -> Unit,
+    onMaxTokensChange: (String) -> Unit,
+    onContextLengthChange: (String) -> Unit,
+    onPresencePenaltyChange: (String) -> Unit,
+    onFrequencyPenaltyChange: (String) -> Unit,
+    onSeedChange: (String) -> Unit,
     onSystemProfileSave: () -> Unit,
     onSystemProfileCreate: () -> Unit,
     onSystemProfileDelete: (String) -> Unit,
@@ -3503,6 +5816,7 @@ private fun SettingsSheet(
     onImportChats: () -> Unit,
 ) {
     val scrollState = rememberScrollState()
+    var advancedGenerationExpanded by remember { mutableStateOf(false) }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -3666,6 +5980,101 @@ private fun SettingsSheet(
                 label = { Text("System prompt") },
                 supportingText = { Text("Used as the system prompt for new requests.") },
             )
+            ToolToggleRow(
+                title = "Append phone date/time",
+                description = "Adds the current phone date, time, and time zone to every system prompt.",
+                checked = state.appendDateTimeToSystemPrompt,
+                onCheckedChange = onAppendDateTimeToSystemPromptChange,
+            )
+            OutlinedButton(
+                onClick = { advancedGenerationExpanded = !advancedGenerationExpanded },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Text(
+                    text = if (advancedGenerationExpanded) {
+                        "Hide advanced generation"
+                    } else {
+                        "Advanced generation"
+                    },
+                )
+            }
+            AnimatedVisibility(visible = advancedGenerationExpanded) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        text = "Blank or invalid values are omitted from the API request.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        GenerationNumberField(
+                            value = state.temperatureDraft,
+                            onValueChange = onTemperatureChange,
+                            label = "Temperature",
+                            modifier = Modifier.weight(1f),
+                            decimal = true,
+                        )
+                        GenerationNumberField(
+                            value = state.topPDraft,
+                            onValueChange = onTopPChange,
+                            label = "Top P",
+                            modifier = Modifier.weight(1f),
+                            decimal = true,
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        GenerationNumberField(
+                            value = state.maxTokensDraft,
+                            onValueChange = onMaxTokensChange,
+                            label = "Max tokens",
+                            modifier = Modifier.weight(1f),
+                            decimal = false,
+                        )
+                        GenerationNumberField(
+                            value = state.contextLengthDraft,
+                            onValueChange = onContextLengthChange,
+                            label = "Context length",
+                            modifier = Modifier.weight(1f),
+                            decimal = false,
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        GenerationNumberField(
+                            value = state.presencePenaltyDraft,
+                            onValueChange = onPresencePenaltyChange,
+                            label = "Presence penalty",
+                            modifier = Modifier.weight(1f),
+                            decimal = true,
+                        )
+                        GenerationNumberField(
+                            value = state.frequencyPenaltyDraft,
+                            onValueChange = onFrequencyPenaltyChange,
+                            label = "Frequency penalty",
+                            modifier = Modifier.weight(1f),
+                            decimal = true,
+                        )
+                    }
+                    GenerationNumberField(
+                        value = state.seedDraft,
+                        onValueChange = onSeedChange,
+                        label = "Seed",
+                        modifier = Modifier.fillMaxWidth(),
+                        decimal = false,
+                    )
+                }
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -3692,6 +6101,102 @@ private fun SettingsSheet(
                 ) {
                     Text("Save")
                 }
+            }
+
+            HorizontalDivider(color = DividerDefaults.color.copy(alpha = 0.45f))
+
+            Text(
+                text = "Phone tools",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = "Enabled tools are added quietly to the system prompt. Every phone action still asks for confirmation.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            ToolToggleRow(
+                title = "Open app drafts",
+                description = "Open URL, Maps, email draft, phone dialer, or SMS draft.",
+                checked = state.nativeIntentToolEnabled,
+                onCheckedChange = onNativeIntentToolEnabledChange,
+            )
+            ToolToggleRow(
+                title = "Calendar and reminders",
+                description = "Prepare calendar events or reminder drafts.",
+                checked = state.calendarToolEnabled,
+                onCheckedChange = onCalendarToolEnabledChange,
+            )
+            ToolToggleRow(
+                title = "Contacts lookup",
+                description = "Search contacts by name after Android permission is granted.",
+                checked = state.contactsToolEnabled,
+                onCheckedChange = onContactsToolEnabledChange,
+            )
+            ToolToggleRow(
+                title = "Notification digest",
+                description = "Summarize captured notifications. Android notification access opens when enabled.",
+                checked = state.notificationDigestToolEnabled,
+                onCheckedChange = onNotificationDigestToolEnabledChange,
+            )
+            ToolToggleRow(
+                title = "Local file search",
+                description = "Search a user-selected folder for document names and readable text snippets.",
+                checked = state.localFileSearchToolEnabled,
+                onCheckedChange = onLocalFileSearchToolEnabledChange,
+            )
+            AnimatedVisibility(visible = state.localFileSearchToolEnabled) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = if (state.localFileSearchTreeUri.isBlank()) {
+                            "No folder selected."
+                        } else {
+                            "Folder access granted."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedButton(
+                        onClick = onPickLocalSearchFolder,
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Text("Change folder")
+                    }
+                }
+            }
+            ToolToggleRow(
+                title = "Device status",
+                description = "Report battery, network, storage, app version, and LM Studio connectivity.",
+                checked = state.deviceStatusToolEnabled,
+                onCheckedChange = onDeviceStatusToolEnabledChange,
+            )
+
+            HorizontalDivider(color = DividerDefaults.color.copy(alpha = 0.45f))
+
+            Text(
+                text = "Voice",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            ToolToggleRow(
+                title = "Voice input",
+                description = "Use the microphone to transcribe prompts into the message box.",
+                checked = state.voiceInputEnabled,
+                onCheckedChange = onVoiceInputEnabledChange,
+            )
+            ToolToggleRow(
+                title = "Voice output",
+                description = "Show read-aloud controls on assistant messages.",
+                checked = state.voiceOutputEnabled,
+                onCheckedChange = onVoiceOutputEnabledChange,
+            )
+            AnimatedVisibility(visible = state.voiceOutputEnabled) {
+                ToolToggleRow(
+                    title = "Auto-read answers",
+                    description = "Read new assistant replies aloud after generation finishes.",
+                    checked = state.autoReadAnswersEnabled,
+                    onCheckedChange = onAutoReadAnswersEnabledChange,
+                )
             }
 
             HorizontalDivider(color = DividerDefaults.color.copy(alpha = 0.45f))

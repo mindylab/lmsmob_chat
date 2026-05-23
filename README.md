@@ -6,16 +6,18 @@
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey)](LICENSE.md)
 
 Android chat app for LM Studio. Connect your phone to an LM Studio server
-running on your PC and chat with local LLMs over your LAN.
+running on your PC and chat with local LLMs over your LAN. Version 1.28 adds
+voice input, read-aloud answers, document sharing, and opt-in phone assistant
+tools for maps, drafts, contacts, notifications, local files, and device status.
 
 [Download the latest APK](https://github.com/mindylab/lmsmob_chat/releases/latest)
 or open the current
-[v1.16 APK asset](https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob_chat-v1.16-debug.apk).
+[v1.28 APK asset](https://github.com/mindylab/lmsmob_chat/releases/download/v1.28/lmsmob_chat-v1.28-debug.apk).
 
 ## Demo
 
 <p align="center">
-  <a href="https://github.com/mindylab/lmsmob_chat/releases/download/v1.16/lmsmob-chat-v1.16-demo.mp4">Watch the LMSMOB Chat Android demo video</a>
+  <a href="https://github.com/mindylab/lmsmob_chat/releases/download/v1.28/lmsmob-chat-v1.28-demo.mp4">Watch the LMSMOB Chat Android demo video</a>
 </p>
 
 <div align="center">
@@ -45,23 +47,36 @@ or open the current
 - Connects to LM Studio MCP/plugin integrations such as `mcp/local-web`.
 - Refreshes loaded LM Studio models from the app settings.
 - Keeps chat sessions locally with search and session switching.
-- Supports copy/edit for user messages.
+- Supports copy, edit, delete, and cancel actions in chat.
 - Imports and exports chat history as JSON.
 - Supports image attachments for vision-capable models.
+- Shares text, images, PDFs, DOC/DOCX, and XLS/XLSX files into the app from
+  Android share sheets.
+- Converts supported documents into text, and can render PDFs as image
+  attachments for vision-capable models.
+- Adds optional voice input, text-to-speech output, and automatic answer
+  read-aloud.
+- Provides opt-in phone assistant tools for URL opening, map routes, email/SMS
+  drafts, phone dialing, calendar/reminder drafts, contact lookup, notification
+  digest, local file search, and device status.
+- Shows context usage estimates and advanced generation settings including
+  temperature, top-p, max tokens, context length, penalties, and seed.
 - Includes emulator and physical-device LAN setup paths.
 
 ## Roadmap
 
-The 2026 roadmap focuses on richer MCP and phone-assistant tools:
+The 2026 roadmap now builds on the first phone-assistant tools shipped in
+v1.28:
 
 - Web tools already work through compatible LM Studio MCP/plugin setup, with a
   packaged LMS/LM Studio web plugin planned to make setup easier.
-- Maps and phone location tools are planned with explicit Android permission
+- Maps route drafts, contact lookup, notification digest, local file search,
+  device status, and confirmable phone action drafts are available now.
+- Phone location tools are still planned with explicit Android permission
   controls.
 - Cron-style scheduled tasks are planned for reminders, notifications, and
   safe phone actions.
-- Phone assistant tools are planned for opt-in device context and confirmable
-  on-phone actions.
+- A signed release APK workflow is planned for wider distribution.
 
 See the full [2026 roadmap](docs/roadmap-2026.md).
 
