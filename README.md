@@ -37,7 +37,7 @@ or open the current
         </video>
       </td>
       <td bgcolor="black" align="center">
-        Old vesion 1.26<br>
+        Old vesion 1.16<br>
         <video
           src="https://github.com/user-attachments/assets/2233ddcb-c7a8-4783-b36d-9838fa2aa6b3"
           width="360"
