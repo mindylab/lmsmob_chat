@@ -1,7 +1,12 @@
 package com.mindylab.lmstudiochat
 
 import android.Manifest
+import android.app.AlarmManager
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.Notification
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.ClipData
@@ -13,16 +18,24 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.pdf.PdfRenderer
+import android.media.AudioAttributes
+import android.media.Ringtone
+import android.media.RingtoneManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.BatteryManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.StatFs
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.view.WindowManager
 import android.provider.OpenableColumns
+import android.provider.AlarmClock
 import android.provider.CalendarContract
 import android.provider.ContactsContract
 import android.provider.DocumentsContract
@@ -53,6 +66,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -146,6 +161,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
@@ -163,14 +180,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -191,6 +211,7 @@ import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -199,7 +220,31 @@ import java.util.UUID
 import java.util.zip.ZipInputStream
 
 private const val DefaultApiUrl = "http://10.0.2.2:1234/v1"
-private const val DefaultSystemPrompt = "You are a helpful assistant running locally through LM Studio."
+private const val LegacyDefaultSystemPrompt = "You are a helpful assistant running locally through LM Studio."
+private val DefaultSystemPrompt = """
+    You are LMSMOB Chat, a polite, practical assistant running locally through LM Studio on the user's Android device.
+
+    Core style:
+    - Be warm, concise, and useful. Ask a short clarifying question only when it is needed to avoid a wrong action.
+    - Use the user's language when it is clear from the conversation.
+    - Explain uncertainty honestly, especially for live, legal, medical, financial, or device-permission-sensitive tasks.
+    - When the user's context suggests a useful next step, offer one or two concrete options without overwhelming them.
+
+    You can help with:
+    - Chat, drafting, rewriting, translation, summarization, planning, troubleshooting, and coding explanations.
+    - Images when the selected LM Studio model supports vision.
+    - Documents shared or uploaded by the user, including PDF, DOC, DOCX, XLS, and XLSX after the app converts them to text or images.
+    - Rich responses with readable Markdown, tables, lists, and code blocks when appropriate.
+    - LM Studio server-side MCP/plugin tools when the app enables integrations for the current request.
+    - Android phone-side tools when the app lists them below; these always require user confirmation before any action is performed.
+
+    Behavior with tools and actions:
+    - Prefer answering directly when no tool is needed.
+    - If a phone-side action is needed, describe what you want to do and emit exactly one action block in the format the app provides.
+    - Treat calls, SMS, email, calendar, reminders, alarms, URLs, maps, contacts, files, notifications, and watch jobs as sensitive. Never claim they are finished until the app returns a tool result or the user confirms the draft.
+    - For monitoring or recurring tasks, prefer clear, narrow watch-job filters such as app, sender, and text condition.
+    - If a capability is not enabled or not listed, tell the user how to enable it instead of pretending you used it.
+""".trimIndent()
 private const val DefaultSystemProfileId = "default"
 private const val MaxDocumentTextChars = 24000
 private const val DefaultContextLength = 8000
@@ -213,6 +258,27 @@ data class NativeToolAction(
     val id: String = UUID.randomUUID().toString(),
     val tool: String,
     val args: JSONObject,
+)
+
+data class WatchJob(
+    val id: String = UUID.randomUUID().toString(),
+    val title: String,
+    val trigger: String = "notification",
+    val appQuery: String = "",
+    val senderQuery: String = "",
+    val textQuery: String = "",
+    val matchMode: String = "filter",
+    val aiInstruction: String = "",
+    val scheduleMinutes: Int = 0,
+    val alertMessage: String = "",
+    val alertMode: String = "normal",
+    val lifetime: String = "noend",
+    val enabled: Boolean = true,
+    val createdAt: Long = System.currentTimeMillis(),
+    val lastRunAt: Long = 0L,
+    val lastCheckedAt: Long = 0L,
+    val lastMatchedAt: Long = 0L,
+    val matchCount: Int = 0,
 )
 
 private val NativeActionRegex = Regex(
@@ -486,6 +552,21 @@ class MainActivity : ComponentActivity() {
                         viewModel.showError("Contacts permission is required before the contacts lookup tool can be used.")
                     }
                 }
+                val notificationPermissionLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestPermission(),
+                ) { granted ->
+                    if (!granted) {
+                        viewModel.showError("Notification permission is required before Watch Job alerts can appear.")
+                    }
+                }
+                fun ensureWatchJobAccess() {
+                    if (!context.hasPostNotificationsPermission()) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                    if (!context.isNotificationListenerEnabled()) {
+                        context.openNotificationListenerSettings(viewModel)
+                    }
+                }
                 val localFolderLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.OpenDocumentTree(),
                 ) { uri: Uri? ->
@@ -528,6 +609,11 @@ class MainActivity : ComponentActivity() {
                     onCloseSettings = viewModel::closeSettings,
                     onOpenInfo = viewModel::openInfo,
                     onCloseInfo = viewModel::closeInfo,
+                    onOpenWatchJobs = {
+                        ensureWatchJobAccess()
+                        viewModel.openWatchJobs()
+                    },
+                    onCloseWatchJobs = viewModel::closeWatchJobs,
                     onApiUrlChange = viewModel::updateApiUrl,
                     onModelChange = viewModel::updateModel,
                     onApiTokenChange = viewModel::updateApiToken,
@@ -536,6 +622,7 @@ class MainActivity : ComponentActivity() {
                     onAllowedToolsChange = viewModel::updateAllowedTools,
                     onNativeIntentToolEnabledChange = viewModel::updateNativeIntentToolEnabled,
                     onCalendarToolEnabledChange = viewModel::updateCalendarToolEnabled,
+                    onAlarmToolEnabledChange = viewModel::updateAlarmToolEnabled,
                     onContactsToolEnabledChange = { enabled ->
                         if (!enabled) {
                             viewModel.updateContactsToolEnabled(false)
@@ -560,10 +647,21 @@ class MainActivity : ComponentActivity() {
                     },
                     onPickLocalSearchFolder = { localFolderLauncher.launch(null) },
                     onDeviceStatusToolEnabledChange = viewModel::updateDeviceStatusToolEnabled,
+                    onWatchJobToolEnabledChange = { enabled ->
+                        viewModel.updateWatchJobToolEnabled(enabled)
+                        if (enabled) {
+                            ensureWatchJobAccess()
+                        }
+                    },
                     onVoiceInputEnabledChange = viewModel::updateVoiceInputEnabled,
                     onVoiceOutputEnabledChange = viewModel::updateVoiceOutputEnabled,
                     onAutoReadAnswersEnabledChange = viewModel::updateAutoReadAnswersEnabled,
+                    onAppendCapabilityGuideToSystemPromptChange = viewModel::updateAppendCapabilityGuideToSystemPrompt,
                     onAppendDateTimeToSystemPromptChange = viewModel::updateAppendDateTimeToSystemPrompt,
+                    onCreateWatchJob = viewModel::createWatchJob,
+                    onUpdateWatchJob = viewModel::updateWatchJob,
+                    onToggleWatchJob = viewModel::toggleWatchJob,
+                    onDeleteWatchJob = viewModel::deleteWatchJob,
                     onSystemProfileSelect = viewModel::selectSystemProfile,
                     onSystemProfileNameChange = viewModel::updateSystemProfileNameDraft,
                     onSystemPromptChange = viewModel::updateSystemPromptDraft,
@@ -682,6 +780,56 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+class WatchJobAlertActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON,
+            )
+        }
+        window.addFlags(
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD,
+        )
+
+        val title = intent.getStringExtra(ExtraTitle).orEmpty().ifBlank { "Watch job alert" }
+        val detail = intent.getStringExtra(ExtraDetail).orEmpty()
+        val jobId = intent.getStringExtra(ExtraJobId).orEmpty()
+
+        setContent {
+            LmStudioChatTheme {
+                WatchJobAlarmScreen(
+                    title = title,
+                    detail = detail,
+                    jobId = jobId,
+                    onStop = {
+                        stopWatchJobNotification(jobId)
+                        finish()
+                    },
+                )
+            }
+        }
+    }
+
+    private fun stopWatchJobNotification(jobId: String) {
+        if (jobId.isBlank()) return
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.cancel(jobId.hashCode())
+    }
+
+    companion object {
+        const val ExtraTitle = "watch_job_alert_title"
+        const val ExtraDetail = "watch_job_alert_detail"
+        const val ExtraJobId = "watch_job_id"
+    }
+}
+
 enum class MessageRole(val apiName: String) {
     User("user"),
     Assistant("assistant"),
@@ -750,14 +898,18 @@ data class ChatUiState(
     val allowedTools: String = "",
     val nativeIntentToolEnabled: Boolean = false,
     val calendarToolEnabled: Boolean = false,
+    val alarmToolEnabled: Boolean = false,
     val contactsToolEnabled: Boolean = false,
     val notificationDigestToolEnabled: Boolean = false,
     val localFileSearchToolEnabled: Boolean = false,
     val localFileSearchTreeUri: String = "",
     val deviceStatusToolEnabled: Boolean = false,
+    val watchJobToolEnabled: Boolean = false,
+    val watchJobs: List<WatchJob> = emptyList(),
     val voiceInputEnabled: Boolean = false,
     val voiceOutputEnabled: Boolean = false,
     val autoReadAnswersEnabled: Boolean = false,
+    val appendCapabilityGuideToSystemPrompt: Boolean = true,
     val appendDateTimeToSystemPrompt: Boolean = false,
     val systemProfiles: List<SystemPromptProfile> = listOf(
         SystemPromptProfile(
@@ -782,6 +934,7 @@ data class ChatUiState(
     val previousResponseId: String? = null,
     val isSettingsOpen: Boolean = false,
     val isInfoOpen: Boolean = false,
+    val isWatchJobsOpen: Boolean = false,
     val pendingNativeToolAction: NativeToolAction? = null,
     val error: String? = null,
     val modelLoadError: String? = null,
@@ -830,14 +983,18 @@ class ChatViewModel(
             allowedTools = settingsStore.allowedTools,
             nativeIntentToolEnabled = settingsStore.nativeIntentToolEnabled,
             calendarToolEnabled = settingsStore.calendarToolEnabled,
+            alarmToolEnabled = settingsStore.alarmToolEnabled,
             contactsToolEnabled = settingsStore.contactsToolEnabled,
             notificationDigestToolEnabled = settingsStore.notificationDigestToolEnabled,
             localFileSearchToolEnabled = settingsStore.localFileSearchToolEnabled,
             localFileSearchTreeUri = settingsStore.localFileSearchTreeUri,
             deviceStatusToolEnabled = settingsStore.deviceStatusToolEnabled,
+            watchJobToolEnabled = settingsStore.watchJobToolEnabled,
+            watchJobs = WatchJobStore.load(settingsStore.context),
             voiceInputEnabled = settingsStore.voiceInputEnabled,
             voiceOutputEnabled = settingsStore.voiceOutputEnabled,
             autoReadAnswersEnabled = settingsStore.autoReadAnswersEnabled,
+            appendCapabilityGuideToSystemPrompt = settingsStore.appendCapabilityGuideToSystemPrompt,
             appendDateTimeToSystemPrompt = settingsStore.appendDateTimeToSystemPrompt,
             temperatureDraft = settingsStore.temperature,
             topPDraft = settingsStore.topP,
@@ -860,6 +1017,7 @@ class ChatViewModel(
         settingsStore.saveChatSessions(initialSessions)
         settingsStore.activeSystemProfileId = initialActiveProfile.id
         settingsStore.saveSystemProfiles(initialProfiles)
+        WatchJobStore.load(settingsStore.context).forEach { WatchJobRunner.schedule(settingsStore.context, it) }
         refreshModels(silent = true)
     }
 
@@ -1455,6 +1613,11 @@ class ChatViewModel(
         _uiState.update { it.copy(calendarToolEnabled = value, previousResponseId = null) }
     }
 
+    fun updateAlarmToolEnabled(value: Boolean) {
+        settingsStore.alarmToolEnabled = value
+        _uiState.update { it.copy(alarmToolEnabled = value, previousResponseId = null) }
+    }
+
     fun updateContactsToolEnabled(value: Boolean) {
         settingsStore.contactsToolEnabled = value
         _uiState.update { it.copy(contactsToolEnabled = value, previousResponseId = null) }
@@ -1480,6 +1643,281 @@ class ChatViewModel(
         _uiState.update { it.copy(deviceStatusToolEnabled = value, previousResponseId = null) }
     }
 
+    fun updateWatchJobToolEnabled(value: Boolean) {
+        settingsStore.watchJobToolEnabled = value
+        _uiState.update { it.copy(watchJobToolEnabled = value, previousResponseId = null) }
+    }
+
+    fun openWatchJobs() {
+        _uiState.update {
+            it.copy(
+                watchJobs = WatchJobStore.load(settingsStore.context),
+                isWatchJobsOpen = true,
+            )
+        }
+    }
+
+    fun closeWatchJobs() {
+        _uiState.update { it.copy(isWatchJobsOpen = false) }
+    }
+
+    fun createWatchJob(
+        title: String,
+        trigger: String,
+        appQuery: String,
+        senderQuery: String,
+        textQuery: String,
+        matchMode: String,
+        aiInstruction: String,
+        scheduleMinutesText: String,
+        alertMessage: String,
+        alertMode: String,
+        lifetime: String,
+    ) {
+        val normalizedTitle = title.trim().ifBlank { "Watch job" }
+        val normalizedTrigger = trigger.trim().lowercase(Locale.getDefault()).let {
+            if (it == "schedule") "schedule" else "notification"
+        }
+        val normalizedAppQuery = appQuery.trim()
+        val normalizedSenderQuery = senderQuery.trim()
+        val normalizedTextQuery = textQuery.trim()
+        val normalizedMatchMode = matchMode.normalizedWatchMatchMode()
+        val normalizedAiInstruction = aiInstruction.trim()
+        if (normalizedMatchMode == "ai" && normalizedAiInstruction.isBlank()) {
+            _uiState.update { it.copy(error = "Add AI instructions for AI mode.") }
+            return
+        }
+        if (normalizedMatchMode == "filter" && listOf(normalizedAppQuery, normalizedSenderQuery, normalizedTextQuery).all { it.isBlank() }) {
+            _uiState.update { it.copy(error = "Add at least one Watch Job filter.") }
+            return
+        }
+        val scheduleMinutes = scheduleMinutesText.toIntOrNull()?.coerceIn(1, 1440) ?: 15
+        val job = WatchJob(
+            title = normalizedTitle,
+            trigger = normalizedTrigger,
+            appQuery = normalizedAppQuery,
+            senderQuery = normalizedSenderQuery,
+            textQuery = normalizedTextQuery,
+            matchMode = normalizedMatchMode,
+            aiInstruction = normalizedAiInstruction,
+            scheduleMinutes = if (normalizedTrigger == "schedule") scheduleMinutes else 0,
+            alertMessage = alertMessage.trim(),
+            alertMode = alertMode.normalizedWatchAlertMode(),
+            lifetime = lifetime.normalizedWatchLifetime(),
+        )
+        addWatchJob(job)
+    }
+
+    fun createWatchJobFromArgs(args: JSONObject): WatchJob {
+        val trigger = args.arg("trigger", "mode")
+            .lowercase(Locale.getDefault())
+            .let { if (it == "schedule" || it == "scheduled") "schedule" else "notification" }
+        val scheduleMinutes = args.optInt("schedule_minutes", args.optInt("interval_minutes", 15))
+            .coerceIn(1, 1440)
+        val appQuery = args.arg("app", "package", "app_query")
+        val senderQuery = args.arg("sender", "from", "sender_query")
+        val textQuery = args.arg("text", "contains", "query", "text_query")
+        val matchMode = args.arg("match_mode", "matchMode", "mode_type").normalizedWatchMatchMode()
+        val aiInstruction = args.arg("ai_instruction", "instruction", "instructions", "task")
+        if (matchMode == "ai" && aiInstruction.isBlank()) {
+            throw IOException("AI Watch Job needs ai_instruction.")
+        }
+        if (matchMode == "filter" && listOf(appQuery, senderQuery, textQuery).all { it.isBlank() }) {
+            throw IOException("Watch Job needs at least one app, sender, or text filter.")
+        }
+        val job = WatchJob(
+            title = args.arg("title", "name").ifBlank { "Watch job" },
+            trigger = trigger,
+            appQuery = appQuery,
+            senderQuery = senderQuery,
+            textQuery = textQuery,
+            matchMode = matchMode,
+            aiInstruction = aiInstruction,
+            scheduleMinutes = if (trigger == "schedule") scheduleMinutes else 0,
+            alertMessage = args.arg("alert", "alert_message", "message"),
+            alertMode = args.arg("alert_mode", "alertMode", "mode").normalizedWatchAlertMode(),
+            lifetime = args.arg("lifetime", "life_time", "expires").normalizedWatchLifetime(),
+        )
+        addWatchJob(job)
+        return job
+    }
+
+    fun updateWatchJob(
+        jobId: String,
+        title: String,
+        trigger: String,
+        appQuery: String,
+        senderQuery: String,
+        textQuery: String,
+        matchMode: String,
+        aiInstruction: String,
+        scheduleMinutesText: String,
+        alertMessage: String,
+        alertMode: String,
+        lifetime: String,
+        enabled: Boolean,
+    ) {
+        val existing = WatchJobStore.load(settingsStore.context).firstOrNull { it.id == jobId } ?: return
+        val normalizedTitle = title.trim().ifBlank { existing.title }
+        val normalizedTrigger = trigger.trim().lowercase(Locale.getDefault()).let {
+            if (it == "schedule") "schedule" else "notification"
+        }
+        val normalizedAppQuery = appQuery.trim()
+        val normalizedSenderQuery = senderQuery.trim()
+        val normalizedTextQuery = textQuery.trim()
+        val normalizedMatchMode = matchMode.normalizedWatchMatchMode()
+        val normalizedAiInstruction = aiInstruction.trim()
+        if (normalizedMatchMode == "ai" && normalizedAiInstruction.isBlank()) {
+            _uiState.update { it.copy(error = "Add AI instructions for AI mode.") }
+            return
+        }
+        if (normalizedMatchMode == "filter" && listOf(normalizedAppQuery, normalizedSenderQuery, normalizedTextQuery).all { it.isBlank() }) {
+            _uiState.update { it.copy(error = "Add at least one Watch Job filter.") }
+            return
+        }
+        val scheduleMinutes = scheduleMinutesText.toIntOrNull()?.coerceIn(1, 1440) ?: existing.scheduleMinutes.coerceAtLeast(15)
+        val updated = existing.copy(
+            title = normalizedTitle,
+            trigger = normalizedTrigger,
+            appQuery = normalizedAppQuery,
+            senderQuery = normalizedSenderQuery,
+            textQuery = normalizedTextQuery,
+            matchMode = normalizedMatchMode,
+            aiInstruction = normalizedAiInstruction,
+            scheduleMinutes = if (normalizedTrigger == "schedule") scheduleMinutes else 0,
+            alertMessage = alertMessage.trim(),
+            alertMode = alertMode.normalizedWatchAlertMode(),
+            lifetime = lifetime.normalizedWatchLifetime(),
+            enabled = enabled,
+        )
+        replaceWatchJob(updated)
+    }
+
+    fun listWatchJobsForTool(): String {
+        val jobs = WatchJobStore.load(settingsStore.context)
+        if (jobs.isEmpty()) return "No watch jobs are configured."
+        return buildString {
+            appendLine("Watch jobs:")
+            jobs.forEachIndexed { index, job ->
+                appendLine("${index + 1}. ${job.title}")
+                appendLine("   id: ${job.id}")
+                appendLine("   enabled: ${job.enabled}")
+                appendLine("   trigger: ${job.trigger}${if (job.trigger == "schedule") " every ${job.scheduleMinutes} min" else ""}")
+                appendLine("   match mode: ${job.matchMode.watchMatchModeLabel()}")
+                appendLine("   filters: ${job.watchJobFiltersText()}")
+                if (job.matchMode.normalizedWatchMatchMode() == "ai") {
+                    appendLine("   ai instruction: ${job.aiInstruction}")
+                }
+                appendLine("   alert: ${job.alertMode.watchAlertModeLabel()}, lifetime: ${job.lifetime.watchLifetimeLabel()}")
+                appendLine("   matches: ${job.matchCount}, last run: ${job.lastRunAt.toWatchJobTime()}, last checked: ${job.lastCheckedAt.toWatchJobTime()}, last match: ${job.lastMatchedAt.toWatchJobTime()}")
+            }
+        }.trim()
+    }
+
+    fun editWatchJobFromArgs(args: JSONObject): WatchJob {
+        val existing = findWatchJobFromArgs(args)
+        val newTitle = args.optionalArg("new_title", "new_name")
+            ?: if (args.arg("id", "job_id", "watch_job_id").isNotBlank()) {
+                args.optionalArg("title", "name")
+            } else {
+                null
+            }
+        val updated = existing.copy(
+            title = newTitle?.trim()?.ifBlank { existing.title } ?: existing.title,
+            trigger = (args.optionalArg("trigger", "mode") ?: existing.trigger)
+                .lowercase(Locale.getDefault())
+                .let { if (it == "schedule" || it == "scheduled") "schedule" else "notification" },
+            appQuery = args.optionalArg("app", "package", "app_query")?.trim() ?: existing.appQuery,
+            senderQuery = args.optionalArg("sender", "from", "sender_query")?.trim() ?: existing.senderQuery,
+            textQuery = args.optionalArg("text", "contains", "query", "text_query")?.trim() ?: existing.textQuery,
+            matchMode = (args.optionalArg("match_mode", "matchMode") ?: existing.matchMode).normalizedWatchMatchMode(),
+            aiInstruction = args.optionalArg("ai_instruction", "instruction", "instructions", "task")?.trim() ?: existing.aiInstruction,
+            scheduleMinutes = args.optInt("schedule_minutes", args.optInt("interval_minutes", existing.scheduleMinutes.coerceAtLeast(15))).coerceIn(1, 1440),
+            alertMessage = args.optionalArg("alert", "alert_message", "message")?.trim() ?: existing.alertMessage,
+            alertMode = (args.optionalArg("alert_mode", "alertMode") ?: existing.alertMode).normalizedWatchAlertMode(),
+            lifetime = (args.optionalArg("lifetime", "life_time", "expires") ?: existing.lifetime).normalizedWatchLifetime(),
+            enabled = if (args.has("enabled")) args.optBoolean("enabled", existing.enabled) else existing.enabled,
+        ).let { job ->
+            if (job.trigger == "schedule") job else job.copy(scheduleMinutes = 0)
+        }
+        if (updated.matchMode == "ai" && updated.aiInstruction.isBlank()) {
+            throw IOException("AI Watch Job needs ai_instruction.")
+        }
+        if (updated.matchMode == "filter" && listOf(updated.appQuery, updated.senderQuery, updated.textQuery).all { it.isBlank() }) {
+            throw IOException("Watch Job needs at least one app, sender, or text filter.")
+        }
+        replaceWatchJob(updated)
+        return updated
+    }
+
+    fun deleteWatchJobFromArgs(args: JSONObject): WatchJob {
+        val job = findWatchJobFromArgs(args)
+        deleteWatchJob(job.id)
+        return job
+    }
+
+    fun setWatchJobEnabledFromArgs(args: JSONObject): WatchJob {
+        val job = findWatchJobFromArgs(args)
+        val enabled = when {
+            args.has("enabled") -> args.optBoolean("enabled", job.enabled)
+            args.optString("state").equals("enabled", ignoreCase = true) -> true
+            args.optString("state").equals("disabled", ignoreCase = true) -> false
+            else -> throw IOException("watch_job_set_enabled needs enabled=true or enabled=false.")
+        }
+        val updated = job.copy(enabled = enabled)
+        replaceWatchJob(updated)
+        return updated
+    }
+
+    private fun addWatchJob(job: WatchJob) {
+        val jobs = WatchJobStore.load(settingsStore.context) + job
+        saveWatchJobs(jobs)
+        WatchJobRunner.schedule(settingsStore.context, job)
+    }
+
+    private fun replaceWatchJob(job: WatchJob) {
+        WatchJobRunner.cancel(settingsStore.context, job.id)
+        val jobs = WatchJobStore.load(settingsStore.context).map { existing ->
+            if (existing.id == job.id) job else existing
+        }
+        saveWatchJobs(jobs)
+        WatchJobRunner.schedule(settingsStore.context, job)
+    }
+
+    private fun findWatchJobFromArgs(args: JSONObject): WatchJob {
+        val id = args.arg("id", "job_id", "watch_job_id")
+        val title = args.arg("title", "name")
+        val jobs = WatchJobStore.load(settingsStore.context)
+        return jobs.firstOrNull { id.isNotBlank() && it.id == id }
+            ?: jobs.firstOrNull { title.isNotBlank() && it.title.equals(title, ignoreCase = true) }
+            ?: throw IOException("Watch job not found. Use watch_job_list first to get the id.")
+    }
+
+    fun toggleWatchJob(jobId: String, enabled: Boolean) {
+        val jobs = WatchJobStore.load(settingsStore.context).map { job ->
+            if (job.id == jobId) job.copy(enabled = enabled) else job
+        }
+        saveWatchJobs(jobs)
+        jobs.firstOrNull { it.id == jobId }?.let { job ->
+            if (enabled) {
+                WatchJobRunner.schedule(settingsStore.context, job)
+            } else {
+                WatchJobRunner.cancel(settingsStore.context, job.id)
+            }
+        }
+    }
+
+    fun deleteWatchJob(jobId: String) {
+        val jobs = WatchJobStore.load(settingsStore.context).filterNot { it.id == jobId }
+        WatchJobRunner.cancel(settingsStore.context, jobId)
+        saveWatchJobs(jobs)
+    }
+
+    private fun saveWatchJobs(jobs: List<WatchJob>) {
+        WatchJobStore.save(settingsStore.context, jobs)
+        _uiState.update { it.copy(watchJobs = jobs.sortedByDescending { job -> job.createdAt }) }
+    }
+
     fun updateVoiceInputEnabled(value: Boolean) {
         settingsStore.voiceInputEnabled = value
         _uiState.update { it.copy(voiceInputEnabled = value) }
@@ -1493,6 +1931,11 @@ class ChatViewModel(
     fun updateAutoReadAnswersEnabled(value: Boolean) {
         settingsStore.autoReadAnswersEnabled = value
         _uiState.update { it.copy(autoReadAnswersEnabled = value) }
+    }
+
+    fun updateAppendCapabilityGuideToSystemPrompt(value: Boolean) {
+        settingsStore.appendCapabilityGuideToSystemPrompt = value
+        _uiState.update { it.copy(appendCapabilityGuideToSystemPrompt = value, previousResponseId = null) }
     }
 
     fun updateAppendDateTimeToSystemPrompt(value: Boolean) {
@@ -1759,7 +2202,8 @@ class ChatViewModel(
 }
 
 class SettingsStore(context: Context) {
-    private val preferences = context.getSharedPreferences("lm_studio_chat", Context.MODE_PRIVATE)
+    val context: Context = context.applicationContext
+    private val preferences = this.context.getSharedPreferences("lm_studio_chat", Context.MODE_PRIVATE)
 
     var activeSessionId: String
         get() = preferences.getString("active_session_id", "") ?: ""
@@ -1815,6 +2259,12 @@ class SettingsStore(context: Context) {
             preferences.edit().putBoolean("calendar_tool_enabled", value).apply()
         }
 
+    var alarmToolEnabled: Boolean
+        get() = preferences.getBoolean("alarm_tool_enabled", false)
+        set(value) {
+            preferences.edit().putBoolean("alarm_tool_enabled", value).apply()
+        }
+
     var contactsToolEnabled: Boolean
         get() = preferences.getBoolean("contacts_tool_enabled", false)
         set(value) {
@@ -1845,6 +2295,12 @@ class SettingsStore(context: Context) {
             preferences.edit().putBoolean("device_status_tool_enabled", value).apply()
         }
 
+    var watchJobToolEnabled: Boolean
+        get() = preferences.getBoolean("watch_job_tool_enabled", false)
+        set(value) {
+            preferences.edit().putBoolean("watch_job_tool_enabled", value).apply()
+        }
+
     var voiceInputEnabled: Boolean
         get() = preferences.getBoolean("voice_input_enabled", false)
         set(value) {
@@ -1867,6 +2323,12 @@ class SettingsStore(context: Context) {
         get() = preferences.getBoolean("append_date_time_to_system_prompt", false)
         set(value) {
             preferences.edit().putBoolean("append_date_time_to_system_prompt", value).apply()
+        }
+
+    var appendCapabilityGuideToSystemPrompt: Boolean
+        get() = preferences.getBoolean("append_capability_guide_to_system_prompt", true)
+        set(value) {
+            preferences.edit().putBoolean("append_capability_guide_to_system_prompt", value).apply()
         }
 
     var temperature: String
@@ -1934,10 +2396,16 @@ class SettingsStore(context: Context) {
             .apply()
     }
 
-    fun loadSystemProfiles(): List<SystemPromptProfile> =
-        runCatching {
+    fun loadSystemProfiles(): List<SystemPromptProfile> {
+        val profiles = runCatching {
             systemProfilesFromJson(preferences.getString("system_profiles", "").orEmpty())
         }.getOrDefault(defaultSystemProfiles())
+        val migratedProfiles = migrateDefaultSystemProfiles(profiles)
+        if (migratedProfiles != profiles) {
+            saveSystemProfiles(migratedProfiles)
+        }
+        return migratedProfiles
+    }
 
     fun saveSystemProfiles(profiles: List<SystemPromptProfile>) {
         preferences.edit()
@@ -1989,6 +2457,18 @@ class SettingsStore(context: Context) {
             }
             return profiles.ifEmpty { defaultSystemProfiles() }
         }
+
+        fun migrateDefaultSystemProfiles(profiles: List<SystemPromptProfile>): List<SystemPromptProfile> =
+            profiles.map { profile ->
+                if (
+                    profile.id == DefaultSystemProfileId &&
+                    profile.prompt.trim() == LegacyDefaultSystemPrompt
+                ) {
+                    profile.copy(prompt = DefaultSystemPrompt)
+                } else {
+                    profile
+                }
+            }
 
         fun chatSessionsToJson(sessions: List<ChatSession>): String {
             val sessionsJson = JSONArray()
@@ -2213,7 +2693,7 @@ private fun ChatUiState.activeSystemPrompt(): String =
         ?: systemPromptDraft.takeIf { it.isNotBlank() }
         ?: DefaultSystemPrompt)
         .withPhoneDateTimePrompt(this)
-        .withNativeToolPrompt(this)
+        .withCapabilityGuidePrompt(this)
 
 private fun String.withPhoneDateTimePrompt(state: ChatUiState): String {
     if (!state.appendDateTimeToSystemPrompt) return this
@@ -2224,10 +2704,133 @@ private fun String.withPhoneDateTimePrompt(state: ChatUiState): String {
     return "$this\n\nCurrent phone date/time: $phoneDateTime."
 }
 
+private fun String.withCapabilityGuidePrompt(state: ChatUiState): String {
+    val prompt = state.capabilityGuideSystemPrompt()
+    return if (prompt.isBlank()) this else "$this\n\n$prompt"
+}
+
 private fun String.withNativeToolPrompt(state: ChatUiState): String {
     val prompt = state.nativeToolSystemPrompt()
     return if (prompt.isBlank()) this else "$this\n\n$prompt"
 }
+
+private fun String.withServerToolsPrompt(state: ChatUiState): String {
+    if (!state.serverToolsEnabled) return this
+    val integrations = state.serverIntegrations
+        .split('\n', ',', ';')
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .joinToString("; ")
+    val allowedTools = state.allowedTools
+        .split('\n', ',', ';')
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .joinToString("; ")
+    val prompt = buildString {
+        appendLine("LM Studio server-side tools may be available for this request.")
+        if (integrations.isNotBlank()) {
+            appendLine("Enabled server integrations: $integrations.")
+        }
+        if (allowedTools.isNotBlank()) {
+            appendLine("Allowed server tool names: $allowedTools.")
+        }
+        append("Use server-side tools only when they directly help the user's request, and summarize any tool output clearly.")
+    }
+    return "$this\n\n$prompt"
+}
+
+private fun ChatUiState.capabilityGuideSystemPrompt(): String {
+    if (!appendCapabilityGuideToSystemPrompt) return ""
+    val modelInfo = selectedModelInfo()
+    val visionStatus = if (selectedModelSupportsVision()) "ENABLED" else "DISABLED"
+    val reasoningStatus = if (selectedModelSupportsReasoningToggle()) "ENABLED" else "DISABLED"
+    val serverIntegrationsList = serverIntegrations.toCapabilityList()
+    val allowedToolsList = allowedTools.toCapabilityList()
+
+    fun Boolean.status(): String = if (this) "ENABLED" else "DISABLED"
+
+    fun phoneToolLine(
+        enabled: Boolean,
+        name: String,
+        schema: String,
+        description: String,
+        settingsName: String,
+        limitation: String = "",
+    ): String {
+        val availability = if (enabled) {
+            "Use only after user confirmation. Action schema: $schema."
+        } else {
+            "Do not emit this action. Tell the user to enable Settings > Phone tools > $settingsName first if they want to allow it."
+        }
+        return buildString {
+            append("- [${enabled.status()}] $name: $description $availability")
+            if (limitation.isNotBlank()) append(" Limitation: $limitation")
+        }
+    }
+
+    return buildString {
+        appendLine("LMSMOB capability guide appended by the app.")
+        appendLine("Use this guide as the current source of truth. Enabled means the user has allowed the capability in app settings or by selecting a compatible model. Disabled means you must not pretend to use it; politely tell the user what setting/model permission is needed.")
+        appendLine()
+        appendLine("General app capabilities:")
+        appendLine("- [ENABLED] Conversation: answer questions, draft text, rewrite, translate, summarize, reason through plans, explain code, and help troubleshoot LM Studio or Android setup.")
+        appendLine("- [ENABLED] Rich formatting: use Markdown, headings, bullet lists, code blocks, and Markdown tables. Tables should be emitted as normal Markdown tables when tabular data is present.")
+        appendLine("- [ENABLED] Chat context: use the visible conversation context. The app shows context usage, but you should stay concise when context is high.")
+        appendLine("- [ENABLED] Document uploads: the user can attach PDF, DOC, DOCX, XLS, and XLSX files. The app converts them to plain text or images before sending; answer only from content actually provided.")
+        appendLine("- [$visionStatus] Image understanding: ${if (selectedModelSupportsVision()) "the selected model reports vision support, so the user can attach camera/gallery images." else "the selected model does not report vision support; ask the user to select a vision-capable model before image analysis."}")
+        appendLine("- [$reasoningStatus] Thinking toggle: ${if (selectedModelSupportsReasoningToggle()) "the selected model supports on/off reasoning control." else "the selected model does not expose an on/off reasoning control."}")
+        appendLine("- [${voiceInputEnabled.status()}] Voice input: user-facing speech-to-text for prompts. You do not directly listen; the app transcribes when the user presses the mic.")
+        appendLine("- [${voiceOutputEnabled.status()}] Voice output: user-facing text-to-speech for assistant answers. You do not directly speak; the app reads answers aloud when enabled.")
+        appendLine("- [${autoReadAnswersEnabled.status()}] Auto-read answers: the app can read completed replies aloud when voice output is enabled.")
+        appendLine("- [${appendDateTimeToSystemPrompt.status()}] Current date/time in prompt: ${if (appendDateTimeToSystemPrompt) "the app appends the phone date/time separately." else "not appended; ask the user to enable it if exact current phone time matters."}")
+        appendLine("- [ENABLED] Chat management UI: the user can search chats, copy/edit/delete messages, delete chats, and import/export history in the app UI. Do not claim to operate these UI controls yourself.")
+        appendLine()
+        appendLine("LM Studio server-side tools and integrations:")
+        if (serverToolsEnabled) {
+            appendLine("- [ENABLED] Server tools: LM Studio MCP/plugin integrations may be used by the /api/v1/chat request.")
+            appendLine("- Integrations configured for this request: ${serverIntegrationsList.ifBlank { "none listed; ask the user to add at least one integration in Settings > Server tools." }}")
+            appendLine("- Allowed server tool filter: ${allowedToolsList.ifBlank { "none set; LM Studio decides from enabled integrations." }}")
+            appendLine("- Use server tools only when they directly help. Summarize tool results clearly. If a requested server tool is missing, ask the user to enable/install it in LM Studio and add it to Settings > Server tools.")
+        } else {
+            appendLine("- [DISABLED] Server tools: do not assume web/MCP/plugin access. If the user asks for web browsing, Playwright, local-web, or other LM Studio plugins, tell them to enable Settings > Server tools, add integrations, and provide an API token with MCP permissions.")
+        }
+        appendLine()
+        appendLine("Phone-side action format:")
+        appendLine("- For enabled phone-side actions, reply with a short explanation and exactly one block: <lmsmob_action>{\"tool\":\"tool_name\",\"args\":{\"key\":\"value\"}}</lmsmob_action>")
+        appendLine("- For disabled phone-side actions, do not emit an action block. Ask the user to enable the specific tool in Settings > Phone tools. Enabling a tool is the user's consent to allow the app to offer that action with confirmation.")
+        appendLine("- Calls, SMS, email, maps, URLs, calendar, reminders, alarms, contacts, files, notifications, and watch jobs are sensitive. The app asks for confirmation; never say the final action is complete until the app returns a tool result or the user confirms a draft.")
+        appendLine()
+        appendLine("Phone-side tools:")
+        appendLine(phoneToolLine(nativeIntentToolEnabled, "open_url", "{\"tool\":\"open_url\",\"args\":{\"url\":\"https://example.com\"}}", "open a web URL in Android after confirmation.", "Open app drafts"))
+        appendLine(phoneToolLine(nativeIntentToolEnabled, "maps_route", "{\"tool\":\"maps_route\",\"args\":{\"query\":\"address or destination\"}}", "open Google Maps or a compatible maps app for a destination/search.", "Open app drafts"))
+        appendLine(phoneToolLine(nativeIntentToolEnabled, "email_draft", "{\"tool\":\"email_draft\",\"args\":{\"to\":\"name@example.com\",\"subject\":\"Subject\",\"body\":\"Message\"}}", "prepare an email draft; the user sends it manually.", "Open app drafts"))
+        appendLine(phoneToolLine(nativeIntentToolEnabled, "phone_dial", "{\"tool\":\"phone_dial\",\"args\":{\"phone\":\"+370...\"}}", "open the phone dialer with a number; the user starts the call manually.", "Open app drafts"))
+        appendLine(phoneToolLine(nativeIntentToolEnabled, "sms_draft", "{\"tool\":\"sms_draft\",\"args\":{\"phone\":\"+370...\",\"body\":\"Message\"}}", "prepare an SMS draft; the user sends it manually.", "Open app drafts"))
+        appendLine(phoneToolLine(calendarToolEnabled, "calendar_event", "{\"tool\":\"calendar_event\",\"args\":{\"title\":\"Meeting\",\"start\":\"2026-05-23T14:00\",\"end\":\"2026-05-23T15:00\",\"location\":\"Office\",\"description\":\"Notes\"}}", "prepare a calendar event draft.", "Calendar and reminders"))
+        appendLine(phoneToolLine(calendarToolEnabled, "reminder", "{\"tool\":\"reminder\",\"args\":{\"title\":\"Task\",\"time\":\"2026-05-24T09:00\",\"notes\":\"Details\"}}", "prepare a reminder-style calendar item.", "Calendar and reminders"))
+        appendLine(phoneToolLine(alarmToolEnabled, "alarm_read", "{\"tool\":\"alarm_read\",\"args\":{}}", "read the next scheduled Android alarm if Android exposes one.", "Alarms", "Android does not expose the full alarm database to third-party apps."))
+        appendLine(phoneToolLine(alarmToolEnabled, "alarm_list", "{\"tool\":\"alarm_list\",\"args\":{}}", "open the Clock alarms screen so the user can view alarms.", "Alarms", "The app cannot read all alarms directly."))
+        appendLine(phoneToolLine(alarmToolEnabled, "alarm_create", "{\"tool\":\"alarm_create\",\"args\":{\"hour\":7,\"minute\":30,\"message\":\"Wake up\",\"days\":[\"MONDAY\"],\"vibrate\":true}}", "open an Android alarm creation draft.", "Alarms"))
+        appendLine(phoneToolLine(alarmToolEnabled, "alarm_edit", "{\"tool\":\"alarm_edit\",\"args\":{\"label\":\"Wake up\"}}", "open the Clock alarms screen for manual editing.", "Alarms", "Android does not allow direct edit by label."))
+        appendLine(phoneToolLine(alarmToolEnabled, "alarm_delete", "{\"tool\":\"alarm_delete\",\"args\":{\"label\":\"Wake up\"}}", "open the Clock alarms screen for manual deletion.", "Alarms", "Android does not allow direct delete by label."))
+        appendLine(phoneToolLine(contactsToolEnabled, "contacts_lookup", "{\"tool\":\"contacts_lookup\",\"args\":{\"name\":\"Rasa\"}}", "search granted phone contacts by name and return matching phone/email entries.", "Contacts lookup"))
+        appendLine(phoneToolLine(notificationDigestToolEnabled, "notification_digest", "{\"tool\":\"notification_digest\",\"args\":{\"limit\":20}}", "summarize recent notifications captured by LMSMOB notification access.", "Notification digest", "Requires Android Notification Listener access."))
+        appendLine(phoneToolLine(localFileSearchToolEnabled, "local_file_search", "{\"tool\":\"local_file_search\",\"args\":{\"query\":\"invoice May\"}}", "search the user-selected folder for matching file names and readable text snippets.", "Local file search", "Only the folder granted by the user is searchable."))
+        appendLine(phoneToolLine(deviceStatusToolEnabled, "device_status", "{\"tool\":\"device_status\",\"args\":{}}", "return battery, network, storage, app version, and LM Studio connection status.", "Device status"))
+        appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_list", "{\"tool\":\"watch_job_list\",\"args\":{}}", "return configured watch jobs with ids, filters, alert modes, lifetime, and enabled state.", "Watch jobs"))
+        appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_create", "{\"tool\":\"watch_job_create\",\"args\":{\"title\":\"Mindylab offer watch\",\"trigger\":\"notification\",\"match_mode\":\"ai\",\"ai_instruction\":\"Alert me if this notification mentions an offer from company Mindylab.\",\"app\":\"\",\"sender\":\"\",\"text\":\"\",\"schedule_minutes\":15,\"alert\":\"Mindylab offer found\",\"alert_mode\":\"alarm\",\"lifetime\":\"noend\"}}", "create a local notification or scheduled watch job. match_mode can be filter or ai. In AI mode, ai_instruction is required and app/sender/text are optional pre-filters. alert_mode can be normal or alarm. lifetime can be once, today, or noend.", "Watch jobs", "Requires notification permission, Notification Listener access, and a reachable LM Studio model for AI mode. Alarm mode is full-screen and intrusive, so use it only when the user clearly wants strong alerts."))
+        appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_edit", "{\"tool\":\"watch_job_edit\",\"args\":{\"id\":\"watch-job-id\",\"title\":\"New title\",\"match_mode\":\"ai\",\"ai_instruction\":\"Alert only for Mindylab offers\",\"app\":\"Telegram\",\"sender\":\"Mom\",\"text\":\"urgent\",\"trigger\":\"notification\",\"alert_mode\":\"normal\",\"lifetime\":\"noend\",\"enabled\":true}}", "edit an existing watch job by id or exact title. Omitted fields keep existing values.", "Watch jobs"))
+        appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_set_enabled", "{\"tool\":\"watch_job_set_enabled\",\"args\":{\"id\":\"watch-job-id\",\"enabled\":false}}", "enable or disable an existing watch job by id or exact title.", "Watch jobs"))
+        appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_delete", "{\"tool\":\"watch_job_delete\",\"args\":{\"id\":\"watch-job-id\"}}", "delete an existing watch job by id or exact title.", "Watch jobs"))
+    }.trim()
+}
+
+private fun String.toCapabilityList(): String =
+    split('\n', ',', ';')
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .distinct()
+        .joinToString("; ")
 
 private fun ChatUiState.nativeToolSystemPrompt(): String {
     val tools = mutableListOf<String>()
@@ -2242,10 +2845,24 @@ private fun ChatUiState.nativeToolSystemPrompt(): String {
         tools += "calendar_event {title, start, end, location, description}"
         tools += "reminder {title, time, notes}"
     }
+    if (alarmToolEnabled) {
+        tools += "alarm_read {}"
+        tools += "alarm_list {}"
+        tools += "alarm_create {hour, minute, message, days, vibrate}"
+        tools += "alarm_edit {label}"
+        tools += "alarm_delete {label}"
+    }
     if (contactsToolEnabled) tools += "contacts_lookup {name}"
     if (notificationDigestToolEnabled) tools += "notification_digest {limit}"
     if (localFileSearchToolEnabled) tools += "local_file_search {query}"
     if (deviceStatusToolEnabled) tools += "device_status {}"
+    if (watchJobToolEnabled) {
+        tools += "watch_job_list {}"
+        tools += "watch_job_create {title, trigger, match_mode, ai_instruction, app, sender, text, schedule_minutes, alert, alert_mode, lifetime}"
+        tools += "watch_job_edit {id, title, trigger, match_mode, ai_instruction, app, sender, text, schedule_minutes, alert, alert_mode, lifetime, enabled}"
+        tools += "watch_job_set_enabled {id, enabled}"
+        tools += "watch_job_delete {id}"
+    }
     if (tools.isEmpty()) return ""
 
     return """
@@ -2253,6 +2870,8 @@ private fun ChatUiState.nativeToolSystemPrompt(): String {
         If one of these tools is needed, reply with a short explanation and exactly one action block:
         <lmsmob_action>{"tool":"tool_name","args":{"key":"value"}}</lmsmob_action>
         Available phone-side tools: ${tools.joinToString("; ")}.
+        Alarm limitations: Android only lets this app read the next scheduled alarm and create alarm drafts. alarm_list, alarm_edit, and alarm_delete open the Clock alarms screen for the user to view or finish manually.
+        Watch job limitations: watch_job_list can read configured jobs; watch_job_create, watch_job_edit, watch_job_set_enabled, and watch_job_delete manage them after user confirmation. Use watch_job_list first if you do not know a job id. match_mode may be "filter" or "ai". AI mode sends notification content to LM Studio and requires ai_instruction; app, sender, and text become optional pre-filters. alert_mode may be "normal" or "alarm"; alarm mode opens a full-screen alert with repeating sound/vibration until stopped. lifetime may be "once", "today", or "noend". It needs Android notification access and alert permission, and it should be used only for clear user-requested monitoring tasks.
         Do not claim the action is complete until the app returns a tool result or the user confirms the draft.
         Phone-side tools are drafts only for calls, SMS, email, calendar, maps, and URLs; the user performs the final send/call/save.
     """.trimIndent()
@@ -2300,10 +2919,20 @@ private fun ChatUiState.isNativeToolEnabled(tool: String): Boolean =
         "sms_draft" -> nativeIntentToolEnabled
         "calendar_event",
         "reminder" -> calendarToolEnabled
+        "alarm_read",
+        "alarm_list",
+        "alarm_create",
+        "alarm_edit",
+        "alarm_delete" -> alarmToolEnabled
         "contacts_lookup" -> contactsToolEnabled
         "notification_digest" -> notificationDigestToolEnabled
         "local_file_search" -> localFileSearchToolEnabled
         "device_status" -> deviceStatusToolEnabled
+        "watch_job_list",
+        "watch_job_create",
+        "watch_job_edit",
+        "watch_job_set_enabled",
+        "watch_job_delete" -> watchJobToolEnabled
         else -> false
     }
 
@@ -2316,10 +2945,20 @@ private fun NativeToolAction.displayTitle(): String =
         "sms_draft" -> "Create SMS Draft"
         "calendar_event" -> "Create Calendar Event"
         "reminder" -> "Create Reminder"
+        "alarm_read" -> "Read Next Alarm"
+        "alarm_list" -> "Show All Alarms"
+        "alarm_create" -> "Create Alarm"
+        "alarm_edit" -> "Edit Alarm"
+        "alarm_delete" -> "Delete Alarm"
         "contacts_lookup" -> "Look Up Contacts"
         "notification_digest" -> "Read Notification Digest"
         "local_file_search" -> "Search Local Files"
         "device_status" -> "Read Device Status"
+        "watch_job_list" -> "List Watch Jobs"
+        "watch_job_create" -> "Create Watch Job"
+        "watch_job_edit" -> "Edit Watch Job"
+        "watch_job_set_enabled" -> "Enable or Disable Watch Job"
+        "watch_job_delete" -> "Delete Watch Job"
         else -> tool
     }
 
@@ -2332,10 +2971,27 @@ private fun NativeToolAction.displaySummary(): String =
         "sms_draft" -> listOf(args.arg("phone", "phone_number", "number"), args.arg("body", "message")).filter { it.isNotBlank() }.joinToString(" - ")
         "calendar_event" -> listOf(args.arg("title"), args.arg("start")).filter { it.isNotBlank() }.joinToString(" - ")
         "reminder" -> listOf(args.arg("title"), args.arg("time", "start")).filter { it.isNotBlank() }.joinToString(" - ")
+        "alarm_read" -> "Read the next scheduled Android alarm"
+        "alarm_list" -> "Open the Android Clock alarms list"
+        "alarm_create" -> listOf(args.arg("time").ifBlank { "${args.arg("hour")}:${args.arg("minute")}" }, args.arg("message", "label", "title")).filter { it.isNotBlank() }.joinToString(" - ")
+        "alarm_edit" -> args.arg("label", "message", "title").ifBlank { "Open Clock alarms screen" }
+        "alarm_delete" -> args.arg("label", "message", "title").ifBlank { "Open Clock alarms screen for manual deletion" }
         "contacts_lookup" -> args.arg("name", "query")
         "notification_digest" -> "Summarize recent notifications stored by LMSMOB Chat"
         "local_file_search" -> args.arg("query")
         "device_status" -> "Battery, network, storage, app and LM Studio connectivity"
+        "watch_job_list" -> "Read configured watch jobs"
+        "watch_job_create" -> listOf(
+            args.arg("title", "name"),
+            args.arg("trigger", "mode").ifBlank { "notification" },
+            args.arg("match_mode").ifBlank { "filter" }.watchMatchModeLabel(),
+            args.arg("app", "sender", "text", "query", "contains"),
+            args.arg("alert_mode").normalizedWatchAlertMode().watchAlertModeLabel(),
+            args.arg("lifetime").normalizedWatchLifetime().watchLifetimeLabel(),
+        ).filter { it.isNotBlank() }.joinToString(" - ")
+        "watch_job_edit" -> listOf(args.arg("id", "job_id"), args.arg("title", "name")).filter { it.isNotBlank() }.joinToString(" - ")
+        "watch_job_set_enabled" -> listOf(args.arg("id", "job_id"), "enabled=${args.optBoolean("enabled", false)}").filter { it.isNotBlank() }.joinToString(" - ")
+        "watch_job_delete" -> listOf(args.arg("id", "job_id"), args.arg("title", "name")).filter { it.isNotBlank() }.joinToString(" - ")
         else -> args.toString()
     }.ifBlank { "No extra details provided." }
 
@@ -2344,6 +3000,13 @@ private fun JSONObject.arg(vararg names: String): String {
         optString(name).takeIf { it.isNotBlank() }?.let { return it }
     }
     return ""
+}
+
+private fun JSONObject.optionalArg(vararg names: String): String? {
+    names.forEach { name ->
+        if (has(name)) return optString(name)
+    }
+    return null
 }
 
 private fun Context.copyToClipboard(text: String) {
@@ -2427,6 +3090,16 @@ private suspend fun executeNativeToolAction(
             "sms_draft" -> context.openSmsDraft(action.args)
             "calendar_event" -> context.openCalendarDraft(action.args, reminder = false)
             "reminder" -> context.openCalendarDraft(action.args, reminder = true)
+            "alarm_read" -> {
+                val result = withContext(Dispatchers.IO) {
+                    context.nextAlarmText()
+                }
+                viewModel.receiveSharedText(result.asNativeToolResult("alarm_read"))
+            }
+            "alarm_list" -> context.openAlarmManageScreen()
+            "alarm_create" -> context.openAlarmCreateDraft(action.args)
+            "alarm_edit" -> context.openAlarmManageScreen()
+            "alarm_delete" -> context.openAlarmManageScreen()
             "contacts_lookup" -> {
                 val result = withContext(Dispatchers.IO) {
                     context.lookupContacts(action.args.arg("name", "query"))
@@ -2456,6 +3129,30 @@ private suspend fun executeNativeToolAction(
                     context.deviceStatusText(state)
                 }
                 viewModel.receiveSharedText(result.asNativeToolResult("device_status"))
+            }
+            "watch_job_list" -> {
+                val result = viewModel.listWatchJobsForTool()
+                viewModel.receiveSharedText(result.asNativeToolResult("watch_job_list"))
+            }
+            "watch_job_create" -> {
+                val job = viewModel.createWatchJobFromArgs(action.args)
+                val result = "Created watch job.\n${job.watchJobToolDescription()}"
+                viewModel.receiveSharedText(result.asNativeToolResult("watch_job_create"))
+            }
+            "watch_job_edit" -> {
+                val job = viewModel.editWatchJobFromArgs(action.args)
+                val result = "Updated watch job.\n${job.watchJobToolDescription()}"
+                viewModel.receiveSharedText(result.asNativeToolResult("watch_job_edit"))
+            }
+            "watch_job_set_enabled" -> {
+                val job = viewModel.setWatchJobEnabledFromArgs(action.args)
+                val result = "Watch job ${if (job.enabled) "enabled" else "disabled"}.\n${job.watchJobToolDescription()}"
+                viewModel.receiveSharedText(result.asNativeToolResult("watch_job_set_enabled"))
+            }
+            "watch_job_delete" -> {
+                val job = viewModel.deleteWatchJobFromArgs(action.args)
+                val result = "Deleted watch job: ${job.title}\nid: ${job.id}"
+                viewModel.receiveSharedText(result.asNativeToolResult("watch_job_delete"))
             }
             else -> throw IOException("Unsupported phone-side tool: ${action.tool}")
         }
@@ -2525,6 +3222,117 @@ private fun Context.openCalendarDraft(args: JSONObject, reminder: Boolean) {
     }
     startSafeActivity(intent)
 }
+
+private fun Context.nextAlarmText(): String {
+    val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+    val nextAlarm = alarmManager.nextAlarmClock
+        ?: return "No next scheduled Android alarm was reported by the phone."
+    val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z", Locale.getDefault())
+    val triggerTime = Instant.ofEpochMilli(nextAlarm.triggerTime)
+        .atZone(ZoneId.systemDefault())
+        .format(formatter)
+    val source = nextAlarm.showIntent?.creatorPackage.orEmpty()
+    return buildString {
+        appendLine("Next phone alarm:")
+        appendLine("- Time: $triggerTime")
+        if (source.isNotBlank()) appendLine("- Clock app: $source")
+        appendLine("- Note: Android exposes only the next scheduled alarm to third-party apps.")
+    }.trim()
+}
+
+private fun Context.openAlarmCreateDraft(args: JSONObject) {
+    val (hour, minute) = args.toAlarmHourMinute()
+    val label = args.arg("message", "label", "title").ifBlank { "LMSMOB alarm" }
+    val intent = Intent(AlarmClock.ACTION_SET_ALARM).apply {
+        putExtra(AlarmClock.EXTRA_HOUR, hour)
+        putExtra(AlarmClock.EXTRA_MINUTES, minute)
+        putExtra(AlarmClock.EXTRA_MESSAGE, label)
+        putExtra(AlarmClock.EXTRA_VIBRATE, args.optBoolean("vibrate", true))
+        putExtra(AlarmClock.EXTRA_SKIP_UI, false)
+        args.toAlarmDays().takeIf { it.isNotEmpty() }?.let { days ->
+            putIntegerArrayListExtra(AlarmClock.EXTRA_DAYS, ArrayList(days))
+        }
+    }
+    startSafeActivity(intent)
+}
+
+private fun Context.openAlarmManageScreen() {
+    startSafeActivity(Intent(AlarmClock.ACTION_SHOW_ALARMS))
+}
+
+private fun JSONObject.toAlarmHourMinute(): Pair<Int, Int> {
+    val hour = optionalInt("hour")
+    val minute = optionalInt("minute", "minutes")
+    if (hour != null && minute != null) {
+        return hour.toAlarmHour() to minute.toAlarmMinute()
+    }
+
+    val time = arg("time", "start")
+    val timeMatch = Regex("""\b(\d{1,2}):(\d{2})\b""").find(time)
+    if (timeMatch != null) {
+        return timeMatch.groupValues[1].toInt().toAlarmHour() to
+            timeMatch.groupValues[2].toInt().toAlarmMinute()
+    }
+    val parsedMillis = time.toEventMillis()
+    if (parsedMillis != null) {
+        val dateTime = Instant.ofEpochMilli(parsedMillis).atZone(ZoneId.systemDefault())
+        return dateTime.hour to dateTime.minute
+    }
+    throw IOException("Alarm time is missing. Provide hour/minute or time like 07:30.")
+}
+
+private fun JSONObject.toAlarmDays(): List<Int> {
+    val rawArray = optJSONArray("days")
+    if (rawArray != null) {
+        return buildList {
+            for (index in 0 until rawArray.length()) {
+                rawArray.opt(index).toAlarmDayOrNull()?.let(::add)
+            }
+        }.distinct()
+    }
+    return arg("days")
+        .split(",", ";", " ")
+        .mapNotNull { it.toAlarmDayOrNull() }
+        .distinct()
+}
+
+private fun JSONObject.optionalInt(vararg names: String): Int? {
+    for (name in names) {
+        val value = opt(name)
+        val intValue = when (value) {
+            is Number -> value.toInt()
+            is String -> value.trim().toIntOrNull()
+            else -> null
+        }
+        if (intValue != null) return intValue
+    }
+    return null
+}
+
+private fun Any?.toAlarmDayOrNull(): Int? =
+    when (this) {
+        is Number -> toInt().takeIf { it in Calendar.SUNDAY..Calendar.SATURDAY }
+        is String -> trim().lowercase(Locale.getDefault()).let { value ->
+            value.toIntOrNull()?.takeIf { it in Calendar.SUNDAY..Calendar.SATURDAY }
+                ?: when (value.take(3)) {
+                    "sun" -> Calendar.SUNDAY
+                    "mon" -> Calendar.MONDAY
+                    "tue" -> Calendar.TUESDAY
+                    "wed" -> Calendar.WEDNESDAY
+                    "thu" -> Calendar.THURSDAY
+                    "fri" -> Calendar.FRIDAY
+                    "sat" -> Calendar.SATURDAY
+                    else -> null
+                }
+        }
+        else -> null
+    }
+
+private fun Int.toAlarmHour(): Int =
+    takeIf { it in 0..23 } ?: throw IOException("Alarm hour must be between 0 and 23.")
+
+private fun Int.toAlarmMinute(): Int =
+    takeIf { it in 0..59 } ?: throw IOException("Alarm minute must be between 0 and 59.")
 
 private fun Context.startSafeActivity(intent: Intent) {
     try {
@@ -2645,8 +3453,7 @@ private fun Context.renderPdfPages(uri: Uri, name: String): List<ChatImageAttach
         PdfRenderer(pfd).use { renderer ->
             if (renderer.pageCount == 0) throw IOException("PDF has no pages")
             return buildList {
-                val pagesToRender = minOf(renderer.pageCount, 4)
-                for (index in 0 until pagesToRender) {
+                for (index in 0 until renderer.pageCount) {
                     renderer.openPage(index).use { page ->
                         val targetWidth = 1280
                         val ratio = targetWidth.toFloat() / page.width.toFloat()
@@ -2827,6 +3634,10 @@ private fun Context.hasContactsPermission(): Boolean =
 private fun Context.hasRecordAudioPermission(): Boolean =
     ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
+private fun Context.hasPostNotificationsPermission(): Boolean =
+    Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+        ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+
 private fun Context.lookupContacts(query: String): String {
     if (!hasContactsPermission()) throw IOException("Contacts permission is not granted.")
     if (query.isBlank()) throw IOException("Contact search query is missing.")
@@ -3005,6 +3816,7 @@ private suspend fun Context.deviceStatusText(state: ChatUiState): String {
 class LmNotificationListenerService : NotificationListenerService() {
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         NotificationDigestStore.record(applicationContext, sbn)
+        WatchJobRunner.onNotificationPosted(applicationContext, sbn)
     }
 }
 
@@ -3038,11 +3850,15 @@ private object NotificationDigestStore {
         preferences.edit().putString(NotificationsKey, next.toString()).apply()
     }
 
-    fun digest(context: Context, limit: Int): String {
+    fun recent(context: Context): JSONArray {
         val preferences = context.getSharedPreferences(PreferencesName, Context.MODE_PRIVATE)
-        val notifications = runCatching {
+        return runCatching {
             JSONArray(preferences.getString(NotificationsKey, "[]").orEmpty())
         }.getOrDefault(JSONArray())
+    }
+
+    fun digest(context: Context, limit: Int): String {
+        val notifications = recent(context)
         if (notifications.length() == 0) {
             return "No notifications have been captured yet. Notification access may have just been enabled."
         }
@@ -3056,6 +3872,415 @@ private object NotificationDigestStore {
             }
         }
     }
+}
+
+private object WatchJobStore {
+    private const val PreferencesName = "lm_studio_watch_jobs"
+    private const val JobsKey = "jobs"
+
+    fun load(context: Context): List<WatchJob> {
+        val preferences = context.getSharedPreferences(PreferencesName, Context.MODE_PRIVATE)
+        return runCatching {
+            fromJson(preferences.getString(JobsKey, "").orEmpty())
+        }.getOrDefault(emptyList())
+    }
+
+    fun save(context: Context, jobs: List<WatchJob>) {
+        val preferences = context.getSharedPreferences(PreferencesName, Context.MODE_PRIVATE)
+        preferences.edit()
+            .putString(JobsKey, toJson(jobs))
+            .apply()
+    }
+
+    private fun toJson(jobs: List<WatchJob>): String {
+        val jobsJson = JSONArray()
+        jobs.forEach { job ->
+            jobsJson.put(
+                JSONObject()
+                    .put("id", job.id)
+                    .put("title", job.title)
+                    .put("trigger", job.trigger)
+                    .put("app_query", job.appQuery)
+                    .put("sender_query", job.senderQuery)
+                    .put("text_query", job.textQuery)
+                    .put("match_mode", job.matchMode)
+                    .put("ai_instruction", job.aiInstruction)
+                    .put("schedule_minutes", job.scheduleMinutes)
+                    .put("alert_message", job.alertMessage)
+                    .put("alert_mode", job.alertMode)
+                    .put("lifetime", job.lifetime)
+                    .put("enabled", job.enabled)
+                    .put("created_at", job.createdAt)
+                    .put("last_run_at", job.lastRunAt)
+                    .put("last_checked_at", job.lastCheckedAt)
+                    .put("last_matched_at", job.lastMatchedAt)
+                    .put("match_count", job.matchCount),
+            )
+        }
+        return JSONObject()
+            .put("version", 1)
+            .put("jobs", jobsJson)
+            .toString()
+    }
+
+    private fun fromJson(json: String): List<WatchJob> {
+        if (json.isBlank()) return emptyList()
+        val root = JSONObject(json)
+        val jobsJson = root.optJSONArray("jobs") ?: JSONArray()
+        return buildList {
+            for (index in 0 until jobsJson.length()) {
+                val item = jobsJson.optJSONObject(index) ?: continue
+                val trigger = item.optString("trigger").lowercase(Locale.getDefault()).let {
+                    if (it == "schedule") "schedule" else "notification"
+                }
+                add(
+                    WatchJob(
+                        id = item.optString("id").ifBlank { UUID.randomUUID().toString() },
+                        title = item.optString("title").ifBlank { "Watch job" },
+                        trigger = trigger,
+                        appQuery = item.optString("app_query"),
+                        senderQuery = item.optString("sender_query"),
+                        textQuery = item.optString("text_query"),
+                        matchMode = item.optString("match_mode").normalizedWatchMatchMode(),
+                        aiInstruction = item.optString("ai_instruction"),
+                        scheduleMinutes = item.optInt("schedule_minutes", 0),
+                        alertMessage = item.optString("alert_message"),
+                        alertMode = item.optString("alert_mode").normalizedWatchAlertMode(),
+                        lifetime = item.optString("lifetime").normalizedWatchLifetime(),
+                        enabled = item.optBoolean("enabled", true),
+                        createdAt = item.optLong("created_at", System.currentTimeMillis()),
+                        lastRunAt = item.optLong("last_run_at", 0L),
+                        lastCheckedAt = item.optLong("last_checked_at", 0L),
+                        lastMatchedAt = item.optLong("last_matched_at", 0L),
+                        matchCount = item.optInt("match_count", 0),
+                    ),
+                )
+            }
+        }.sortedByDescending { it.createdAt }
+    }
+}
+
+class WatchJobReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == WatchJobRunner.Action) {
+            val jobId = intent.getStringExtra(WatchJobRunner.ExtraJobId) ?: return
+            WatchJobRunner.runScheduled(context.applicationContext, jobId)
+        }
+    }
+}
+
+private object WatchJobRunner {
+    const val Action = "com.mindylab.lmstudiochat.WATCH_JOB"
+    const val ExtraJobId = "job_id"
+    private const val ChannelId = "watch_jobs"
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    fun schedule(context: Context, job: WatchJob) {
+        if (!job.enabled || job.trigger != "schedule" || job.scheduleMinutes <= 0) {
+            cancel(context, job.id)
+            return
+        }
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pendingIntent = PendingIntent.getBroadcast(
+            context,
+            job.id.hashCode(),
+            Intent(context, WatchJobReceiver::class.java)
+                .setAction(Action)
+                .putExtra(ExtraJobId, job.id),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val triggerAt = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(job.scheduleMinutes.toLong())
+        alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
+    }
+
+    fun cancel(context: Context, jobId: String) {
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pendingIntent = PendingIntent.getBroadcast(
+            context,
+            jobId.hashCode(),
+            Intent(context, WatchJobReceiver::class.java).setAction(Action),
+            PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE,
+        )
+        if (pendingIntent != null) {
+            alarmManager.cancel(pendingIntent)
+            pendingIntent.cancel()
+        }
+    }
+
+    fun onNotificationPosted(context: Context, sbn: StatusBarNotification) {
+        if (sbn.packageName == context.packageName) return
+        val item = sbn.toWatchNotificationJson()
+        val now = System.currentTimeMillis()
+        var changed = false
+        val jobs = WatchJobStore.load(context).map { job ->
+            if (!job.enabled || job.trigger != "notification") return@map job
+            if (job.isWatchJobExpired(now)) {
+                changed = true
+                return@map job.copy(enabled = false, lastRunAt = now, lastCheckedAt = now)
+            }
+            val itemTime = item.optLong("time", now)
+            val checkedJob = job.copy(lastRunAt = now, lastCheckedAt = maxOf(job.lastCheckedAt, itemTime))
+            changed = true
+            if (checkedJob.matchMode.normalizedWatchMatchMode() == "ai") {
+                scope.launch {
+                    evaluateAiWatchNotification(context, checkedJob, item)
+                }
+                checkedJob
+            } else if (notificationMatches(context, checkedJob, item)) {
+                showAlert(
+                    context = context,
+                    job = checkedJob,
+                    detail = item.watchNotificationDescription(context),
+                )
+                checkedJob.copy(
+                    lastMatchedAt = item.optLong("time", now),
+                    matchCount = checkedJob.matchCount + 1,
+                ).afterWatchJobMatch()
+            } else {
+                checkedJob
+            }
+        }
+        if (changed) {
+            WatchJobStore.save(context, jobs)
+        }
+    }
+
+    fun runScheduled(context: Context, jobId: String) {
+        val now = System.currentTimeMillis()
+        val jobs = WatchJobStore.load(context)
+        val job = jobs.firstOrNull { it.id == jobId } ?: return
+        if (!job.enabled || job.trigger != "schedule") {
+            cancel(context, jobId)
+            return
+        }
+        if (job.isWatchJobExpired(now)) {
+            WatchJobStore.save(
+                context,
+                jobs.map { existing -> if (existing.id == jobId) job.copy(enabled = false, lastRunAt = now) else existing },
+            )
+            cancel(context, jobId)
+            return
+        }
+
+        val notifications = NotificationDigestStore.recent(context)
+        val checkAfter = if (job.lastCheckedAt > 0L) job.lastCheckedAt else job.createdAt
+        val recentItems = (0 until notifications.length())
+            .mapNotNull { index -> notifications.optJSONObject(index) }
+            .filter { item -> item.optLong("time", 0L) > checkAfter }
+            .sortedBy { item -> item.optLong("time", 0L) }
+        var lastCheckedAt = job.lastCheckedAt
+        var matched: JSONObject? = null
+        for (item in recentItems) {
+            val itemTime = item.optLong("time", 0L)
+            lastCheckedAt = maxOf(lastCheckedAt, itemTime)
+            val isMatch = job.watchJobPrefilterMatches(context, item) &&
+                if (job.matchMode.normalizedWatchMatchMode() == "ai") {
+                    runCatching { runBlockingWatchAiEvaluation(context, job, item) }.getOrDefault(false)
+                } else {
+                    notificationMatches(context, job, item)
+                }
+            if (isMatch) {
+                matched = item
+                break
+            }
+        }
+        val updatedJob = if (matched != null) {
+            showAlert(
+                context = context,
+                job = job,
+                detail = matched.watchNotificationDescription(context),
+            )
+            job.copy(
+                lastRunAt = now,
+                lastCheckedAt = maxOf(lastCheckedAt, matched.optLong("time", now)),
+                lastMatchedAt = matched.optLong("time", now),
+                matchCount = job.matchCount + 1,
+            ).afterWatchJobMatch()
+        } else {
+            job.copy(lastRunAt = now, lastCheckedAt = lastCheckedAt)
+        }
+        val finalJob = updatedJob.afterWatchJobRun(now)
+        WatchJobStore.save(
+            context,
+            jobs.map { existing -> if (existing.id == jobId) finalJob else existing },
+        )
+        schedule(context, finalJob)
+    }
+
+    private fun notificationMatches(context: Context, job: WatchJob, item: JSONObject): Boolean {
+        if (!job.watchJobPrefilterMatches(context, item)) return false
+        if (job.matchMode.normalizedWatchMatchMode() == "ai") return false
+        return true
+    }
+
+    private fun WatchJob.watchJobPrefilterMatches(context: Context, item: JSONObject): Boolean {
+        val packageName = item.optString("package")
+        val appLabel = context.appLabelForPackage(packageName)
+        val title = item.optString("title")
+        val text = item.optString("text")
+        val subText = item.optString("sub_text")
+        val appHaystack = "$packageName $appLabel"
+        val senderHaystack = "$title $subText $text"
+        val textHaystack = "$title $text $subText"
+        return appHaystack.matchesFilter(appQuery) &&
+            senderHaystack.matchesFilter(senderQuery) &&
+            textHaystack.matchesFilter(textQuery)
+    }
+
+    private suspend fun evaluateAiWatchNotification(context: Context, job: WatchJob, item: JSONObject) {
+        if (!job.enabled || job.matchMode.normalizedWatchMatchMode() != "ai") return
+        if (!job.watchJobPrefilterMatches(context, item)) return
+        if (job.isWatchJobExpired()) return
+        val shouldAlert = runCatching {
+            LmStudioClient().evaluateWatchJobNotification(
+                settingsStore = SettingsStore(context),
+                job = job,
+                notification = item.watchNotificationDescription(context),
+            )
+        }.getOrDefault(false)
+        val jobs = WatchJobStore.load(context)
+        val current = jobs.firstOrNull { it.id == job.id } ?: return
+        val itemTime = item.optLong("time", 0L)
+        if (!current.enabled || current.lastMatchedAt >= itemTime) return
+        val now = System.currentTimeMillis()
+        val updated = if (shouldAlert) {
+            showAlert(
+                context = context,
+                job = current,
+                detail = item.watchNotificationDescription(context),
+            )
+            current.copy(
+                lastRunAt = now,
+                lastCheckedAt = maxOf(current.lastCheckedAt, itemTime),
+                lastMatchedAt = item.optLong("time", now),
+                matchCount = current.matchCount + 1,
+            ).afterWatchJobMatch()
+        } else {
+            current.copy(lastRunAt = now, lastCheckedAt = maxOf(current.lastCheckedAt, itemTime))
+        }.afterWatchJobRun(now)
+        WatchJobStore.save(
+            context,
+            jobs.map { existing -> if (existing.id == current.id) updated else existing },
+        )
+        schedule(context, updated)
+    }
+
+    private fun runBlockingWatchAiEvaluation(context: Context, job: WatchJob, item: JSONObject): Boolean {
+        val result = kotlinx.coroutines.runBlocking {
+            LmStudioClient().evaluateWatchJobNotification(
+                settingsStore = SettingsStore(context),
+                job = job,
+                notification = item.watchNotificationDescription(context),
+            )
+        }
+        return result
+    }
+
+    private fun showAlert(context: Context, job: WatchJob, detail: String) {
+        if (!context.hasPostNotificationsPermission()) return
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.createNotificationChannel(
+            NotificationChannel(
+                ChannelId,
+                "Watch jobs",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Alerts from LMSMOB notification and schedule watch jobs."
+                enableVibration(true)
+            },
+        )
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            0,
+            Intent(context, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val title = job.alertMessage.ifBlank { "Watch job matched: ${job.title}" }
+        val alertIntent = Intent(context, WatchJobAlertActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            .putExtra(WatchJobAlertActivity.ExtraTitle, title)
+            .putExtra(WatchJobAlertActivity.ExtraDetail, detail)
+            .putExtra(WatchJobAlertActivity.ExtraJobId, job.id)
+        val fullScreenIntent = PendingIntent.getActivity(
+            context,
+            job.id.hashCode() xor 0x51A7,
+            alertIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = Notification.Builder(context, ChannelId)
+            .setSmallIcon(R.drawable.ml_logo)
+            .setContentTitle(title)
+            .setContentText(detail.take(90))
+            .setStyle(Notification.BigTextStyle().bigText(detail))
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setCategory(Notification.CATEGORY_REMINDER)
+            .setPriority(Notification.PRIORITY_HIGH)
+            .setVibrate(longArrayOf(0, 300, 160, 300))
+            .apply {
+                if (job.alertMode.normalizedWatchAlertMode() == "alarm") {
+                    setOngoing(true)
+                    setFullScreenIntent(fullScreenIntent, true)
+                }
+            }
+            .build()
+        manager.notify(job.id.hashCode(), notification)
+    }
+}
+
+private fun WatchJob.isWatchJobExpired(now: Long = System.currentTimeMillis()): Boolean =
+    when (lifetime.normalizedWatchLifetime()) {
+        "today" -> {
+            val zone = ZoneId.systemDefault()
+            Instant.ofEpochMilli(createdAt).atZone(zone).toLocalDate() !=
+                Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+        }
+        else -> false
+    }
+
+private fun WatchJob.afterWatchJobMatch(): WatchJob =
+    if (lifetime.normalizedWatchLifetime() == "once") {
+        copy(enabled = false)
+    } else {
+        this
+    }
+
+private fun WatchJob.afterWatchJobRun(now: Long): WatchJob =
+    if (isWatchJobExpired(now)) copy(enabled = false, lastRunAt = now) else this
+
+private fun StatusBarNotification.toWatchNotificationJson(): JSONObject {
+    val extras = notification.extras
+    return JSONObject()
+        .put("time", System.currentTimeMillis())
+        .put("package", packageName)
+        .put("title", extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty())
+        .put("text", extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty())
+        .put("sub_text", extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString().orEmpty())
+}
+
+@Suppress("DEPRECATION")
+private fun Context.appLabelForPackage(packageName: String): String =
+    runCatching {
+        val appInfo = packageManager.getApplicationInfo(packageName, 0)
+        packageManager.getApplicationLabel(appInfo).toString()
+    }.getOrDefault(packageName)
+
+private fun String.matchesFilter(query: String): Boolean =
+    query.isBlank() || contains(query, ignoreCase = true)
+
+private fun JSONObject.watchNotificationDescription(context: Context): String {
+    val packageName = optString("package")
+    val app = context.appLabelForPackage(packageName)
+    val title = optString("title")
+    val text = optString("text")
+    val subText = optString("sub_text")
+    return listOf(
+        "App: $app ($packageName)",
+        "Title: $title".takeIf { title.isNotBlank() },
+        "Text: $text".takeIf { text.isNotBlank() },
+        "Subtext: $subText".takeIf { subText.isNotBlank() },
+    ).filterNotNull().joinToString("\n")
 }
 
 class LmStudioClient(
@@ -3267,6 +4492,81 @@ class LmStudioClient(
 
                 ChatCompletionResult(content = content)
             }
+        }
+    }
+
+    suspend fun evaluateWatchJobNotification(
+        settingsStore: SettingsStore,
+        job: WatchJob,
+        notification: String,
+    ): Boolean = withContext(Dispatchers.IO) {
+        val apiUrl = settingsStore.apiUrl
+        val model = settingsStore.model.ifBlank {
+            throw IOException("Choose a loaded LM Studio model before AI Watch Jobs can evaluate notifications.")
+        }
+        val systemPrompt = buildString {
+            appendLine("You are a strict notification classifier for an Android watch job.")
+            appendLine("Use ALERT only when the notification clearly satisfies the user's watch instruction and the user should be interrupted.")
+            appendLine("Use IGNORE for unrelated, routine, weak, or uncertain matches.")
+            appendLine("If uncertain, choose IGNORE.")
+            appendLine("You may think if your model requires it, but your response must end with exactly one final marker.")
+            appendLine("The final marker must be exactly one of these lines:")
+            appendLine("FINAL_DECISION: ALERT")
+            appendLine("FINAL_DECISION: IGNORE")
+            appendLine("Do not put ALERT or IGNORE anywhere else except the final marker.")
+        }.trim()
+        val userPrompt = buildString {
+            appendLine("USER WATCH INSTRUCTION:")
+            appendLine(job.aiInstruction.ifBlank { "Alert only when this notification clearly needs the user's attention." })
+            appendLine()
+            appendLine("NOTIFICATION TEXT AND METADATA:")
+            appendLine(notification.ifBlank { "(empty notification text)" })
+            appendLine()
+            appendLine("Return the final marker after any internal evaluation.")
+            append("FINAL_DECISION:")
+        }
+        val payload = JSONObject()
+            .put("model", model)
+            .put(
+                "messages",
+                JSONArray()
+                    .put(JSONObject().put("role", "system").put("content", systemPrompt))
+                    .put(JSONObject().put("role", "user").put("content", userPrompt)),
+            )
+            .put("stream", false)
+            .put("temperature", 0)
+            .put("max_tokens", 3000)
+
+        val request = Request.Builder()
+            .url(apiUrl.normalizedOpenAiBaseUrl() + "/chat/completions")
+            .withApiToken(settingsStore.apiToken)
+            .post(payload.toString().toRequestBody(jsonMediaType))
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            val body = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                throw IOException("LM Studio returned HTTP ${response.code}: ${body.take(160)}")
+            }
+            val message = JSONObject(body)
+                .optJSONArray("choices")
+                ?.optJSONObject(0)
+                ?.optJSONObject("message")
+            val content = listOf(
+                message?.optString("content").orEmpty(),
+                message?.optString("reasoning_content").orEmpty(),
+            ).joinToString("\n")
+            val explicitDecision = Regex(
+                "FINAL[_\\s-]*DECISION\\s*[:=\\-]?\\s*(ALERT|IGNORE)\\b",
+                RegexOption.IGNORE_CASE,
+            ).findAll(content).lastOrNull()?.groupValues?.getOrNull(1)
+            val lineDecision = content
+                .lineSequence()
+                .map { it.trim().trim('.', ':', '-', '*', ' ') }
+                .filter { it.equals("ALERT", ignoreCase = true) || it.equals("IGNORE", ignoreCase = true) }
+                .lastOrNull()
+            (explicitDecision ?: lineDecision)
+                ?.uppercase(Locale.getDefault()) == "ALERT"
         }
     }
 
@@ -3799,7 +5099,7 @@ private fun NativeToolActionDialog(
                     )
                 }
                 Text(
-                    text = "Draft actions open Android screens only. You still press Send, Call, Save, or Navigate yourself.",
+                    text = "Phone-side actions require your confirmation. Draft actions still leave final Send, Call, Save, or Navigate to you.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -3848,6 +5148,12 @@ private fun Throwable.isChatCancellation(): Boolean {
         detail.contains("cancelled", ignoreCase = true)
 }
 
+private enum class UtilityTab {
+    Settings,
+    WatchJobs,
+    Info,
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LmStudioApp(
@@ -3866,6 +5172,8 @@ fun LmStudioApp(
     onCloseSettings: () -> Unit,
     onOpenInfo: () -> Unit,
     onCloseInfo: () -> Unit,
+    onOpenWatchJobs: () -> Unit,
+    onCloseWatchJobs: () -> Unit,
     onApiUrlChange: (String) -> Unit,
     onModelChange: (String) -> Unit,
     onApiTokenChange: (String) -> Unit,
@@ -3874,15 +5182,22 @@ fun LmStudioApp(
     onAllowedToolsChange: (String) -> Unit,
     onNativeIntentToolEnabledChange: (Boolean) -> Unit,
     onCalendarToolEnabledChange: (Boolean) -> Unit,
+    onAlarmToolEnabledChange: (Boolean) -> Unit,
     onContactsToolEnabledChange: (Boolean) -> Unit,
     onNotificationDigestToolEnabledChange: (Boolean) -> Unit,
     onLocalFileSearchToolEnabledChange: (Boolean) -> Unit,
     onPickLocalSearchFolder: () -> Unit,
     onDeviceStatusToolEnabledChange: (Boolean) -> Unit,
+    onWatchJobToolEnabledChange: (Boolean) -> Unit,
     onVoiceInputEnabledChange: (Boolean) -> Unit,
     onVoiceOutputEnabledChange: (Boolean) -> Unit,
     onAutoReadAnswersEnabledChange: (Boolean) -> Unit,
+    onAppendCapabilityGuideToSystemPromptChange: (Boolean) -> Unit,
     onAppendDateTimeToSystemPromptChange: (Boolean) -> Unit,
+    onCreateWatchJob: (String, String, String, String, String, String, String, String, String, String, String) -> Unit,
+    onUpdateWatchJob: (String, String, String, String, String, String, String, String, String, String, String, String, Boolean) -> Unit,
+    onToggleWatchJob: (String, Boolean) -> Unit,
+    onDeleteWatchJob: (String) -> Unit,
     onSystemProfileSelect: (String) -> Unit,
     onSystemProfileNameChange: (String) -> Unit,
     onSystemPromptChange: (String) -> Unit,
@@ -3913,11 +5228,35 @@ fun LmStudioApp(
 ) {
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+    fun showSettingsTab() {
+        onCloseWatchJobs()
+        onCloseInfo()
+        onOpenSettings()
+    }
+    fun showWatchJobsTab() {
+        onCloseSettings()
+        onCloseInfo()
+        onOpenWatchJobs()
+    }
+    fun showInfoTab() {
+        onCloseSettings()
+        onCloseWatchJobs()
+        onOpenInfo()
+    }
+    fun showUtilityTab(tab: UtilityTab) {
+        when (tab) {
+            UtilityTab.Settings -> showSettingsTab()
+            UtilityTab.WatchJobs -> showWatchJobsTab()
+            UtilityTab.Info -> showInfoTab()
+        }
+    }
 
     if (state.isSettingsOpen) {
         SettingsSheet(
             state = state,
             onDismiss = onCloseSettings,
+            selectedUtilityTab = UtilityTab.Settings,
+            onUtilityTabSelected = ::showUtilityTab,
             onApiUrlChange = onApiUrlChange,
             onModelChange = onModelChange,
             onApiTokenChange = onApiTokenChange,
@@ -3926,14 +5265,17 @@ fun LmStudioApp(
             onAllowedToolsChange = onAllowedToolsChange,
             onNativeIntentToolEnabledChange = onNativeIntentToolEnabledChange,
             onCalendarToolEnabledChange = onCalendarToolEnabledChange,
+            onAlarmToolEnabledChange = onAlarmToolEnabledChange,
             onContactsToolEnabledChange = onContactsToolEnabledChange,
             onNotificationDigestToolEnabledChange = onNotificationDigestToolEnabledChange,
             onLocalFileSearchToolEnabledChange = onLocalFileSearchToolEnabledChange,
             onPickLocalSearchFolder = onPickLocalSearchFolder,
             onDeviceStatusToolEnabledChange = onDeviceStatusToolEnabledChange,
+            onWatchJobToolEnabledChange = onWatchJobToolEnabledChange,
             onVoiceInputEnabledChange = onVoiceInputEnabledChange,
             onVoiceOutputEnabledChange = onVoiceOutputEnabledChange,
             onAutoReadAnswersEnabledChange = onAutoReadAnswersEnabledChange,
+            onAppendCapabilityGuideToSystemPromptChange = onAppendCapabilityGuideToSystemPromptChange,
             onAppendDateTimeToSystemPromptChange = onAppendDateTimeToSystemPromptChange,
             onSystemProfileSelect = onSystemProfileSelect,
             onSystemProfileNameChange = onSystemProfileNameChange,
@@ -3954,7 +5296,23 @@ fun LmStudioApp(
         )
     }
     if (state.isInfoOpen) {
-        InfoSheet(onDismiss = onCloseInfo)
+        InfoSheet(
+            onDismiss = onCloseInfo,
+            selectedUtilityTab = UtilityTab.Info,
+            onUtilityTabSelected = ::showUtilityTab,
+        )
+    }
+    if (state.isWatchJobsOpen) {
+        WatchJobsSheet(
+            state = state,
+            onDismiss = onCloseWatchJobs,
+            selectedUtilityTab = UtilityTab.WatchJobs,
+            onUtilityTabSelected = ::showUtilityTab,
+            onCreateWatchJob = onCreateWatchJob,
+            onToggleWatchJob = onToggleWatchJob,
+            onDeleteWatchJob = onDeleteWatchJob,
+            onUpdateWatchJob = onUpdateWatchJob,
+        )
     }
 
     ModalNavigationDrawer(
@@ -3972,14 +5330,6 @@ fun LmStudioApp(
                 },
                 onChatSearchChange = onChatSearchChange,
                 onDeleteChat = onDeleteChat,
-                onSettings = {
-                    onOpenSettings()
-                    scope.launch { drawerState.close() }
-                },
-                onInfo = {
-                    onOpenInfo()
-                    scope.launch { drawerState.close() }
-                },
             )
         },
     ) {
@@ -4016,7 +5366,7 @@ fun LmStudioApp(
                         }
                     },
                     actions = {
-                        IconButton(onClick = onOpenSettings) {
+                        IconButton(onClick = { showSettingsTab() }) {
                             Icon(
                                 imageVector = Icons.Filled.Settings,
                                 contentDescription = "Settings",
@@ -4116,6 +5466,56 @@ private fun ContextUsageBar(state: ChatUiState) {
     }
 }
 
+@Composable
+private fun UtilityTabs(
+    selected: UtilityTab,
+    onSelected: (UtilityTab) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        FilterChip(
+            selected = selected == UtilityTab.Settings,
+            onClick = { onSelected(UtilityTab.Settings) },
+            label = { Text("Settings") },
+            leadingIcon = {
+                Icon(
+                    imageVector = Icons.Filled.Settings,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+            },
+        )
+        FilterChip(
+            selected = selected == UtilityTab.WatchJobs,
+            onClick = { onSelected(UtilityTab.WatchJobs) },
+            label = { Text("Watch jobs") },
+            leadingIcon = {
+                Icon(
+                    imageVector = Icons.Filled.Search,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+            },
+        )
+        FilterChip(
+            selected = selected == UtilityTab.Info,
+            onClick = { onSelected(UtilityTab.Info) },
+            label = { Text("Info & license") },
+            leadingIcon = {
+                Icon(
+                    imageVector = Icons.Filled.Info,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+            },
+        )
+    }
+}
+
 private fun ChatUiState.contextUsage(): ContextUsage {
     val available = contextLengthDraft.toNullableInt()
         ?: selectedModelInfo()?.contextLength
@@ -4168,8 +5568,6 @@ private fun DrawerContent(
     onSelectChat: (String) -> Unit,
     onChatSearchChange: (String) -> Unit,
     onDeleteChat: (String) -> Unit,
-    onSettings: () -> Unit,
-    onInfo: () -> Unit,
 ) {
     val query = state.chatSearchQuery.trim()
     var pendingDeleteSession by remember { mutableStateOf<ChatSession?>(null) }
@@ -4266,25 +5664,6 @@ private fun DrawerContent(
                         )
                     }
                 }
-            }
-
-            TextButton(
-                onClick = onSettings,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-            ) {
-                Icon(imageVector = Icons.Filled.Settings, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Connection settings")
-            }
-            TextButton(
-                onClick = onInfo,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-            ) {
-                Icon(imageVector = Icons.Filled.Info, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Info & license")
             }
         }
     }
@@ -4476,6 +5855,7 @@ private fun MessageRow(
 ) {
     val isUser = message.role == MessageRole.User
     val context = LocalContext.current
+    var previewAttachment by remember(message.id) { mutableStateOf<ChatImageAttachment?>(null) }
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -4508,7 +5888,10 @@ private fun MessageRow(
                 }
                 if (message.attachments.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(6.dp))
-                    MessageAttachmentSummary(message.attachments)
+                    MessageAttachmentSummary(
+                        attachments = message.attachments,
+                        onPreview = { previewAttachment = it },
+                    )
                 }
                 MessageActions(
                     canEdit = true,
@@ -4552,19 +5935,39 @@ private fun MessageRow(
             }
         }
     }
+
+    previewAttachment?.let { attachment ->
+        ImagePreviewDialog(
+            attachment = attachment,
+            onDismiss = { previewAttachment = null },
+        )
+    }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun MessageAttachmentSummary(attachments: List<ChatImageAttachment>) {
-    Row(
+private fun MessageAttachmentSummary(
+    attachments: List<ChatImageAttachment>,
+    onPreview: (ChatImageAttachment) -> Unit,
+) {
+    FlowRow(
+        modifier = Modifier.widthIn(max = 310.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         attachments.forEach { attachment ->
             Surface(
                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.75f),
                 contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
                 shape = RoundedCornerShape(50.dp),
+                modifier = Modifier
+                    .then(
+                        if (attachment.dataUrl.isNotBlank()) {
+                            Modifier.clickable { onPreview(attachment) }
+                        } else {
+                            Modifier
+                        },
+                    ),
             ) {
                 Row(
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
@@ -4590,6 +5993,92 @@ private fun MessageAttachmentSummary(attachments: List<ChatImageAttachment>) {
             }
         }
     }
+}
+
+@Composable
+private fun ImagePreviewDialog(
+    attachment: ChatImageAttachment,
+    onDismiss: () -> Unit,
+) {
+    val bitmap = remember(attachment.dataUrl) { attachment.decodeImageBitmap() }
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 8.dp,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text(
+                        text = attachment.label,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    IconButton(onClick = onDismiss) {
+                        Icon(
+                            imageVector = Icons.Filled.Close,
+                            contentDescription = "Close image preview",
+                        )
+                    }
+                }
+                if (bitmap != null) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = attachment.label,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 220.dp, max = 560.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
+                        contentScale = ContentScale.Fit,
+                    )
+                } else {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(18.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.AddPhotoAlternate,
+                                contentDescription = null,
+                                modifier = Modifier.size(36.dp),
+                            )
+                            Text(
+                                text = "Image preview is not available for this attachment.",
+                                textAlign = TextAlign.Center,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun ChatImageAttachment.decodeImageBitmap(): Bitmap? {
+    if (dataUrl.isBlank()) return null
+    val encoded = dataUrl.substringAfter(",", missingDelimiterValue = dataUrl)
+    return runCatching {
+        val bytes = Base64.decode(encoded, Base64.DEFAULT)
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    }.getOrNull()
 }
 
 private enum class MessageBlockType {
@@ -5435,11 +6924,13 @@ private fun VoiceInputButton(
 private fun AttachedImageChip(
     attachment: ChatImageAttachment,
     onClear: () -> Unit,
+    onPreview: (ChatImageAttachment) -> Unit,
 ) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.75f),
         contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
         shape = RoundedCornerShape(16.dp),
+        modifier = Modifier.clickable { onPreview(attachment) },
     ) {
         Row(
             modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 7.dp, bottom = 7.dp),
@@ -5546,6 +7037,7 @@ private fun ChatComposer(
 ) {
     val focusManager = LocalFocusManager.current
     val canSend = (input.isNotBlank() || attachedImages.isNotEmpty() || attachedDocumentText != null) && !isSending
+    var previewAttachment by remember { mutableStateOf<ChatImageAttachment?>(null) }
 
     Surface(
         color = MaterialTheme.colorScheme.surface,
@@ -5587,8 +7079,19 @@ private fun ChatComposer(
                 visible = true,
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    attachedImages.forEach { attachment ->
-                        AttachedImageChip(attachment = attachment, onClear = onClearImage)
+                    if (attachedImages.isNotEmpty()) {
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            contentPadding = PaddingValues(end = 4.dp),
+                        ) {
+                            items(attachedImages) { attachment ->
+                                AttachedImageChip(
+                                    attachment = attachment,
+                                    onClear = onClearImage,
+                                    onPreview = { previewAttachment = it },
+                                )
+                            }
+                        }
                     }
                     if (attachedDocumentText != null) {
                         AttachedDocumentChip(
@@ -5721,7 +7224,647 @@ private fun ChatComposer(
             ContextUsageBar(state = state)
         }
     }
+
+    previewAttachment?.let { attachment ->
+        ImagePreviewDialog(
+            attachment = attachment,
+            onDismiss = { previewAttachment = null },
+        )
+    }
 }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun WatchJobsSheet(
+    state: ChatUiState,
+    onDismiss: () -> Unit,
+    selectedUtilityTab: UtilityTab,
+    onUtilityTabSelected: (UtilityTab) -> Unit,
+    onCreateWatchJob: (String, String, String, String, String, String, String, String, String, String, String) -> Unit,
+    onUpdateWatchJob: (String, String, String, String, String, String, String, String, String, String, String, String, Boolean) -> Unit,
+    onToggleWatchJob: (String, Boolean) -> Unit,
+    onDeleteWatchJob: (String) -> Unit,
+) {
+    val scrollState = rememberScrollState()
+    var title by remember { mutableStateOf("") }
+    var trigger by remember { mutableStateOf("notification") }
+    var appQuery by remember { mutableStateOf("") }
+    var senderQuery by remember { mutableStateOf("") }
+    var textQuery by remember { mutableStateOf("") }
+    var matchMode by remember { mutableStateOf("filter") }
+    var aiInstruction by remember { mutableStateOf("") }
+    var scheduleMinutes by remember { mutableStateOf("15") }
+    var alertMessage by remember { mutableStateOf("") }
+    var alertMode by remember { mutableStateOf("normal") }
+    var lifetime by remember { mutableStateOf("noend") }
+    var editingJobId by remember { mutableStateOf<String?>(null) }
+    var editingEnabled by remember { mutableStateOf(true) }
+    var localError by remember { mutableStateOf<String?>(null) }
+    var pendingDelete by remember { mutableStateOf<WatchJob?>(null) }
+
+    fun clearWatchJobForm() {
+        title = ""
+        trigger = "notification"
+        appQuery = ""
+        senderQuery = ""
+        textQuery = ""
+        matchMode = "filter"
+        aiInstruction = ""
+        scheduleMinutes = "15"
+        alertMessage = ""
+        alertMode = "normal"
+        lifetime = "noend"
+        editingJobId = null
+        editingEnabled = true
+        localError = null
+    }
+
+    fun editWatchJob(job: WatchJob) {
+        title = job.title
+        trigger = job.trigger
+        appQuery = job.appQuery
+        senderQuery = job.senderQuery
+        textQuery = job.textQuery
+        matchMode = job.matchMode.normalizedWatchMatchMode()
+        aiInstruction = job.aiInstruction
+        scheduleMinutes = job.scheduleMinutes.takeIf { it > 0 }?.toString() ?: "15"
+        alertMessage = job.alertMessage
+        alertMode = job.alertMode.normalizedWatchAlertMode()
+        lifetime = job.lifetime.normalizedWatchLifetime()
+        editingJobId = job.id
+        editingEnabled = job.enabled
+        localError = null
+    }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.92f)
+                .navigationBarsPadding()
+                .verticalScroll(scrollState)
+                .padding(horizontal = 22.dp)
+                .padding(bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            UtilityTabs(
+                selected = selectedUtilityTab,
+                onSelected = onUtilityTabSelected,
+            )
+            Text(
+                text = "Watch jobs",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = if (editingJobId == null) {
+                    "Create local monitors that alert you from captured notifications. Scheduled jobs scan the recent notification history."
+                } else {
+                    "Editing a watch job. Save to update the stored filters and schedule."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (!state.watchJobToolEnabled) {
+                Text(
+                    text = "Enable Watch jobs in Phone tools if you want the model to create these after confirmation.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
+            OutlinedTextField(
+                value = title,
+                onValueChange = { title = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("Job title") },
+                placeholder = { Text("Mom on Telegram") },
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = trigger == "notification",
+                    onClick = { trigger = "notification" },
+                    label = { Text("On notification") },
+                )
+                FilterChip(
+                    selected = trigger == "schedule",
+                    onClick = { trigger = "schedule" },
+                    label = { Text("On schedule") },
+                )
+            }
+            Text(
+                text = "Match mode",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = matchMode == "filter",
+                    onClick = { matchMode = "filter" },
+                    label = { Text("Filters") },
+                )
+                FilterChip(
+                    selected = matchMode == "ai",
+                    onClick = { matchMode = "ai" },
+                    label = { Text("AI") },
+                )
+            }
+            Text(
+                text = if (matchMode == "ai") {
+                    "AI mode sends matching notifications to LM Studio and expects a strict ALERT or IGNORE decision."
+                } else {
+                    "Filter mode alerts when the local app, sender, and text filters match."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedTextField(
+                value = appQuery,
+                onValueChange = { appQuery = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text(if (matchMode == "ai") "App pre-filter (optional)" else "App filter") },
+                placeholder = { Text("Telegram") },
+            )
+            OutlinedTextField(
+                value = senderQuery,
+                onValueChange = { senderQuery = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text(if (matchMode == "ai") "Sender pre-filter (optional)" else "Sender filter") },
+                placeholder = { Text("Mom") },
+            )
+            OutlinedTextField(
+                value = textQuery,
+                onValueChange = { textQuery = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text(if (matchMode == "ai") "Text pre-filter (optional)" else "Text contains") },
+                placeholder = { Text("urgent") },
+            )
+            AnimatedVisibility(visible = matchMode == "ai") {
+                OutlinedTextField(
+                    value = aiInstruction,
+                    onValueChange = { aiInstruction = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 3,
+                    maxLines = 6,
+                    label = { Text("AI instruction") },
+                    placeholder = { Text("Alert me if this notification mentions an offer from company Mindylab.") },
+                    supportingText = { Text("Keep it specific. The model returns only ALERT or IGNORE.") },
+                )
+            }
+            AnimatedVisibility(visible = trigger == "schedule") {
+                GenerationNumberField(
+                    value = scheduleMinutes,
+                    onValueChange = { scheduleMinutes = it },
+                    label = "Check every minutes",
+                    modifier = Modifier.fillMaxWidth(),
+                    decimal = false,
+                )
+            }
+            OutlinedTextField(
+                value = alertMessage,
+                onValueChange = { alertMessage = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("Alert message") },
+                placeholder = { Text("Mom wrote on Telegram") },
+            )
+            Text(
+                text = "Alert mode",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = alertMode == "normal",
+                    onClick = { alertMode = "normal" },
+                    label = { Text("Normal") },
+                )
+                FilterChip(
+                    selected = alertMode == "alarm",
+                    onClick = { alertMode = "alarm" },
+                    label = { Text("Alarm") },
+                )
+            }
+            Text(
+                text = if (alertMode == "alarm") {
+                    "Alarm opens a full-screen alert and repeats sound/vibration until stopped."
+                } else {
+                    "Normal sends a high-priority notification."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = "Lifetime",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = lifetime == "once",
+                    onClick = { lifetime = "once" },
+                    label = { Text("Once") },
+                )
+                FilterChip(
+                    selected = lifetime == "today",
+                    onClick = { lifetime = "today" },
+                    label = { Text("Today") },
+                )
+                FilterChip(
+                    selected = lifetime == "noend",
+                    onClick = { lifetime = "noend" },
+                    label = { Text("No end") },
+                )
+            }
+            AnimatedVisibility(visible = editingJobId != null) {
+                ToolToggleRow(
+                    title = "Enabled",
+                    description = "Keep this watch job active after saving.",
+                    checked = editingEnabled,
+                    onCheckedChange = { editingEnabled = it },
+                )
+            }
+            localError?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (editingJobId != null) {
+                    OutlinedButton(
+                        onClick = { clearWatchJobForm() },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Text("Cancel")
+                    }
+                }
+                Button(
+                    onClick = {
+                    if (matchMode == "ai" && aiInstruction.isBlank()) {
+                        localError = "Add AI instructions for AI mode."
+                        return@Button
+                    }
+                    if (matchMode == "filter" && listOf(appQuery, senderQuery, textQuery).all { it.isBlank() }) {
+                        localError = "Add at least one filter so the job does not alert on every notification."
+                        return@Button
+                    }
+                        localError = null
+                        val jobId = editingJobId
+                        if (jobId == null) {
+                            onCreateWatchJob(
+                                title,
+                                trigger,
+                                appQuery,
+                                senderQuery,
+                                textQuery,
+                                matchMode,
+                                aiInstruction,
+                                scheduleMinutes,
+                                alertMessage,
+                                alertMode,
+                                lifetime,
+                            )
+                        } else {
+                            onUpdateWatchJob(
+                                jobId,
+                                title,
+                                trigger,
+                                appQuery,
+                                senderQuery,
+                                textQuery,
+                                matchMode,
+                                aiInstruction,
+                                scheduleMinutes,
+                                alertMessage,
+                                alertMode,
+                                lifetime,
+                                editingEnabled,
+                            )
+                        }
+                        clearWatchJobForm()
+                    },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Text(if (editingJobId == null) "Create watch job" else "Save changes")
+                }
+            }
+
+            HorizontalDivider(color = DividerDefaults.color.copy(alpha = 0.45f))
+
+            Text(
+                text = "Active jobs",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            if (state.watchJobs.isEmpty()) {
+                Text(
+                    text = "No watch jobs yet.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    state.watchJobs.forEach { job ->
+                        WatchJobCard(
+                            job = job,
+                            onToggle = { enabled -> onToggleWatchJob(job.id, enabled) },
+                            onEdit = { editWatchJob(job) },
+                            onDelete = { pendingDelete = job },
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    val jobToDelete = pendingDelete
+    if (jobToDelete != null) {
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("Delete watch job?") },
+            text = { Text("This will remove \"${jobToDelete.title}\" from this device.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteWatchJob(jobToDelete.id)
+                        pendingDelete = null
+                    },
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun WatchJobCard(
+    job: WatchJob,
+    onToggle: (Boolean) -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = job.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = if (job.trigger == "schedule") {
+                            "Every ${job.scheduleMinutes} min"
+                        } else {
+                            "On matching notification"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = "${job.alertMode.watchAlertModeLabel()} alert - ${job.lifetime.watchLifetimeLabel()}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = "${job.matchMode.watchMatchModeLabel()} match",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = job.enabled, onCheckedChange = onToggle)
+                IconButton(onClick = onEdit) {
+                    Icon(
+                        imageVector = Icons.Filled.Edit,
+                        contentDescription = "Edit watch job",
+                    )
+                }
+                IconButton(onClick = onDelete) {
+                    Icon(
+                        imageVector = Icons.Filled.Delete,
+                        contentDescription = "Delete watch job",
+                    )
+                }
+            }
+            Text(
+                text = buildList {
+                    if (job.appQuery.isNotBlank()) add("App: ${job.appQuery}")
+                    if (job.senderQuery.isNotBlank()) add("Sender: ${job.senderQuery}")
+                    if (job.textQuery.isNotBlank()) add("Text: ${job.textQuery}")
+                }.joinToString("  |  ").ifBlank { "No filters" },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (job.matchMode.normalizedWatchMatchMode() == "ai") {
+                Text(
+                    text = "AI: ${job.aiInstruction}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(
+                text = "Matches: ${job.matchCount}  |  Last checked: ${job.lastCheckedAt.toWatchJobTime()}  |  Last match: ${job.lastMatchedAt.toWatchJobTime()}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun WatchJobAlarmScreen(
+    title: String,
+    detail: String,
+    jobId: String,
+    onStop: () -> Unit,
+) {
+    val context = LocalContext.current
+    val handler = remember { Handler(Looper.getMainLooper()) }
+    DisposableEffect(jobId) {
+        val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        val ringtone = context.watchJobAlarmRingtone()
+        val playRunnable = object : Runnable {
+            override fun run() {
+                runCatching {
+                    if (ringtone?.isPlaying != true) {
+                        ringtone?.play()
+                    }
+                }
+                handler.postDelayed(this, 3500L)
+            }
+        }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(
+                    VibrationEffect.createWaveform(
+                        longArrayOf(0, 700, 350, 900),
+                        0,
+                    ),
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(longArrayOf(0, 700, 350, 900), 0)
+            }
+        }
+        handler.post(playRunnable)
+        onDispose {
+            handler.removeCallbacks(playRunnable)
+            runCatching { ringtone?.stop() }
+            runCatching { vibrator.cancel() }
+        }
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(24.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            AppMark(modifier = Modifier.size(82.dp))
+            Spacer(modifier = Modifier.height(24.dp))
+            Text(
+                text = title,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(modifier = Modifier.height(14.dp))
+            if (detail.isNotBlank()) {
+                Text(
+                    text = detail,
+                    style = MaterialTheme.typography.bodyLarge,
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(modifier = Modifier.height(28.dp))
+            }
+            Button(
+                onClick = onStop,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError,
+                ),
+            ) {
+                Text("Stop alert")
+            }
+        }
+    }
+}
+
+private fun Context.watchJobAlarmRingtone(): Ringtone? {
+    val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+        ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+    return runCatching {
+        RingtoneManager.getRingtone(applicationContext, uri)?.apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                audioAttributes = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ALARM)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+            }
+        }
+    }.getOrNull()
+}
+
+private fun Long.toWatchJobTime(): String {
+    if (this <= 0L) return "Never"
+    val formatter = DateTimeFormatter.ofPattern("MMM d HH:mm", Locale.getDefault())
+    return Instant.ofEpochMilli(this)
+        .atZone(ZoneId.systemDefault())
+        .format(formatter)
+}
+
+private fun String.normalizedWatchAlertMode(): String =
+    when (trim().lowercase(Locale.getDefault()).replace("_", "-")) {
+        "alarm", "fullscreen", "full-screen", "strong" -> "alarm"
+        else -> "normal"
+    }
+
+private fun String.normalizedWatchLifetime(): String =
+    when (trim().lowercase(Locale.getDefault()).replace("_", "-")) {
+        "once", "one-time", "one time", "single" -> "once"
+        "today", "only-today", "only today" -> "today"
+        else -> "noend"
+    }
+
+private fun String.normalizedWatchMatchMode(): String =
+    when (trim().lowercase(Locale.getDefault()).replace("_", "-")) {
+        "ai", "model", "llm", "smart" -> "ai"
+        else -> "filter"
+    }
+
+private fun String.watchAlertModeLabel(): String =
+    if (normalizedWatchAlertMode() == "alarm") "Alarm" else "Normal"
+
+private fun String.watchLifetimeLabel(): String =
+    when (normalizedWatchLifetime()) {
+        "once" -> "once"
+        "today" -> "today only"
+        else -> "no end"
+    }
+
+private fun String.watchMatchModeLabel(): String =
+    if (normalizedWatchMatchMode() == "ai") "AI" else "Filters"
+
+private fun WatchJob.watchJobFiltersText(): String =
+    buildList {
+        if (appQuery.isNotBlank()) add("app=$appQuery")
+        if (senderQuery.isNotBlank()) add("sender=$senderQuery")
+        if (textQuery.isNotBlank()) add("text=$textQuery")
+    }.joinToString(", ").ifBlank { "none" }
+
+private fun WatchJob.watchJobToolDescription(): String =
+    buildString {
+        appendLine("Title: $title")
+        appendLine("ID: $id")
+        appendLine("Enabled: $enabled")
+        appendLine("Trigger: $trigger${if (trigger == "schedule") " every $scheduleMinutes minutes" else ""}")
+        appendLine("Match mode: ${matchMode.watchMatchModeLabel()}")
+        appendLine("Filters: ${watchJobFiltersText()}")
+        if (matchMode.normalizedWatchMatchMode() == "ai") appendLine("AI instruction: $aiInstruction")
+        appendLine("Alert mode: ${alertMode.watchAlertModeLabel()}")
+        appendLine("Lifetime: ${lifetime.watchLifetimeLabel()}")
+        appendLine("Matches: $matchCount")
+    }.trim()
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -5781,6 +7924,8 @@ private fun GenerationNumberField(
 private fun SettingsSheet(
     state: ChatUiState,
     onDismiss: () -> Unit,
+    selectedUtilityTab: UtilityTab,
+    onUtilityTabSelected: (UtilityTab) -> Unit,
     onApiUrlChange: (String) -> Unit,
     onModelChange: (String) -> Unit,
     onApiTokenChange: (String) -> Unit,
@@ -5789,14 +7934,17 @@ private fun SettingsSheet(
     onAllowedToolsChange: (String) -> Unit,
     onNativeIntentToolEnabledChange: (Boolean) -> Unit,
     onCalendarToolEnabledChange: (Boolean) -> Unit,
+    onAlarmToolEnabledChange: (Boolean) -> Unit,
     onContactsToolEnabledChange: (Boolean) -> Unit,
     onNotificationDigestToolEnabledChange: (Boolean) -> Unit,
     onLocalFileSearchToolEnabledChange: (Boolean) -> Unit,
     onPickLocalSearchFolder: () -> Unit,
     onDeviceStatusToolEnabledChange: (Boolean) -> Unit,
+    onWatchJobToolEnabledChange: (Boolean) -> Unit,
     onVoiceInputEnabledChange: (Boolean) -> Unit,
     onVoiceOutputEnabledChange: (Boolean) -> Unit,
     onAutoReadAnswersEnabledChange: (Boolean) -> Unit,
+    onAppendCapabilityGuideToSystemPromptChange: (Boolean) -> Unit,
     onAppendDateTimeToSystemPromptChange: (Boolean) -> Unit,
     onSystemProfileSelect: (String) -> Unit,
     onSystemProfileNameChange: (String) -> Unit,
@@ -5829,6 +7977,10 @@ private fun SettingsSheet(
                 .padding(bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            UtilityTabs(
+                selected = selectedUtilityTab,
+                onSelected = onUtilityTabSelected,
+            )
             Text(
                 text = "Connection",
                 style = MaterialTheme.typography.titleLarge,
@@ -5981,6 +8133,12 @@ private fun SettingsSheet(
                 supportingText = { Text("Used as the system prompt for new requests.") },
             )
             ToolToggleRow(
+                title = "Append capability guide",
+                description = "Adds the current model, document, server-tool, and phone-tool capability map to each request so the model knows what is enabled and what the user must enable first.",
+                checked = state.appendCapabilityGuideToSystemPrompt,
+                onCheckedChange = onAppendCapabilityGuideToSystemPromptChange,
+            )
+            ToolToggleRow(
                 title = "Append phone date/time",
                 description = "Adds the current phone date, time, and time zone to every system prompt.",
                 checked = state.appendDateTimeToSystemPrompt,
@@ -6128,6 +8286,12 @@ private fun SettingsSheet(
                 onCheckedChange = onCalendarToolEnabledChange,
             )
             ToolToggleRow(
+                title = "Alarms",
+                description = "Read the next alarm, create alarm drafts, or open Clock to list/edit/delete alarms.",
+                checked = state.alarmToolEnabled,
+                onCheckedChange = onAlarmToolEnabledChange,
+            )
+            ToolToggleRow(
                 title = "Contacts lookup",
                 description = "Search contacts by name after Android permission is granted.",
                 checked = state.contactsToolEnabled,
@@ -6169,6 +8333,12 @@ private fun SettingsSheet(
                 description = "Report battery, network, storage, app version, and LM Studio connectivity.",
                 checked = state.deviceStatusToolEnabled,
                 onCheckedChange = onDeviceStatusToolEnabledChange,
+            )
+            ToolToggleRow(
+                title = "Watch jobs",
+                description = "Let the model create local notification or scheduled watch jobs after confirmation.",
+                checked = state.watchJobToolEnabled,
+                onCheckedChange = onWatchJobToolEnabledChange,
             )
 
             HorizontalDivider(color = DividerDefaults.color.copy(alpha = 0.45f))
@@ -6351,7 +8521,11 @@ private fun SettingsSheet(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun InfoSheet(onDismiss: () -> Unit) {
+private fun InfoSheet(
+    onDismiss: () -> Unit,
+    selectedUtilityTab: UtilityTab,
+    onUtilityTabSelected: (UtilityTab) -> Unit,
+) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -6363,6 +8537,10 @@ private fun InfoSheet(onDismiss: () -> Unit) {
                 .padding(bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            UtilityTabs(
+                selected = selectedUtilityTab,
+                onSelected = onUtilityTabSelected,
+            )
             Row(
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
                 verticalAlignment = Alignment.CenterVertically,

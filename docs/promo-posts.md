@@ -10,8 +10,8 @@ server running on your PC.
 
 It supports LM Studio's OpenAI-compatible API, chat history, model refresh,
 vision/image attachments for supported models, LM Studio server tools/MCP
-integrations through `/api/v1/chat`, voice input/output, document sharing, and
-opt-in phone assistant tools.
+integrations through `/api/v1/chat`, voice input/output, document sharing,
+alarm tools, Watch Jobs, and opt-in phone assistant tools.
 
 GitHub:
 https://github.com/mindylab/lmsmob_chat
@@ -20,7 +20,7 @@ Latest APK:
 https://github.com/mindylab/lmsmob_chat/releases/latest
 
 Demo video:
-https://github.com/mindylab/lmsmob_chat/releases/download/v1.28/lmsmob-chat-v1.28-demo.mp4
+https://github.com/mindylab/lmsmob_chat/releases/download/v1.40/lmsmob-chat-v1.40-demo.mp4
 
 ## Reddit / Discord Post
 
@@ -43,6 +43,10 @@ What it supports:
 - Confirmable phone tools for map routes, URL opening, email/SMS drafts,
   calls, calendar/reminder drafts, contacts, notifications, local file search,
   and device status
+- Alarm tools for reading the next alarm, opening Clock, and preparing alarm
+  drafts
+- Watch Jobs for local notification or scheduled monitors with filters, LM
+  Studio AI classification, normal alerts, or alarm-style full-screen alerts
 - Advanced generation settings and context usage estimates
 - Emulator default URL and physical-device LAN setup
 
@@ -53,7 +57,7 @@ Release APK:
 https://github.com/mindylab/lmsmob_chat/releases/latest
 
 Demo video:
-https://github.com/mindylab/lmsmob_chat/releases/download/v1.28/lmsmob-chat-v1.28-demo.mp4
+https://github.com/mindylab/lmsmob_chat/releases/download/v1.40/lmsmob-chat-v1.40-demo.mp4
 
 I would appreciate feedback from anyone using LM Studio from Android.
 

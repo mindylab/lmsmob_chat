@@ -6,25 +6,25 @@
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey)](LICENSE.md)
 
 Android chat app for LM Studio. Connect your phone to an LM Studio server
-running on your PC and chat with local LLMs over your LAN. Version 1.28 adds
-voice input, read-aloud answers, document sharing, and opt-in phone assistant
-tools for maps, drafts, contacts, notifications, local files, and device status.
+running on your PC and chat with local LLMs over your LAN. Version 1.40 adds
+Watch Jobs, alarm tools, and a richer capability guide on top of the v1.28
+voice, document, and phone assistant tools.
 
 [Download the latest APK](https://github.com/mindylab/lmsmob_chat/releases/latest)
 or open the current
-[v1.28 APK asset](https://github.com/mindylab/lmsmob_chat/releases/download/v1.28/lmsmob_chat-v1.28-debug.apk).
+[v1.40 APK asset](https://github.com/mindylab/lmsmob_chat/releases/download/v1.40/lmsmob_chat-v1.40-debug.apk).
 
 ## Demo
 
 <p align="center">
-  <a href="https://github.com/mindylab/lmsmob_chat/releases/download/v1.28/lmsmob-chat-v1.28-demo.mp4">Watch the LMSMOB Chat Android demo video</a>
+  <a href="https://github.com/mindylab/lmsmob_chat/releases/download/v1.40/lmsmob-chat-v1.40-demo.mp4">Watch the LMSMOB Chat Android demo video</a>
 </p>
 
 <div align="center">
   <table>
     <tr>
       <td bgcolor="black" align="center">
-        New vesion 1.28<br>
+        Version 1.40 demo<br>
         <video
           src="https://github.com/user-attachments/assets/ca5dc8f1-5717-471b-908d-27d3ab2877e2"
           width="360"
@@ -37,7 +37,7 @@ or open the current
         </video>
       </td>
       <td bgcolor="black" align="center">
-        Old vesion 1.16<br>
+        Old version 1.16<br>
         <video
           src="https://github.com/user-attachments/assets/2233ddcb-c7a8-4783-b36d-9838fa2aa6b3"
           width="360"
@@ -75,6 +75,15 @@ or open the current
 - Provides opt-in phone assistant tools for URL opening, map routes, email/SMS
   drafts, phone dialing, calendar/reminder drafts, contact lookup, notification
   digest, local file search, and device status.
+- Adds alarm tools for reading the next Android alarm, opening the Clock alarm
+  screen, and preparing alarm creation drafts.
+- Adds Watch Jobs: local notification or scheduled monitors with filters or
+  LM Studio AI classification, normal notifications, alarm-style full-screen
+  alerts, once/today/no-end lifetimes, and confirmation before model-created
+  jobs are saved.
+- Appends a capability guide to prompts so the selected model knows which
+  server tools, phone tools, vision, reasoning, voice, document, and date/time
+  capabilities are currently enabled.
 - Shows context usage estimates and advanced generation settings including
   temperature, top-p, max tokens, context length, penalties, and seed.
 - Includes emulator and physical-device LAN setup paths.
@@ -82,7 +91,7 @@ or open the current
 ## Roadmap
 
 The 2026 roadmap now builds on the first phone-assistant tools shipped in
-v1.28:
+v1.28 and the Watch Jobs release in v1.40:
 
 - Web tools already work through compatible LM Studio MCP/plugin setup, with a
   tested local-web MCP server available in
@@ -90,10 +99,11 @@ v1.28:
   A packaged LMS/LM Studio web plugin is still planned to make setup easier.
 - Maps route drafts, contact lookup, notification digest, local file search,
   device status, and confirmable phone action drafts are available now.
+- Alarm tools and Watch Jobs are available now for opt-in notification
+  monitors, scheduled checks, and stronger local alerts.
 - Phone location tools are still planned with explicit Android permission
   controls.
-- Cron-style scheduled tasks are planned for reminders, notifications, and
-  safe phone actions.
+- Broader cron-style scheduled prompts and safe phone actions are still planned.
 - A signed release APK workflow is planned for wider distribution.
 
 See the full [2026 roadmap](docs/roadmap-2026.md).

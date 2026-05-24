@@ -22,6 +22,14 @@ allowlisted, and sensitive phone actions should require clear user control.
 - Version 1.28 adds confirmable phone assistant tools for opening URLs, map
   routes, email/SMS drafts, phone dialing, calendar/reminder drafts, contacts,
   notification digest, local file search, and device status.
+- Version 1.40 adds alarm tools for reading the next Android alarm, opening the
+  Clock alarm screen, and preparing alarm creation drafts.
+- Version 1.40 adds Watch Jobs for local notification or scheduled monitoring,
+  filter or LM Studio AI matching, normal notifications, full-screen alarm
+  alerts, and once/today/no-end lifetimes.
+- Version 1.40 adds an optional capability guide so prompts include the current
+  model, server-tool, phone-tool, document, voice, vision, and date/time
+  capabilities enabled in the app.
 - A packaged LMS/LM Studio web plugin is planned so setup becomes easier for
   normal users.
 
@@ -31,8 +39,8 @@ allowlisted, and sensitive phone actions should require clear user control.
 - Add a first-run tool setup guide for LM Studio MCP/plugin integrations.
 - Document supported web tool IDs and recommended allowlists.
 - Improve release packaging with a signed release APK workflow.
-- Polish v1.28 phone assistant settings, permission explanations, and release
-  notes based on early tester feedback.
+- Polish v1.40 Watch Jobs, alarm permissions, and release notes based on early
+  tester feedback.
 
 ## Q3 2026
 
@@ -50,7 +58,7 @@ allowlisted, and sensitive phone actions should require clear user control.
 ## Q4 2026
 
 - Cron-style scheduled tasks:
-  - Add local scheduled reminders with Android notifications.
+  - Build on Watch Jobs with broader scheduled prompts and task workflows.
   - Allow scheduled prompts to run against LM Studio when the phone is online.
   - Support simple phone actions after confirmation, such as opening an app,
     copying text, or preparing a message.
