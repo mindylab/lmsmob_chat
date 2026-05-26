@@ -6,52 +6,22 @@
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey)](LICENSE.md)
 
 Android chat app for LM Studio. Connect your phone to an LM Studio server
-running on your PC and chat with local LLMs over your LAN. Version 1.40 adds
-Watch Jobs, alarm tools, and a richer capability guide on top of the v1.28
-voice, document, and phone assistant tools.
+running on your PC and chat with local LLMs over your LAN. Version 1.51 adds
+chat folders, richer MCP image outputs, QR tool support, source chips, and table
+export on top of Watch Jobs, alarms, voice, document, and phone assistant tools.
 
 [Download the latest APK](https://github.com/mindylab/lmsmob_chat/releases/latest)
-or open the current
-[v1.40 APK asset](https://github.com/mindylab/lmsmob_chat/releases/download/v1.40/lmsmob_chat-v1.40-debug.apk).
+from the GitHub releases page.
 
 ## Demo
 
 <p align="center">
-  <a href="https://github.com/mindylab/lmsmob_chat/releases/download/v1.40/lmsmob-chat-v1.40-demo.mp4">Watch the LMSMOB Chat Android demo video</a>
+  <a href="https://youtu.be/mtZJ2uDz3hY">
+    <img src="https://img.youtube.com/vi/mtZJ2uDz3hY/hqdefault.jpg" alt="Watch the LMSMOB Chat Android demo on YouTube" width="520">
+  </a>
+  <br>
+  <a href="https://youtu.be/mtZJ2uDz3hY">Watch the LMSMOB Chat Android demo on YouTube</a>
 </p>
-
-<div align="center">
-  <table>
-    <tr>
-      <td bgcolor="black" align="center">
-        Version 1.40 demo<br>
-        <video
-          src="https://github.com/user-attachments/assets/ca5dc8f1-5717-471b-908d-27d3ab2877e2"
-          width="360"
-          autoplay
-          loop
-          muted
-          playsinline
-          controls>
-          DEMO
-        </video>
-      </td>
-      <td bgcolor="black" align="center">
-        Old version 1.16<br>
-        <video
-          src="https://github.com/user-attachments/assets/2233ddcb-c7a8-4783-b36d-9838fa2aa6b3"
-          width="360"
-          autoplay
-          loop
-          muted
-          playsinline
-          controls>
-          DEMO
-        </video>
-      </td>
-    </tr>
-  </table>
-</div>
 
 ## Features
 
@@ -61,8 +31,10 @@ or open the current
 - Connects to LM Studio MCP/plugin integrations such as `mcp/local-web`.
 - Tested companion LM Studio tools are published at
   [mindylab/lm_studio_tools](https://github.com/mindylab/lm_studio_tools).
+- Displays MCP image outputs in chat, including web page screenshots and
+  generated QR codes returned by LM Studio tools.
 - Refreshes loaded LM Studio models from the app settings.
-- Keeps chat sessions locally with search and session switching.
+- Keeps chat sessions locally with folders, search, and session switching.
 - Supports copy, edit, delete, and cancel actions in chat.
 - Imports and exports chat history as JSON.
 - Supports image attachments for vision-capable models.
@@ -81,6 +53,8 @@ or open the current
   LM Studio AI classification, normal notifications, alarm-style full-screen
   alerts, once/today/no-end lifetimes, and confirmation before model-created
   jobs are saved.
+- Shows source chips when answers include source links.
+- Exports Markdown tables from chat answers as XLSX files.
 - Appends a capability guide to prompts so the selected model knows which
   server tools, phone tools, vision, reasoning, voice, document, and date/time
   capabilities are currently enabled.
@@ -145,8 +119,9 @@ LM Studio 0.4.0+ can call MCP/plugin tools through its native
 The tested LM Studio tools repo is
 [mindylab/lm_studio_tools](https://github.com/mindylab/lm_studio_tools). It
 contains the `local-web` MCP server used with LMSMOB Chat, including
-`web_search`, `web_fetch`, `web_page_to_images`, and `web_search_and_fetch`,
-plus ready-to-copy `mcp.json` examples.
+`web_search`, `web_fetch`, `web_search_and_fetch`, `youtube_transcript`,
+`qr_generate`, `qr_scan`, and `web_page_to_images`, plus ready-to-copy
+`mcp.json` examples.
 
 Server-side tools require an LM Studio API token. In LM Studio, create a
 permission token from **Developer > Server Settings > Manage Tokens**, then
@@ -185,6 +160,10 @@ Against the tested server, `mcp/local-web` accepted these allowed tools:
 web_search
 web_fetch
 web_search_and_fetch
+youtube_transcript
+qr_generate
+qr_scan
+web_page_to_images
 ```
 
 For an ephemeral remote MCP, paste a JSON object or JSON array:

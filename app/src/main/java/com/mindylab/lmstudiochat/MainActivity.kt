@@ -8,6 +8,7 @@ import android.app.Notification
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.ActivityNotFoundException
+import android.content.ContentValues
 import android.content.Context
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -39,6 +40,7 @@ import android.provider.AlarmClock
 import android.provider.CalendarContract
 import android.provider.ContactsContract
 import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -48,6 +50,7 @@ import android.speech.tts.UtteranceProgressListener
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Base64
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -65,6 +68,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -105,11 +109,13 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Refresh
@@ -154,6 +160,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -205,6 +212,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Instant
@@ -217,7 +225,9 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
 import java.util.UUID
+import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 
 private const val DefaultApiUrl = "http://10.0.2.2:1234/v1"
 private const val LegacyDefaultSystemPrompt = "You are a helpful assistant running locally through LM Studio."
@@ -235,12 +245,14 @@ private val DefaultSystemPrompt = """
     - Images when the selected LM Studio model supports vision.
     - Documents shared or uploaded by the user, including PDF, DOC, DOCX, XLS, and XLSX after the app converts them to text or images.
     - Rich responses with readable Markdown, tables, lists, and code blocks when appropriate.
-    - LM Studio server-side MCP/plugin tools when the app enables integrations for the current request.
-    - Android phone-side tools when the app lists them below; these always require user confirmation before any action is performed.
+    - LM Studio server-side MCP/plugin tools when the app enables integrations for the current request. These are used by LM Studio itself, not by Android action blocks.
+    - Android phone-side tools when the app lists them below. These require a <lmsmob_action> block and user confirmation before any action is performed.
 
     Behavior with tools and actions:
     - Prefer answering directly when no tool is needed.
-    - If a phone-side action is needed, describe what you want to do and emit exactly one action block in the format the app provides.
+    - If web search, URL fetching, YouTube transcript, QR generation/scanning, or page screenshot work is needed, use LM Studio server-side tools only when server tools are enabled.
+    - If an Android phone-side action is needed, describe what you want to do and emit exactly one action block in the format the app provides.
+    - Never use <lmsmob_action> for LM Studio MCP/plugin tools such as web_search, web_fetch, youtube_transcript, qr_generate, qr_scan, or web_page_to_images.
     - Treat calls, SMS, email, calendar, reminders, alarms, URLs, maps, contacts, files, notifications, and watch jobs as sensitive. Never claim they are finished until the app returns a tool result or the user confirms the draft.
     - For monitoring or recurring tasks, prefer clear, narrow watch-job filters such as app, sender, and text condition.
     - If a capability is not enabled or not listed, tell the user how to enable it instead of pretending you used it.
@@ -248,6 +260,8 @@ private val DefaultSystemPrompt = """
 private const val DefaultSystemProfileId = "default"
 private const val MaxDocumentTextChars = 24000
 private const val DefaultContextLength = 8000
+private const val AllChatsFolderId = "__all_chats__"
+private const val UnfiledChatsFolderId = "__unfiled_chats__"
 
 private data class IncomingShareIntent(
     val id: Long,
@@ -294,6 +308,10 @@ private val AllowedToolPresets = listOf(
     "web_search",
     "web_fetch",
     "web_search_and_fetch",
+    "youtube_transcript",
+    "qr_generate",
+    "qr_scan",
+    "web_page_to_images",
 )
 
 class MainActivity : ComponentActivity() {
@@ -602,6 +620,10 @@ class MainActivity : ComponentActivity() {
                     onNewChat = viewModel::newChat,
                     onSelectChat = viewModel::selectChat,
                     onChatSearchChange = viewModel::updateChatSearchQuery,
+                    onSelectChatFolder = viewModel::selectChatFolder,
+                    onCreateChatFolder = viewModel::createChatFolder,
+                    onDeleteChatFolder = viewModel::deleteChatFolder,
+                    onMoveChatToFolder = viewModel::moveChatToFolder,
                     onEditMessage = viewModel::editMessage,
                     onDeleteMessage = viewModel::deleteMessage,
                     onDeleteChat = viewModel::deleteChat,
@@ -845,9 +867,16 @@ data class ChatMessage(
 
 data class ChatImageAttachment(
     val dataUrl: String = "",
+    val remoteUrl: String = "",
     val label: String = "Image",
     val mimeType: String = "image/jpeg",
 )
+
+private fun ChatImageAttachment.hasDisplayableImage(): Boolean =
+    dataUrl.isNotBlank() || remoteUrl.isNotBlank()
+
+private fun ChatImageAttachment.identityKey(): String =
+    dataUrl.ifBlank { remoteUrl.ifBlank { label } }
 
 data class ChatDocumentAttachment(
     val name: String,
@@ -859,9 +888,16 @@ data class ChatSession(
     val id: String = UUID.randomUUID().toString(),
     val title: String = "New chat",
     val messages: List<ChatMessage> = emptyList(),
+    val folderId: String? = null,
     val previousResponseId: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = System.currentTimeMillis(),
+)
+
+data class ChatFolder(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String,
+    val createdAt: Long = System.currentTimeMillis(),
 )
 
 data class SystemPromptProfile(
@@ -884,6 +920,8 @@ data class ChatUiState(
     val sessions: List<ChatSession> = emptyList(),
     val activeSessionId: String = "",
     val chatSearchQuery: String = "",
+    val chatFolders: List<ChatFolder> = emptyList(),
+    val activeChatFolderId: String = AllChatsFolderId,
     val messages: List<ChatMessage> = emptyList(),
     val input: String = "",
     val isSending: Boolean = false,
@@ -962,9 +1000,13 @@ class ChatViewModel(
     @Volatile
     private var stopRequested = false
 
+    private val initialFolders = settingsStore.loadChatFolders()
     private val initialSessions = settingsStore.loadChatSessions().ifEmpty { listOf(ChatSession()) }
     private val initialActiveSession = initialSessions.firstOrNull { it.id == settingsStore.activeSessionId }
         ?: initialSessions.first()
+    private val initialActiveChatFolderId = settingsStore.activeChatFolderId
+        .takeIf { folderId -> folderId.isKnownChatFolder(initialFolders) }
+        ?: AllChatsFolderId
     private val initialProfiles = settingsStore.loadSystemProfiles()
     private val initialActiveProfile = initialProfiles.firstOrNull { it.id == settingsStore.activeSystemProfileId }
         ?: initialProfiles.first()
@@ -973,6 +1015,8 @@ class ChatViewModel(
         ChatUiState(
             sessions = initialSessions,
             activeSessionId = initialActiveSession.id,
+            chatFolders = initialFolders,
+            activeChatFolderId = initialActiveChatFolderId,
             messages = initialActiveSession.messages,
             previousResponseId = initialActiveSession.previousResponseId,
             apiUrl = settingsStore.apiUrl,
@@ -1014,7 +1058,9 @@ class ChatViewModel(
 
     init {
         settingsStore.activeSessionId = initialActiveSession.id
+        settingsStore.activeChatFolderId = initialActiveChatFolderId
         settingsStore.saveChatSessions(initialSessions)
+        settingsStore.saveChatFolders(initialFolders)
         settingsStore.activeSystemProfileId = initialActiveProfile.id
         settingsStore.saveSystemProfiles(initialProfiles)
         WatchJobStore.load(settingsStore.context).forEach { WatchJobRunner.schedule(settingsStore.context, it) }
@@ -1041,6 +1087,94 @@ class ChatViewModel(
 
     fun updateChatSearchQuery(value: String) {
         _uiState.update { it.copy(chatSearchQuery = value) }
+    }
+
+    fun selectChatFolder(folderId: String) {
+        val state = _uiState.value
+        val normalizedFolderId = folderId.takeIf { it.isKnownChatFolder(state.chatFolders) } ?: AllChatsFolderId
+        settingsStore.activeChatFolderId = normalizedFolderId
+        _uiState.update { it.copy(activeChatFolderId = normalizedFolderId) }
+    }
+
+    fun createChatFolder(name: String) {
+        val cleanName = name.trim().replace(Regex("\\s+"), " ")
+        if (cleanName.isBlank()) return
+        val state = _uiState.value
+        val existing = state.chatFolders.firstOrNull { it.name.equals(cleanName, ignoreCase = true) }
+        val folders = if (existing != null) {
+            state.chatFolders
+        } else {
+            (state.chatFolders + ChatFolder(name = cleanName)).sortedBy { it.name.lowercase(Locale.getDefault()) }
+        }
+        val selectedFolderId = existing?.id ?: folders.firstOrNull { it.name == cleanName }?.id ?: AllChatsFolderId
+        settingsStore.saveChatFolders(folders)
+        settingsStore.activeChatFolderId = selectedFolderId
+        _uiState.update {
+            it.copy(
+                chatFolders = folders,
+                activeChatFolderId = selectedFolderId,
+                error = null,
+            )
+        }
+    }
+
+    fun moveChatToFolder(sessionId: String, folderId: String?) {
+        val state = _uiState.value
+        val targetFolderId = folderId?.takeIf { id -> state.chatFolders.any { it.id == id } }
+        val session = state.sessions.firstOrNull { it.id == sessionId } ?: return
+        if (session.folderId == targetFolderId) return
+        val updatedSession = session.copy(
+            folderId = targetFolderId,
+            updatedAt = System.currentTimeMillis(),
+        )
+        val sessions = state.sessions.replaceSession(updatedSession)
+        val activeFolderId = if (
+            sessionId == state.activeSessionId &&
+            !updatedSession.matchesChatFolder(state.activeChatFolderId)
+        ) {
+            targetFolderId ?: UnfiledChatsFolderId
+        } else {
+            state.activeChatFolderId
+        }
+        settingsStore.activeChatFolderId = activeFolderId
+        settingsStore.saveChatSessions(sessions)
+        _uiState.update {
+            it.copy(
+                sessions = sessions,
+                activeChatFolderId = activeFolderId,
+                error = null,
+            )
+        }
+    }
+
+    fun deleteChatFolder(folderId: String) {
+        if (folderId == AllChatsFolderId || folderId == UnfiledChatsFolderId) return
+        val state = _uiState.value
+        if (state.chatFolders.none { it.id == folderId }) return
+        val folders = state.chatFolders.filterNot { it.id == folderId }
+        val sessions = state.sessions.map { session ->
+            if (session.folderId == folderId) {
+                session.copy(folderId = null, updatedAt = System.currentTimeMillis())
+            } else {
+                session
+            }
+        }
+        val activeFolderId = if (state.activeChatFolderId == folderId) {
+            AllChatsFolderId
+        } else {
+            state.activeChatFolderId
+        }
+        settingsStore.saveChatFolders(folders)
+        settingsStore.saveChatSessions(sessions)
+        settingsStore.activeChatFolderId = activeFolderId
+        _uiState.update {
+            it.copy(
+                chatFolders = folders,
+                sessions = sessions,
+                activeChatFolderId = activeFolderId,
+                error = null,
+            )
+        }
     }
 
     fun selectChat(sessionId: String) {
@@ -1212,6 +1346,7 @@ class ChatViewModel(
                 val toolErrors = mutableListOf<String>()
                 val reasoningBuffer = StringBuilder()
                 val message = StringBuilder()
+                val streamImageAttachments = mutableListOf<ChatImageAttachment>()
 
                 fun renderStreamingContent(): String =
                     buildAssistantContent(
@@ -1225,6 +1360,7 @@ class ChatViewModel(
                     content: String,
                     isStreaming: Boolean,
                     answer: ChatCompletionResult? = null,
+                    attachments: List<ChatImageAttachment> = answer?.attachments.orEmpty(),
                     persist: Boolean = false,
                 ) {
                     _uiState.update { current ->
@@ -1236,6 +1372,7 @@ class ChatViewModel(
                                         if (existingMessage.id == assistantPlaceholder.id) {
                                             existingMessage.copy(
                                                 content = content,
+                                                attachments = attachments,
                                                 isStreaming = isStreaming,
                                             )
                                         } else {
@@ -1317,6 +1454,11 @@ class ChatViewModel(
                             if (toolLabel.isNotBlank() && toolLabel !in toolCalls) {
                                 toolCalls += toolLabel
                             }
+                            event.imageAttachments.forEach { attachment ->
+                                if (attachment.hasDisplayableImage() && streamImageAttachments.none { it.identityKey() == attachment.identityKey() }) {
+                                    streamImageAttachments += attachment
+                                }
+                            }
                         }
                         ChatStreamEventType.ToolFailed -> {
                             val toolLabel = event.toolLabel().ifBlank { "tool" }
@@ -1332,7 +1474,11 @@ class ChatViewModel(
                             }
                         }
                     }
-                    updateAssistant(renderStreamingContent(), isStreaming = true)
+                    updateAssistant(
+                        content = renderStreamingContent(),
+                        isStreaming = true,
+                        attachments = streamImageAttachments,
+                    )
                 }
 
                 result.fold(
@@ -1344,6 +1490,8 @@ class ChatViewModel(
                             content = answer.content,
                             isStreaming = false,
                             answer = answer,
+                            attachments = (answer.attachments + streamImageAttachments)
+                                .distinctBy { it.identityKey() },
                             persist = true,
                         )
                     },
@@ -1377,6 +1525,7 @@ class ChatViewModel(
                                     val assistantMessage = ChatMessage(
                                         role = MessageRole.Assistant,
                                         content = answer.content,
+                                        attachments = answer.attachments,
                                     )
                                     val responseSessions = current.sessions.map { session ->
                                         if (session.id == activeSessionId) {
@@ -1417,8 +1566,12 @@ class ChatViewModel(
     }
 
     fun newChat() {
-        val newSession = ChatSession()
-        val sessions = (listOf(newSession) + _uiState.value.sessions)
+        val state = _uiState.value
+        val folderId = state.activeChatFolderId.takeIf { activeFolderId ->
+            state.chatFolders.any { it.id == activeFolderId }
+        }
+        val newSession = ChatSession(folderId = folderId)
+        val sessions = (listOf(newSession) + state.sessions)
             .distinctBy { it.id }
         settingsStore.activeSessionId = newSession.id
         settingsStore.saveChatSessions(sessions)
@@ -2159,21 +2312,40 @@ class ChatViewModel(
     }
 
     fun exportChatHistoryJson(): String =
-        SettingsStore.chatSessionsToJson(_uiState.value.sessions)
+        SettingsStore.chatSessionsToJson(
+            sessions = _uiState.value.sessions,
+            folders = _uiState.value.chatFolders,
+        )
 
     fun importChatHistory(json: String) {
-        val importedSessions = runCatching {
-            SettingsStore.chatSessionsFromJson(json).ifEmpty { listOf(ChatSession()) }
+        val imported = runCatching {
+            val importedFolders = SettingsStore.chatFoldersFromJson(json)
+            val folderIds = importedFolders.map { it.id }.toSet()
+            val importedSessions = SettingsStore.chatSessionsFromJson(json)
+                .map { session ->
+                    if (session.folderId != null && session.folderId !in folderIds) {
+                        session.copy(folderId = null)
+                    } else {
+                        session
+                    }
+                }
+                .ifEmpty { listOf(ChatSession()) }
+            importedFolders to importedSessions
         }.getOrElse { throwable ->
             _uiState.update { it.copy(error = "Could not import chat history: ${throwable.message}") }
             return
         }
+        val (importedFolders, importedSessions) = imported
         val activeSession = importedSessions.first()
         settingsStore.activeSessionId = activeSession.id
+        settingsStore.activeChatFolderId = AllChatsFolderId
+        settingsStore.saveChatFolders(importedFolders)
         settingsStore.saveChatSessions(importedSessions)
         _uiState.update {
             it.copy(
                 sessions = importedSessions,
+                chatFolders = importedFolders,
+                activeChatFolderId = AllChatsFolderId,
                 activeSessionId = activeSession.id,
                 messages = activeSession.messages,
                 previousResponseId = activeSession.previousResponseId,
@@ -2209,6 +2381,12 @@ class SettingsStore(context: Context) {
         get() = preferences.getString("active_session_id", "") ?: ""
         set(value) {
             preferences.edit().putString("active_session_id", value).apply()
+        }
+
+    var activeChatFolderId: String
+        get() = preferences.getString("active_chat_folder_id", AllChatsFolderId) ?: AllChatsFolderId
+        set(value) {
+            preferences.edit().putString("active_chat_folder_id", value).apply()
         }
 
     var apiUrl: String
@@ -2396,6 +2574,17 @@ class SettingsStore(context: Context) {
             .apply()
     }
 
+    fun loadChatFolders(): List<ChatFolder> =
+        runCatching {
+            chatFoldersFromJson(preferences.getString("chat_folders", "").orEmpty())
+        }.getOrDefault(emptyList())
+
+    fun saveChatFolders(folders: List<ChatFolder>) {
+        preferences.edit()
+            .putString("chat_folders", chatFoldersToJson(folders))
+            .apply()
+    }
+
     fun loadSystemProfiles(): List<SystemPromptProfile> {
         val profiles = runCatching {
             systemProfilesFromJson(preferences.getString("system_profiles", "").orEmpty())
@@ -2462,7 +2651,10 @@ class SettingsStore(context: Context) {
             profiles.map { profile ->
                 if (
                     profile.id == DefaultSystemProfileId &&
-                    profile.prompt.trim() == LegacyDefaultSystemPrompt
+                    (
+                        profile.prompt.trim() == LegacyDefaultSystemPrompt ||
+                            profile.prompt.looksLikePreviousBundledDefaultSystemPrompt()
+                        )
                 ) {
                     profile.copy(prompt = DefaultSystemPrompt)
                 } else {
@@ -2470,7 +2662,61 @@ class SettingsStore(context: Context) {
                 }
             }
 
-        fun chatSessionsToJson(sessions: List<ChatSession>): String {
+        private fun String.looksLikePreviousBundledDefaultSystemPrompt(): Boolean =
+            contains("You are LMSMOB Chat, a polite, practical assistant running locally through LM Studio") &&
+                contains("- LM Studio server-side MCP/plugin tools when the app enables integrations for the current request.") &&
+                contains("- Android phone-side tools when the app lists them below; these always require user confirmation before any action is performed.") &&
+                !contains("Never use <lmsmob_action> for LM Studio MCP/plugin tools")
+
+        fun chatFoldersToJson(folders: List<ChatFolder>): String {
+            val foldersJson = JSONArray()
+            folders.forEach { folder ->
+                foldersJson.put(
+                    JSONObject()
+                        .put("id", folder.id)
+                        .put("name", folder.name)
+                        .put("created_at", folder.createdAt),
+                )
+            }
+            return JSONObject()
+                .put("version", 1)
+                .put("folders", foldersJson)
+                .toString()
+        }
+
+        fun chatFoldersFromJson(json: String): List<ChatFolder> {
+            if (json.isBlank()) return emptyList()
+            val foldersJson = JSONObject(json).optJSONArray("folders") ?: JSONArray()
+            return buildList {
+                for (index in 0 until foldersJson.length()) {
+                    val folderJson = foldersJson.optJSONObject(index) ?: continue
+                    val name = folderJson.optString("name").trim()
+                    if (name.isBlank()) continue
+                    add(
+                        ChatFolder(
+                            id = folderJson.optString("id").ifBlank { UUID.randomUUID().toString() },
+                            name = name,
+                            createdAt = folderJson.optLong("created_at", System.currentTimeMillis()),
+                        ),
+                    )
+                }
+            }.distinctBy { it.id }
+                .sortedBy { it.name.lowercase(Locale.getDefault()) }
+        }
+
+        fun chatSessionsToJson(
+            sessions: List<ChatSession>,
+            folders: List<ChatFolder> = emptyList(),
+        ): String {
+            val foldersJson = JSONArray()
+            folders.forEach { folder ->
+                foldersJson.put(
+                    JSONObject()
+                        .put("id", folder.id)
+                        .put("name", folder.name)
+                        .put("created_at", folder.createdAt),
+                )
+            }
             val sessionsJson = JSONArray()
             sessions.forEach { session ->
                 val messagesJson = JSONArray()
@@ -2480,7 +2726,8 @@ class SettingsStore(context: Context) {
                         attachmentsJson.put(
                             JSONObject()
                                 .put("label", attachment.label)
-                                .put("mime_type", attachment.mimeType),
+                                .put("mime_type", attachment.mimeType)
+                                .put("remote_url", attachment.remoteUrl),
                         )
                     }
                     messagesJson.put(
@@ -2492,19 +2739,20 @@ class SettingsStore(context: Context) {
                             .put("is_streaming", false),
                     )
                 }
-                sessionsJson.put(
-                    JSONObject()
-                        .put("id", session.id)
-                        .put("title", session.title)
-                        .put("previous_response_id", session.previousResponseId)
-                        .put("created_at", session.createdAt)
-                        .put("updated_at", session.updatedAt)
-                        .put("messages", messagesJson),
-                )
+                val sessionJson = JSONObject()
+                    .put("id", session.id)
+                    .put("title", session.title)
+                    .put("previous_response_id", session.previousResponseId)
+                    .put("created_at", session.createdAt)
+                    .put("updated_at", session.updatedAt)
+                    .put("messages", messagesJson)
+                session.folderId?.takeIf { it.isNotBlank() }?.let { sessionJson.put("folder_id", it) }
+                sessionsJson.put(sessionJson)
             }
             return JSONObject()
                 .put("version", 1)
                 .put("exported_at", System.currentTimeMillis())
+                .put("folders", foldersJson)
                 .put("sessions", sessionsJson)
                 .toString(2)
         }
@@ -2535,6 +2783,7 @@ class SettingsStore(context: Context) {
                                     add(
                                         ChatImageAttachment(
                                             dataUrl = "",
+                                            remoteUrl = attachmentJson.optString("remote_url"),
                                             label = label,
                                             mimeType = attachmentJson.optString("mime_type").ifBlank { "image/jpeg" },
                                         ),
@@ -2559,6 +2808,7 @@ class SettingsStore(context: Context) {
                                     ?: "New chat"
                             },
                             messages = messages,
+                            folderId = sessionJson.optString("folder_id").takeIf { it.isNotBlank() },
                             previousResponseId = sessionJson.optString("previous_response_id").takeIf { it.isNotBlank() },
                             createdAt = sessionJson.optLong("created_at", System.currentTimeMillis()),
                             updatedAt = sessionJson.optLong("updated_at", System.currentTimeMillis()),
@@ -2574,6 +2824,18 @@ data class ChatCompletionResult(
     val content: String,
     val responseId: String? = null,
     val modelId: String? = null,
+    val attachments: List<ChatImageAttachment> = emptyList(),
+)
+
+private data class SourceLink(
+    val title: String,
+    val url: String,
+)
+
+private data class ExtractedToolOutput(
+    val textParts: List<String> = emptyList(),
+    val imageAttachments: List<ChatImageAttachment> = emptyList(),
+    val sourceLinks: List<SourceLink> = emptyList(),
 )
 
 enum class ChatStreamEventType {
@@ -2590,6 +2852,7 @@ data class ChatStreamEvent(
     val content: String = "",
     val tool: String = "",
     val provider: String = "",
+    val imageAttachments: List<ChatImageAttachment> = emptyList(),
 )
 
 private fun ChatStreamEvent.toolLabel(): String =
@@ -2608,6 +2871,19 @@ private fun List<ChatSession>.replaceSession(session: ChatSession): List<ChatSes
     }
 }
 
+private fun String.isKnownChatFolder(folders: List<ChatFolder>): Boolean =
+    this == AllChatsFolderId || this == UnfiledChatsFolderId || folders.any { it.id == this }
+
+private fun ChatSession.matchesChatFolder(folderId: String): Boolean =
+    when (folderId) {
+        AllChatsFolderId -> true
+        UnfiledChatsFolderId -> this.folderId.isNullOrBlank()
+        else -> this.folderId == folderId
+    }
+
+private fun ChatSession.folderName(folders: List<ChatFolder>): String =
+    folders.firstOrNull { it.id == folderId }?.name ?: "Unfiled"
+
 private fun String.toChatTitle(): String {
     val compact = trim()
         .replace(Regex("\\s+"), " ")
@@ -2623,6 +2899,7 @@ private fun buildAssistantContent(
     reasoning: String,
     message: String,
     errors: List<String> = emptyList(),
+    sources: List<SourceLink> = emptyList(),
 ): String = buildString {
     if (tools.isNotEmpty()) {
         append("Tools used: ")
@@ -2637,13 +2914,37 @@ private fun buildAssistantContent(
     if (reasoning.isNotBlank() && message.isNotBlank()) {
         append("<|channel>answer\n<channel|>")
     }
-    append(message)
+    append(message.withoutLmStudioImagePlaceholders())
+    val uniqueSources = sources.distinctBy { it.url }.take(12)
+    if (uniqueSources.isNotEmpty()) {
+        if (isNotBlank()) append("\n\n")
+        append("Sources:\n")
+        uniqueSources.forEach { source ->
+            append("- [")
+            append(source.title.toMarkdownLinkLabel())
+            append("](")
+            append(source.url)
+            append(")\n")
+        }
+    }
     if (errors.isNotEmpty()) {
         if (isNotBlank()) append("\n\n")
         append("Tool errors: ")
         append(errors.joinToString(", "))
     }
 }
+
+private fun String.toMarkdownLinkLabel(): String =
+    replace("[", "(")
+        .replace("]", ")")
+        .replace("\n", " ")
+        .trim()
+        .ifBlank { "Source" }
+
+private fun String.withoutLmStudioImagePlaceholders(): String =
+    replace(LmStudioImagePlaceholderRegex, "")
+        .replace(Regex("\\n{3,}"), "\n\n")
+        .trim()
 
 private fun ChatUiState.selectedModelInfo(): ModelInfo? =
     availableModelInfos.firstOrNull { it.id == model }
@@ -2746,6 +3047,7 @@ private fun ChatUiState.capabilityGuideSystemPrompt(): String {
     val reasoningStatus = if (selectedModelSupportsReasoningToggle()) "ENABLED" else "DISABLED"
     val serverIntegrationsList = serverIntegrations.toCapabilityList()
     val allowedToolsList = allowedTools.toCapabilityList()
+    val serverToolHints = serverIntegrationToolHints(serverIntegrations, allowedTools)
 
     fun Boolean.status(): String = if (this) "ENABLED" else "DISABLED"
 
@@ -2785,18 +3087,29 @@ private fun ChatUiState.capabilityGuideSystemPrompt(): String {
         appendLine("- [${appendDateTimeToSystemPrompt.status()}] Current date/time in prompt: ${if (appendDateTimeToSystemPrompt) "the app appends the phone date/time separately." else "not appended; ask the user to enable it if exact current phone time matters."}")
         appendLine("- [ENABLED] Chat management UI: the user can search chats, copy/edit/delete messages, delete chats, and import/export history in the app UI. Do not claim to operate these UI controls yourself.")
         appendLine()
+        appendLine("Tool routing rules:")
+        appendLine("- LM Studio server-side tools are MCP/plugin tools invoked by LM Studio through the integrations field. Never output <lmsmob_action> for server tools.")
+        appendLine("- Android phone-side tools are local device actions invoked only by a <lmsmob_action> block. Never expect LM Studio MCP/plugin tools to open phone apps, read contacts, change alarms, or manage watch jobs.")
+        appendLine("- Use server tools for web/search/fetch/YouTube/QR/page screenshot work. Use phone tools for Android intents, contacts, notifications, files, device status, alarms, calendar/reminders, and watch jobs.")
+        appendLine("- If both sides could apply, choose by intent: read or analyze online content = server tool; open something on the phone or change phone state = phone action after confirmation.")
+        appendLine()
         appendLine("LM Studio server-side tools and integrations:")
         if (serverToolsEnabled) {
             appendLine("- [ENABLED] Server tools: LM Studio MCP/plugin integrations may be used by the /api/v1/chat request.")
             appendLine("- Integrations configured for this request: ${serverIntegrationsList.ifBlank { "none listed; ask the user to add at least one integration in Settings > Server tools." }}")
             appendLine("- Allowed server tool filter: ${allowedToolsList.ifBlank { "none set; LM Studio decides from enabled integrations." }}")
-            appendLine("- Use server tools only when they directly help. Summarize tool results clearly. If a requested server tool is missing, ask the user to enable/install it in LM Studio and add it to Settings > Server tools.")
+            if (serverToolHints.isNotBlank()) {
+                appendLine("- Known server-side tool map:")
+                appendLine(serverToolHints)
+            }
+            appendLine("- Use server tools only when they directly help. Summarize tool results clearly, include direct source links when tool output provides URLs, and show generated images when the tool returns image content. If a requested server tool is missing, ask the user to enable/install it in LM Studio and add it to Settings > Server tools.")
         } else {
             appendLine("- [DISABLED] Server tools: do not assume web/MCP/plugin access. If the user asks for web browsing, Playwright, local-web, or other LM Studio plugins, tell them to enable Settings > Server tools, add integrations, and provide an API token with MCP permissions.")
         }
         appendLine()
         appendLine("Phone-side action format:")
         appendLine("- For enabled phone-side actions, reply with a short explanation and exactly one block: <lmsmob_action>{\"tool\":\"tool_name\",\"args\":{\"key\":\"value\"}}</lmsmob_action>")
+        appendLine("- The only valid tool names inside <lmsmob_action> are the phone-side tools listed below. Do not put server-side names such as web_search, web_fetch, youtube_transcript, qr_generate, qr_scan, or web_page_to_images inside <lmsmob_action>.")
         appendLine("- For disabled phone-side actions, do not emit an action block. Ask the user to enable the specific tool in Settings > Phone tools. Enabling a tool is the user's consent to allow the app to offer that action with confirmation.")
         appendLine("- Calls, SMS, email, maps, URLs, calendar, reminders, alarms, contacts, files, notifications, and watch jobs are sensitive. The app asks for confirmation; never say the final action is complete until the app returns a tool result or the user confirms a draft.")
         appendLine()
@@ -2831,6 +3144,28 @@ private fun String.toCapabilityList(): String =
         .filter { it.isNotBlank() }
         .distinct()
         .joinToString("; ")
+
+private fun serverIntegrationToolHints(integrations: String, allowedTools: String): String {
+    val normalized = integrations.lowercase()
+    val hints = mutableListOf<String>()
+    if ("local-web" in normalized) {
+        hints += "mcp/local-web: web_search finds public web results; web_fetch reads one URL; web_search_and_fetch searches then reads top results; youtube_transcript reads YouTube transcripts; qr_generate creates QR images; qr_scan reads QR images; web_page_to_images captures webpage screenshots. For webpage screenshots, capture the full scrollable page by default. Use viewportOnly=true only when the user explicitly asks for only the top/current visible viewport."
+    }
+    if ("youtube" in normalized && "local-web" !in normalized) {
+        hints += "YouTube MCP/plugin integration: use it for YouTube video lookup or transcript tasks when available."
+    }
+    if ("playwright" in normalized) {
+        hints += "mcp/playwright: browser automation and rendered webpage inspection on the LM Studio server side, not on the Android phone."
+    }
+    if ("gemma4-audio-python" in normalized || "audio" in normalized) {
+        hints += "Audio MCP/plugin integration: audio processing happens on the LM Studio server side when enabled."
+    }
+    val allowed = allowedTools.toCapabilityList()
+    if (allowed.isNotBlank()) {
+        hints += "Allowed server tool filter is active, so only these server tool names should be expected: $allowed."
+    }
+    return hints.joinToString("\n") { "- $it" }
+}
 
 private fun ChatUiState.nativeToolSystemPrompt(): String {
     val tools = mutableListOf<String>()
@@ -3012,6 +3347,17 @@ private fun JSONObject.optionalArg(vararg names: String): String? {
 private fun Context.copyToClipboard(text: String) {
     val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     clipboard.setPrimaryClip(ClipData.newPlainText("LM Studio message", text))
+}
+
+private fun Context.openUrl(url: String) {
+    runCatching {
+        startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+        )
+    }.onFailure {
+        Toast.makeText(this, "Could not open link", Toast.LENGTH_SHORT).show()
+    }
 }
 
 private suspend fun handleIncomingShareIntent(
@@ -4700,7 +5046,9 @@ class LmStudioClient(
                                 content = json.optString("content"),
                             ),
                         )
-                        "tool_call.start" -> onEvent(json.toToolEvent(ChatStreamEventType.ToolStarted))
+                        "tool_call.start",
+                        "tool_call.name",
+                        "tool_call.arguments" -> onEvent(json.toToolEvent(ChatStreamEventType.ToolStarted))
                         "tool_call.success" -> onEvent(json.toToolEvent(ChatStreamEventType.ToolSucceeded))
                         "tool_call.failure" -> onEvent(
                             ChatStreamEvent(
@@ -4754,10 +5102,19 @@ class LmStudioClient(
         val provider = optJSONObject("provider_info")
         val providerName = provider?.optString("plugin_id").orEmpty()
             .ifBlank { provider?.optString("server_label").orEmpty() }
+        val toolName = optString("tool")
+            .ifBlank { optString("tool_name") }
+            .ifBlank { optJSONObject("metadata")?.optString("tool_name").orEmpty() }
+        val extractedOutput = if (type == ChatStreamEventType.ToolSucceeded) {
+            extractToolOutput(toolName.ifBlank { "tool" })
+        } else {
+            ExtractedToolOutput()
+        }
         return ChatStreamEvent(
             type = type,
-            tool = optString("tool"),
+            tool = toolName,
             provider = providerName,
+            imageAttachments = extractedOutput.imageAttachments,
         )
     }
 
@@ -4770,6 +5127,8 @@ class LmStudioClient(
         val reasoningParts = mutableListOf<String>()
         val toolCalls = mutableListOf<String>()
         val invalidToolCalls = mutableListOf<String>()
+        val toolImageAttachments = mutableListOf<ChatImageAttachment>()
+        val sourceLinks = linkedMapOf<String, SourceLink>()
 
         for (index in 0 until output.length()) {
             val item = output.optJSONObject(index) ?: continue
@@ -4788,6 +5147,11 @@ class LmStudioClient(
                     val providerName = provider?.optString("plugin_id").orEmpty()
                         .ifBlank { provider?.optString("server_label").orEmpty() }
                     toolCalls += if (providerName.isBlank()) tool else "$tool via $providerName"
+                    val extractedOutput = item.extractToolOutput(tool)
+                    toolImageAttachments += extractedOutput.imageAttachments
+                    extractedOutput.sourceLinks.forEach { source ->
+                        sourceLinks.putIfAbsent(source.url, source)
+                    }
                 }
                 "invalid_tool_call" -> {
                     val metadata = item.optJSONObject("metadata")
@@ -4805,9 +5169,10 @@ class LmStudioClient(
             reasoning = reasoningParts.joinToString("\n\n"),
             message = messageParts.joinToString("\n\n"),
             errors = invalidToolCalls,
+            sources = sourceLinks.values.toList(),
         ).trim()
 
-        if (content.isBlank()) {
+        if (content.isBlank() && toolImageAttachments.isEmpty()) {
             throw IOException("LM Studio returned an empty response")
         }
 
@@ -4815,9 +5180,277 @@ class LmStudioClient(
             content = content,
             responseId = json.optString("response_id").takeIf { it.isNotBlank() },
             modelId = json.optString("model_instance_id").takeIf { it.isNotBlank() } ?: fallbackModel,
+            attachments = toolImageAttachments,
         )
     }
 }
+
+private fun JSONObject.extractToolOutput(tool: String): ExtractedToolOutput {
+    val output = opt("output") ?: return ExtractedToolOutput()
+    if (output == JSONObject.NULL) return ExtractedToolOutput()
+    return parseToolOutputValue(output, tool)
+}
+
+private fun parseToolOutputValue(value: Any, tool: String): ExtractedToolOutput =
+    when (value) {
+        is JSONArray -> value.extractToolContent(tool)
+        is JSONObject -> value.extractToolObject(tool)
+        else -> parseToolOutputString(value.toString(), tool)
+    }
+
+private fun parseToolOutputString(value: String, tool: String): ExtractedToolOutput {
+    val trimmed = value.trim()
+    if (trimmed.isBlank()) return ExtractedToolOutput()
+    val parsedJson = runCatching {
+        when {
+            trimmed.startsWith("[") -> JSONArray(trimmed).extractToolContent(tool)
+            trimmed.startsWith("{") -> JSONObject(trimmed).extractToolObject(tool)
+            else -> null
+        }
+    }.getOrNull()
+    if (parsedJson != null) return parsedJson
+
+    val images = trimmed.extractToolImageAttachments(tool.readableToolImageLabel())
+    val visibleText = trimmed.withoutDataImageUrls()
+    return ExtractedToolOutput(
+        textParts = listOfNotNull(visibleText.takeIf { it.isNotBlank() }),
+        imageAttachments = images,
+        sourceLinks = visibleText.extractSourceLinks(),
+    )
+}
+
+private fun JSONObject.extractToolObject(tool: String): ExtractedToolOutput {
+    val content = optJSONArray("content")
+    if (content != null) {
+        val fromContent = content.extractToolContent(tool)
+        val structured = optJSONObject("structuredContent")
+        return if (structured != null) {
+            fromContent + structured.extractStructuredToolContent(tool)
+        } else {
+            fromContent
+        }
+    }
+    return extractStructuredToolContent(tool)
+}
+
+private fun JSONObject.extractStructuredToolContent(tool: String): ExtractedToolOutput {
+    val textParts = mutableListOf<String>()
+    optString("text").takeIf { it.isNotBlank() }?.let { text ->
+        textParts += text.withoutDataImageUrls()
+    }
+    optString("formattedText").takeIf { it.isNotBlank() }?.let { text ->
+        textParts += text.withoutDataImageUrls()
+    }
+    val images = mutableListOf<ChatImageAttachment>()
+    images += optString("text").extractToolImageAttachments(tool.readableToolImageLabel())
+    images += optString("formattedText").extractToolImageAttachments(tool.readableToolImageLabel())
+    val imageBase64 = optString("imageBase64")
+        .ifBlank { optString("data") }
+        .ifBlank { optString("data_url") }
+        .ifBlank { optString("dataUrl") }
+        .takeIf { it.isNotBlank() }
+    if (imageBase64 != null) {
+        imageBase64.toImageAttachment(
+            label = tool.readableToolImageLabel(),
+            mimeType = optString("mimeType").ifBlank { "image/png" },
+        )?.let { images += it }
+    }
+    optString("assetUrl")
+        .ifBlank { optString("imageUrl") }
+        .takeIf { it.isNotBlank() }
+        ?.toRemoteImageAttachment(tool.readableToolImageLabel())
+        ?.let { images += it }
+    optJSONArray("images")?.let { imageArray ->
+        for (index in 0 until imageArray.length()) {
+            val image = imageArray.optJSONObject(index) ?: continue
+            image.optString("assetUrl")
+                .ifBlank { image.optString("imageUrl") }
+                .ifBlank { image.optString("url") }
+                .takeIf { it.isNotBlank() }
+                ?.toRemoteImageAttachment("${tool.readableToolImageLabel()} ${images.size + 1}")
+                ?.let { images += it }
+        }
+    }
+    val sourceText = textParts.joinToString("\n\n")
+    return ExtractedToolOutput(
+        textParts = textParts,
+        imageAttachments = images,
+        sourceLinks = sourceText.extractSourceLinks(),
+    )
+}
+
+private fun JSONArray.extractToolContent(tool: String): ExtractedToolOutput {
+    val textParts = mutableListOf<String>()
+    val images = mutableListOf<ChatImageAttachment>()
+    for (index in 0 until length()) {
+        val item = optJSONObject(index) ?: continue
+        when (item.optString("type")) {
+            "text" -> item.optString("text").takeIf { it.isNotBlank() }?.let { text ->
+                images += text.extractToolImageAttachments("${tool.readableToolImageLabel()} ${images.size + 1}")
+                text.withoutDataImageUrls().takeIf { it.isNotBlank() }?.let { textParts += it }
+            }
+            "image" -> {
+                val data = item.optString("data")
+                    .ifBlank { item.optString("imageBase64") }
+                    .ifBlank { item.optString("data_url") }
+                val mimeType = item.optString("mimeType")
+                    .ifBlank { item.optString("mime_type") }
+                    .ifBlank { "image/png" }
+                data.toImageAttachment(
+                    label = "${tool.readableToolImageLabel()} ${images.size + 1}",
+                    mimeType = mimeType,
+                )?.let { images += it }
+                item.optString("assetUrl")
+                    .ifBlank { item.optString("imageUrl") }
+                    .ifBlank { item.optString("url") }
+                    .takeIf { it.isNotBlank() }
+                    ?.toRemoteImageAttachment("${tool.readableToolImageLabel()} ${images.size + 1}")
+                    ?.let { images += it }
+            }
+        }
+    }
+    val sourceText = textParts.joinToString("\n\n")
+    return ExtractedToolOutput(
+        textParts = textParts,
+        imageAttachments = images,
+        sourceLinks = sourceText.extractSourceLinks(),
+    )
+}
+
+private operator fun ExtractedToolOutput.plus(other: ExtractedToolOutput): ExtractedToolOutput =
+    ExtractedToolOutput(
+        textParts = textParts + other.textParts,
+        imageAttachments = (imageAttachments + other.imageAttachments).distinctBy { it.identityKey() },
+        sourceLinks = (sourceLinks + other.sourceLinks).distinctBy { it.url },
+    )
+
+private fun String.toImageAttachment(label: String, mimeType: String): ChatImageAttachment? {
+    val trimmed = trim()
+    if (trimmed.isBlank()) return null
+    val dataUrl = if (trimmed.startsWith("data:image/", ignoreCase = true)) {
+        trimmed
+    } else {
+        "data:${mimeType.ifBlank { "image/png" }};base64,$trimmed"
+    }
+    if (dataUrl.substringAfter(",", missingDelimiterValue = "").isBlank()) return null
+    val resolvedMimeType = dataUrl.substringAfter("data:", "")
+        .substringBefore(";", "")
+        .ifBlank { mimeType.ifBlank { "image/png" } }
+    return ChatImageAttachment(
+        dataUrl = dataUrl,
+        label = label,
+        mimeType = resolvedMimeType,
+    )
+}
+
+private fun String.toRemoteImageAttachment(label: String): ChatImageAttachment? {
+    val trimmed = trim().trimEnd('.', ',', ';')
+    if (!trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true)) {
+        return null
+    }
+    val mimeType = when (trimmed.substringBefore("?").substringAfterLast(".", "").lowercase(Locale.getDefault())) {
+        "jpg", "jpeg" -> "image/jpeg"
+        "webp" -> "image/webp"
+        else -> "image/png"
+    }
+    return ChatImageAttachment(
+        remoteUrl = trimmed,
+        label = label,
+        mimeType = mimeType,
+    )
+}
+
+private fun String.extractToolImageAttachments(labelBase: String): List<ChatImageAttachment> =
+    (extractDataImageAttachments(labelBase) + extractRemoteImageAttachments(labelBase))
+        .distinctBy { it.identityKey() }
+
+private fun String.extractDataImageAttachments(labelBase: String): List<ChatImageAttachment> =
+    DataImageRegex.findAll(this)
+        .mapIndexedNotNull { index, match ->
+            val dataUrl = match.value.replace(Regex("\\s+"), "")
+            val mimeType = dataUrl.substringAfter("data:", "")
+                .substringBefore(";")
+                .ifBlank { "image/png" }
+            dataUrl.toImageAttachment(
+                label = if (index == 0) labelBase else "$labelBase ${index + 1}",
+                mimeType = mimeType,
+            )
+        }
+        .toList()
+
+private fun String.extractRemoteImageAttachments(labelBase: String): List<ChatImageAttachment> =
+    RemoteImageUrlRegex.findAll(this)
+        .mapIndexedNotNull { index, match ->
+            match.value.toRemoteImageAttachment(
+                label = if (index == 0) labelBase else "$labelBase ${index + 1}",
+            )
+        }
+        .toList()
+
+private fun String.withoutDataImageUrls(): String =
+    replace(DataImageRegex, "[generated image]")
+        .replace(Regex("\\n{3,}"), "\n\n")
+        .trim()
+
+private fun String.readableToolImageLabel(): String =
+    split("_", "-", ".")
+        .filter { it.isNotBlank() }
+        .joinToString(" ") { part -> part.replaceFirstChar { it.uppercase(Locale.getDefault()) } }
+        .ifBlank { "Generated image" }
+
+private fun String.extractSourceLinks(): List<SourceLink> {
+    val links = linkedMapOf<String, SourceLink>()
+    var pendingTitle = ""
+    lines().forEach { rawLine ->
+        val line = rawLine.trim()
+        if (line.isBlank()) return@forEach
+        when {
+            line.startsWith("Title:", ignoreCase = true) ->
+                pendingTitle = line.substringAfter(":").trim()
+            Regex("^\\d+\\.\\s+.+").matches(line) ->
+                pendingTitle = line.substringAfter(".").trim()
+            Regex("^Page\\s+\\d+:", RegexOption.IGNORE_CASE).containsMatchIn(line) ->
+                pendingTitle = line.substringAfter(":").trim()
+            line.startsWith("URL:", ignoreCase = true) -> {
+                val url = line.substringAfter(":").trim().cleanSourceUrl()
+                if (url.startsWith("http")) {
+                    links[url] = SourceLink(
+                        title = pendingTitle.ifBlank { url.toSourceTitle() },
+                        url = url,
+                    )
+                }
+            }
+        }
+        MarkdownLinkRegex.findAll(line).forEach { match ->
+            val title = match.groupValues.getOrNull(1).orEmpty().trim()
+            val url = match.groupValues.getOrNull(2).orEmpty().cleanSourceUrl()
+            if (url.startsWith("http")) {
+                links[url] = SourceLink(title = title.ifBlank { url.toSourceTitle() }, url = url)
+            }
+        }
+        UrlRegex.findAll(line).forEach { match ->
+            val url = match.value.cleanSourceUrl()
+            if (url.startsWith("http") && url !in links) {
+                links[url] = SourceLink(title = pendingTitle.ifBlank { url.toSourceTitle() }, url = url)
+            }
+        }
+    }
+    return links.values.toList()
+}
+
+private val MarkdownLinkRegex = Regex("\\[([^\\]]+)]\\((https?://[^)\\s]+)\\)")
+private val UrlRegex = Regex("https?://[^\\s)\\]>\"']+")
+private val DataImageRegex = Regex("data:image/(?:png|jpe?g|webp);base64,[A-Za-z0-9+/=]+")
+private val RemoteImageUrlRegex = Regex("https?://[^\\s)\\]>\"']+\\.(?:png|jpe?g|webp)(?:\\?[^\\s)\\]>\"']*)?", RegexOption.IGNORE_CASE)
+private val LmStudioImagePlaceholderRegex = Regex("<image-[^>]+\\.(?:png|jpe?g|webp)>", RegexOption.IGNORE_CASE)
+
+private fun String.cleanSourceUrl(): String =
+    trim().trimEnd('.', ',', ';', ':')
+
+private fun String.toSourceTitle(): String =
+    runCatching { Uri.parse(this).host.orEmpty().removePrefix("www.") }
+        .getOrDefault("")
+        .ifBlank { this }
 
 private data class NativeModels(
     val loadedModelKeys: List<String>,
@@ -5165,6 +5798,10 @@ fun LmStudioApp(
     onNewChat: () -> Unit,
     onSelectChat: (String) -> Unit,
     onChatSearchChange: (String) -> Unit,
+    onSelectChatFolder: (String) -> Unit,
+    onCreateChatFolder: (String) -> Unit,
+    onDeleteChatFolder: (String) -> Unit,
+    onMoveChatToFolder: (String, String?) -> Unit,
     onEditMessage: (String) -> Unit,
     onDeleteMessage: (String) -> Unit,
     onDeleteChat: (String) -> Unit,
@@ -5329,6 +5966,10 @@ fun LmStudioApp(
                     scope.launch { drawerState.close() }
                 },
                 onChatSearchChange = onChatSearchChange,
+                onSelectChatFolder = onSelectChatFolder,
+                onCreateChatFolder = onCreateChatFolder,
+                onDeleteChatFolder = onDeleteChatFolder,
+                onMoveChatToFolder = onMoveChatToFolder,
                 onDeleteChat = onDeleteChat,
             )
         },
@@ -5531,7 +6172,7 @@ private fun ChatUiState.contextUsage(): ContextUsage {
 private fun ChatUiState.estimatedContextTokens(): Int {
     val messageTokens = messages.fold(0) { total, message ->
         val attachmentTokens = message.attachments.fold(0) { attachmentTotal, attachment ->
-            attachmentTotal + if (attachment.dataUrl.isBlank()) 64 else 1100
+            attachmentTotal + if (attachment.hasDisplayableImage()) 1100 else 64
         }
         total + message.content.estimatedTokenCount() + attachmentTokens + 4
     }
@@ -5567,11 +6208,20 @@ private fun DrawerContent(
     onNewChat: () -> Unit,
     onSelectChat: (String) -> Unit,
     onChatSearchChange: (String) -> Unit,
+    onSelectChatFolder: (String) -> Unit,
+    onCreateChatFolder: (String) -> Unit,
+    onDeleteChatFolder: (String) -> Unit,
+    onMoveChatToFolder: (String, String?) -> Unit,
     onDeleteChat: (String) -> Unit,
 ) {
     val query = state.chatSearchQuery.trim()
     var pendingDeleteSession by remember { mutableStateOf<ChatSession?>(null) }
-    val filteredSessions = state.sessions.filter { session ->
+    var isCreateFolderOpen by remember { mutableStateOf(false) }
+    var newFolderName by remember { mutableStateOf("") }
+    var pendingDeleteFolder by remember { mutableStateOf<ChatFolder?>(null) }
+    val activeFolder = state.chatFolders.firstOrNull { it.id == state.activeChatFolderId }
+    val folderFilteredSessions = state.sessions.filter { it.matchesChatFolder(state.activeChatFolderId) }
+    val filteredSessions = folderFilteredSessions.filter { session ->
         query.isBlank() ||
             session.title.contains(query, ignoreCase = true) ||
             session.messages.any { it.content.contains(query, ignoreCase = true) }
@@ -5590,15 +6240,30 @@ private fun DrawerContent(
                 .padding(horizontal = 18.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Button(
-                onClick = onNewChat,
+            Row(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Icon(imageVector = Icons.Filled.Add, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("New chat")
+                Button(
+                    onClick = onNewChat,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+                ) {
+                    Icon(imageVector = Icons.Filled.Add, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("New chat", maxLines = 1)
+                }
+                OutlinedButton(
+                    onClick = { isCreateFolderOpen = true },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+                ) {
+                    Icon(imageVector = Icons.Filled.Add, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Folder", maxLines = 1)
+                }
             }
 
             OutlinedTextField(
@@ -5613,6 +6278,55 @@ private fun DrawerContent(
                 shape = RoundedCornerShape(12.dp),
             )
 
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(end = 4.dp),
+            ) {
+                item {
+                    ChatFolderChip(
+                        label = "All",
+                        count = state.sessions.size,
+                        selected = state.activeChatFolderId == AllChatsFolderId,
+                        onClick = { onSelectChatFolder(AllChatsFolderId) },
+                    )
+                }
+                item {
+                    ChatFolderChip(
+                        label = "Unfiled",
+                        count = state.sessions.count { it.folderId.isNullOrBlank() },
+                        selected = state.activeChatFolderId == UnfiledChatsFolderId,
+                        onClick = { onSelectChatFolder(UnfiledChatsFolderId) },
+                    )
+                }
+                items(state.chatFolders, key = { it.id }) { folder ->
+                    ChatFolderChip(
+                        label = folder.name,
+                        count = state.sessions.count { it.folderId == folder.id },
+                        selected = state.activeChatFolderId == folder.id,
+                        onClick = { onSelectChatFolder(folder.id) },
+                    )
+                }
+            }
+
+            if (activeFolder != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = activeFolder.name,
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = { pendingDeleteFolder = activeFolder }) {
+                        Text("Delete folder")
+                    }
+                }
+            }
+
             HorizontalDivider(color = DividerDefaults.color.copy(alpha = 0.45f))
 
             LazyColumn(
@@ -5621,6 +6335,7 @@ private fun DrawerContent(
             ) {
                 items(filteredSessions, key = { it.id }) { session ->
                     val selected = session.id == state.activeSessionId
+                    var moveMenuExpanded by remember(session.id) { mutableStateOf(false) }
                     Surface(
                         color = if (selected) {
                             MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.8f)
@@ -5641,24 +6356,66 @@ private fun DrawerContent(
                                 )
                             },
                             supportingContent = {
+                                val messageCount = session.messages.count { it.role == MessageRole.User }
+                                val folderSuffix = if (state.activeChatFolderId == AllChatsFolderId) {
+                                    " - ${session.folderName(state.chatFolders)}"
+                                } else {
+                                    ""
+                                }
                                 Text(
-                                    text = "${session.messages.count { it.role == MessageRole.User }} messages",
+                                    text = "$messageCount messages$folderSuffix",
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                 )
                             },
                             leadingContent = { AppMark(modifier = Modifier.size(28.dp)) },
                             trailingContent = {
-                                IconButton(
-                                    onClick = { pendingDeleteSession = session },
-                                    modifier = Modifier.size(34.dp),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Delete,
-                                        contentDescription = "Delete chat",
-                                        modifier = Modifier.size(18.dp),
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box {
+                                        IconButton(
+                                            onClick = { moveMenuExpanded = true },
+                                            modifier = Modifier.size(34.dp),
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.MoreVert,
+                                                contentDescription = "Move chat",
+                                                modifier = Modifier.size(18.dp),
+                                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                        DropdownMenu(
+                                            expanded = moveMenuExpanded,
+                                            onDismissRequest = { moveMenuExpanded = false },
+                                        ) {
+                                            DropdownMenuItem(
+                                                text = { Text("Move to Unfiled") },
+                                                onClick = {
+                                                    onMoveChatToFolder(session.id, null)
+                                                    moveMenuExpanded = false
+                                                },
+                                            )
+                                            state.chatFolders.forEach { folder ->
+                                                DropdownMenuItem(
+                                                    text = { Text("Move to ${folder.name}") },
+                                                    onClick = {
+                                                        onMoveChatToFolder(session.id, folder.id)
+                                                        moveMenuExpanded = false
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    }
+                                    IconButton(
+                                        onClick = { pendingDeleteSession = session },
+                                        modifier = Modifier.size(34.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Delete,
+                                            contentDescription = "Delete chat",
+                                            modifier = Modifier.size(18.dp),
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
                                 }
                             },
                         )
@@ -5693,6 +6450,96 @@ private fun DrawerContent(
             },
         )
     }
+
+    if (isCreateFolderOpen) {
+        AlertDialog(
+            onDismissRequest = {
+                isCreateFolderOpen = false
+                newFolderName = ""
+            },
+            title = { Text("New folder") },
+            text = {
+                OutlinedTextField(
+                    value = newFolderName,
+                    onValueChange = { newFolderName = it },
+                    singleLine = true,
+                    label = { Text("Folder name") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onCreateChatFolder(newFolderName)
+                        isCreateFolderOpen = false
+                        newFolderName = ""
+                    },
+                    enabled = newFolderName.isNotBlank(),
+                ) {
+                    Text("Create")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        isCreateFolderOpen = false
+                        newFolderName = ""
+                    },
+                ) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+
+    val folderToDelete = pendingDeleteFolder
+    if (folderToDelete != null) {
+        val chatCount = state.sessions.count { it.folderId == folderToDelete.id }
+        AlertDialog(
+            onDismissRequest = { pendingDeleteFolder = null },
+            title = { Text("Delete folder?") },
+            text = {
+                Text(
+                    "This removes \"${folderToDelete.name}\". $chatCount chats will stay on this device and move to Unfiled.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteChatFolder(folderToDelete.id)
+                        pendingDeleteFolder = null
+                    },
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteFolder = null }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun ChatFolderChip(
+    label: String,
+    count: Int,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = {
+            Text(
+                text = "$label ($count)",
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+    )
 }
 
 @Composable
@@ -5891,6 +6738,7 @@ private fun MessageRow(
                     MessageAttachmentSummary(
                         attachments = message.attachments,
                         onPreview = { previewAttachment = it },
+                        inlineSingleImage = false,
                     )
                 }
                 MessageActions(
@@ -5917,6 +6765,14 @@ private fun MessageRow(
                     MessageContent(
                         content = message.content,
                         isStreaming = message.isStreaming,
+                    )
+                }
+                if (message.attachments.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    MessageAttachmentSummary(
+                        attachments = message.attachments,
+                        onPreview = { previewAttachment = it },
+                        inlineSingleImage = true,
                     )
                 }
                 MessageActions(
@@ -5949,7 +6805,19 @@ private fun MessageRow(
 private fun MessageAttachmentSummary(
     attachments: List<ChatImageAttachment>,
     onPreview: (ChatImageAttachment) -> Unit,
+    inlineSingleImage: Boolean = false,
 ) {
+    val singleImage = attachments.singleOrNull()?.takeIf {
+        inlineSingleImage && it.hasDisplayableImage()
+    }
+    if (singleImage != null) {
+        InlineMessageImage(
+            attachment = singleImage,
+            onPreview = onPreview,
+        )
+        return
+    }
+
     FlowRow(
         modifier = Modifier.widthIn(max = 310.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -5962,7 +6830,7 @@ private fun MessageAttachmentSummary(
                 shape = RoundedCornerShape(50.dp),
                 modifier = Modifier
                     .then(
-                        if (attachment.dataUrl.isNotBlank()) {
+                        if (attachment.hasDisplayableImage()) {
                             Modifier.clickable { onPreview(attachment) }
                         } else {
                             Modifier
@@ -5975,7 +6843,7 @@ private fun MessageAttachmentSummary(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(
-                        imageVector = if (attachment.dataUrl.isBlank()) {
+                        imageVector = if (!attachment.hasDisplayableImage()) {
                             Icons.Filled.Description
                         } else {
                             Icons.Filled.AddPhotoAlternate
@@ -5996,11 +6864,78 @@ private fun MessageAttachmentSummary(
 }
 
 @Composable
+private fun InlineMessageImage(
+    attachment: ChatImageAttachment,
+    onPreview: (ChatImageAttachment) -> Unit,
+) {
+    val bitmap by rememberAttachmentBitmap(attachment)
+    val currentBitmap = bitmap
+    if (currentBitmap == null) {
+        MessageAttachmentSummary(
+            attachments = listOf(attachment),
+            onPreview = onPreview,
+            inlineSingleImage = false,
+        )
+        return
+    }
+
+    Surface(
+        modifier = Modifier
+            .widthIn(max = 310.dp)
+            .clickable { onPreview(attachment) },
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+        tonalElevation = 1.dp,
+    ) {
+        Box {
+            Image(
+                bitmap = currentBitmap.asImageBitmap(),
+                contentDescription = attachment.label,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 180.dp, max = 360.dp)
+                    .clip(RoundedCornerShape(18.dp)),
+                contentScale = ContentScale.Fit,
+            )
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(8.dp),
+                shape = RoundedCornerShape(50.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.AddPhotoAlternate,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Text(
+                        text = attachment.label,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun ImagePreviewDialog(
     attachment: ChatImageAttachment,
     onDismiss: () -> Unit,
 ) {
-    val bitmap = remember(attachment.dataUrl) { attachment.decodeImageBitmap() }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val bitmap by rememberAttachmentBitmap(attachment)
+    val currentBitmap = bitmap
     Dialog(onDismissRequest = onDismiss) {
         Surface(
             shape = RoundedCornerShape(24.dp),
@@ -6032,17 +6967,41 @@ private fun ImagePreviewDialog(
                         )
                     }
                 }
-                if (bitmap != null) {
-                    Image(
-                        bitmap = bitmap.asImageBitmap(),
-                        contentDescription = attachment.label,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 220.dp, max = 560.dp)
-                            .clip(RoundedCornerShape(18.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
-                        contentScale = ContentScale.Fit,
+                if (currentBitmap != null) {
+                    ScrollableImagePreview(
+                        bitmap = currentBitmap,
+                        label = attachment.label,
                     )
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                val saveResult = withContext(Dispatchers.IO) {
+                                    context.saveImageAttachmentToDownloads(attachment)
+                                }
+                                saveResult
+                                    .onSuccess {
+                                        Toast.makeText(context, "Image saved to Downloads", Toast.LENGTH_SHORT).show()
+                                    }
+                                    .onFailure { throwable ->
+                                        Toast.makeText(
+                                            context,
+                                            throwable.friendlyMessage(),
+                                            Toast.LENGTH_LONG,
+                                        ).show()
+                                    }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Download,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Download image")
+                    }
                 } else {
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
@@ -6072,18 +7031,282 @@ private fun ImagePreviewDialog(
     }
 }
 
+@Composable
+private fun ScrollableImagePreview(
+    bitmap: Bitmap,
+    label: String,
+) {
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        val imageHeight = (maxWidth * bitmap.height.toFloat() / bitmap.width.toFloat())
+            .coerceAtLeast(160.dp)
+        val viewportHeight = imageHeight.coerceIn(180.dp, 560.dp)
+        val verticalScroll = rememberScrollState()
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(viewportHeight)
+                .clip(RoundedCornerShape(18.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+                .verticalScroll(verticalScroll),
+        ) {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = label,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(imageHeight),
+                contentScale = ContentScale.FillBounds,
+            )
+        }
+    }
+}
+
+@Composable
+private fun rememberAttachmentBitmap(attachment: ChatImageAttachment) =
+    produceState<Bitmap?>(initialValue = null, attachment.dataUrl, attachment.remoteUrl) {
+        value = withContext(Dispatchers.IO) {
+            attachment.decodeImageBitmap()
+        }
+    }
+
+private val ImageAttachmentHttpClient: OkHttpClient = OkHttpClient.Builder()
+    .connectTimeout(10, TimeUnit.SECONDS)
+    .readTimeout(30, TimeUnit.SECONDS)
+    .build()
+
 private fun ChatImageAttachment.decodeImageBitmap(): Bitmap? {
-    if (dataUrl.isBlank()) return null
-    val encoded = dataUrl.substringAfter(",", missingDelimiterValue = dataUrl)
+    val bytes = decodeImageBytes() ?: return null
+    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+}
+
+private fun ChatImageAttachment.decodeImageBytes(): ByteArray? {
+    if (dataUrl.isNotBlank()) {
+        val encoded = dataUrl.substringAfter(",", missingDelimiterValue = dataUrl)
+        return runCatching {
+            Base64.decode(encoded, Base64.DEFAULT)
+        }.getOrNull()
+    }
+
+    if (remoteUrl.isBlank()) return null
     return runCatching {
-        val bytes = Base64.decode(encoded, Base64.DEFAULT)
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        val request = Request.Builder().url(remoteUrl).build()
+        ImageAttachmentHttpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("Image download failed with HTTP ${response.code}")
+            }
+            val body = response.body ?: throw IOException("Image response was empty.")
+            val contentLength = body.contentLength()
+            if (contentLength > 25_000_000L) {
+                throw IOException("Image is too large to download.")
+            }
+            body.bytes()
+        }
     }.getOrNull()
 }
+
+private fun Context.saveImageAttachmentToDownloads(attachment: ChatImageAttachment): Result<Uri> =
+    runCatching {
+        val bytes = attachment.decodeImageBytes()
+            ?: throw IOException("Image data is not available.")
+        val extension = when (attachment.mimeType.lowercase(Locale.getDefault())) {
+            "image/jpeg", "image/jpg" -> "jpg"
+            "image/webp" -> "webp"
+            else -> "png"
+        }
+        val displayName = "${attachment.label.safeFileBaseName()}-${System.currentTimeMillis()}.$extension"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                put(MediaStore.MediaColumns.MIME_TYPE, attachment.mimeType.ifBlank { "image/png" })
+                put(
+                    MediaStore.MediaColumns.RELATIVE_PATH,
+                    "${Environment.DIRECTORY_DOWNLOADS}/LMSMOB Chat",
+                )
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw IOException("Could not create download file.")
+            contentResolver.openOutputStream(uri)?.use { output -> output.write(bytes) }
+                ?: throw IOException("Could not write download file.")
+            uri
+        } else {
+            @Suppress("DEPRECATION")
+            val directory = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "LMSMOB Chat")
+            if (!directory.exists() && !directory.mkdirs()) {
+                throw IOException("Could not create Downloads folder.")
+            }
+            val file = File(directory, displayName)
+            file.writeBytes(bytes)
+            Uri.fromFile(file)
+        }
+    }
+
+private fun Context.saveMarkdownTableToDownloads(table: MarkdownTable): Result<Uri> =
+    runCatching {
+        val bytes = table.toXlsxBytes()
+        val displayName = "chat-table-${System.currentTimeMillis()}.xlsx"
+        val mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                put(
+                    MediaStore.MediaColumns.RELATIVE_PATH,
+                    "${Environment.DIRECTORY_DOWNLOADS}/LMSMOB Chat",
+                )
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw IOException("Could not create download file.")
+            contentResolver.openOutputStream(uri)?.use { output -> output.write(bytes) }
+                ?: throw IOException("Could not write download file.")
+            uri
+        } else {
+            @Suppress("DEPRECATION")
+            val directory = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "LMSMOB Chat")
+            if (!directory.exists() && !directory.mkdirs()) {
+                throw IOException("Could not create Downloads folder.")
+            }
+            val file = File(directory, displayName)
+            file.writeBytes(bytes)
+            Uri.fromFile(file)
+        }
+    }
+
+private fun MarkdownTable.toXlsxBytes(): ByteArray {
+    val columnCount = maxOf(
+        headers.size,
+        rows.maxOfOrNull { it.size } ?: 0,
+        1,
+    )
+    val tableRows = listOf(headers) + rows
+    val output = ByteArrayOutputStream()
+    ZipOutputStream(output).use { zip ->
+        zip.writeTextEntry(
+            "[Content_Types].xml",
+            """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+              <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+              <Default Extension="xml" ContentType="application/xml"/>
+              <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+              <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+              <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+              <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+            </Types>
+            """.trimIndent(),
+        )
+        zip.writeTextEntry(
+            "_rels/.rels",
+            """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+              <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+              <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+            </Relationships>
+            """.trimIndent(),
+        )
+        zip.writeTextEntry(
+            "xl/workbook.xml",
+            """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+              <sheets>
+                <sheet name="Table" sheetId="1" r:id="rId1"/>
+              </sheets>
+            </workbook>
+            """.trimIndent(),
+        )
+        zip.writeTextEntry(
+            "xl/_rels/workbook.xml.rels",
+            """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+            </Relationships>
+            """.trimIndent(),
+        )
+        zip.writeTextEntry(
+            "docProps/app.xml",
+            """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+              <Application>LMSMOB Chat</Application>
+            </Properties>
+            """.trimIndent(),
+        )
+        zip.writeTextEntry(
+            "docProps/core.xml",
+            """
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+              <dc:creator>LMSMOB Chat</dc:creator>
+              <dc:title>Chat table export</dc:title>
+              <dcterms:created xsi:type="dcterms:W3CDTF">${Instant.now()}</dcterms:created>
+            </cp:coreProperties>
+            """.trimIndent(),
+        )
+        zip.writeTextEntry(
+            "xl/worksheets/sheet1.xml",
+            buildString {
+                appendLine("""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>""")
+                appendLine("""<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">""")
+                appendLine("<sheetData>")
+                tableRows.forEachIndexed { rowIndex, row ->
+                    val rowNumber = rowIndex + 1
+                    append("""<row r="$rowNumber">""")
+                    for (column in 0 until columnCount) {
+                        val cellRef = "${columnName(column)}$rowNumber"
+                        val value = row.getOrElse(column) { "" }
+                            .replace(Regex("\\*\\*(.+?)\\*\\*"), "$1")
+                            .replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), "\n")
+                            .trim()
+                        append("""<c r="$cellRef" t="inlineStr"><is><t xml:space="preserve">${value.xmlEscape()}</t></is></c>""")
+                    }
+                    appendLine("</row>")
+                }
+                appendLine("</sheetData>")
+                appendLine("</worksheet>")
+            },
+        )
+    }
+    return output.toByteArray()
+}
+
+private fun ZipOutputStream.writeTextEntry(name: String, text: String) {
+    putNextEntry(ZipEntry(name))
+    write(text.toByteArray(Charsets.UTF_8))
+    closeEntry()
+}
+
+private fun columnName(index: Int): String {
+    var value = index + 1
+    val name = StringBuilder()
+    while (value > 0) {
+        val remainder = (value - 1) % 26
+        name.insert(0, ('A'.code + remainder).toChar())
+        value = (value - 1) / 26
+    }
+    return name.toString()
+}
+
+private fun String.xmlEscape(): String =
+    replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&apos;")
+
+private fun String.safeFileBaseName(): String =
+    replace(Regex("[^A-Za-z0-9._-]+"), "-")
+        .trim('-', '.', '_')
+        .take(48)
+        .ifBlank { "lmstudio-image" }
 
 private enum class MessageBlockType {
     Text,
     Tools,
+    Sources,
     Thought,
     Code,
     Error,
@@ -6108,14 +7331,28 @@ private fun parseMessageBlocks(rawContent: String): List<MessageBlock> {
 
     val blocks = mutableListOf<MessageBlock>()
     val bodyLines = mutableListOf<String>()
+    val sourceLines = mutableListOf<String>()
+    var collectingSources = false
     content.lines().forEach { line ->
         val trimmed = line.trim()
         when {
             trimmed.startsWith("Tools used:", ignoreCase = true) -> {
+                collectingSources = false
                 blocks += MessageBlock(MessageBlockType.Tools, trimmed.substringAfter(":").trim())
             }
             trimmed.startsWith("Tool errors:", ignoreCase = true) -> {
+                collectingSources = false
                 blocks += MessageBlock(MessageBlockType.Error, trimmed.substringAfter(":").trim())
+            }
+            trimmed.startsWith("Sources:", ignoreCase = true) -> {
+                collectingSources = true
+                trimmed.substringAfter(":").trim().takeIf { it.isNotBlank() }?.let { sourceLines += it }
+            }
+            collectingSources && trimmed.isBlank() -> {
+                collectingSources = false
+            }
+            collectingSources -> {
+                sourceLines += line
             }
             else -> bodyLines += line
         }
@@ -6138,6 +7375,9 @@ private fun parseMessageBlocks(rawContent: String): List<MessageBlock> {
         index = match.range.last + 1
     }
     blocks.addTextAndCode(body.substring(index), currentType)
+    if (sourceLines.isNotEmpty()) {
+        blocks += MessageBlock(MessageBlockType.Sources, sourceLines.joinToString("\n").trim())
+    }
 
     return blocks.filter { it.text.isNotBlank() }
 }
@@ -6227,6 +7467,7 @@ private fun MessageContent(
                     isActive = isStreaming,
                     onToggle = { toolsExpanded = !toolsExpanded },
                 )
+                MessageBlockType.Sources -> SourcesBlock(block.text)
                 MessageBlockType.Thought -> ThoughtBlock(
                     text = block.text,
                     expanded = thoughtExpanded,
@@ -6455,6 +7696,8 @@ private fun RichTextBlock(text: String) {
 
 @Composable
 private fun RichMarkdownTable(table: MarkdownTable) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val columnWidths = table.headers.indices.map { column ->
         val maxLength = (listOf(table.headers[column]) + table.rows.map { it.getOrElse(column) { "" } })
             .maxOf { it.length }
@@ -6467,22 +7710,57 @@ private fun RichMarkdownTable(table: MarkdownTable) {
     }
 
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState())
-            .clip(RoundedCornerShape(12.dp)),
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        RichTableRow(
-            cells = table.headers,
-            columnWidths = columnWidths,
-            isHeader = true,
-        )
-        table.rows.forEachIndexed { index, row ->
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .clip(RoundedCornerShape(12.dp)),
+        ) {
             RichTableRow(
-                cells = row,
+                cells = table.headers,
                 columnWidths = columnWidths,
-                isHeader = false,
-                alternate = index % 2 == 1,
+                isHeader = true,
+            )
+            table.rows.forEachIndexed { index, row ->
+                RichTableRow(
+                    cells = row,
+                    columnWidths = columnWidths,
+                    isHeader = false,
+                    alternate = index % 2 == 1,
+                )
+            }
+        }
+        OutlinedButton(
+            onClick = {
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        context.saveMarkdownTableToDownloads(table)
+                    }
+                    result
+                        .onSuccess {
+                            Toast.makeText(context, "Table saved to Downloads", Toast.LENGTH_SHORT).show()
+                        }
+                        .onFailure { throwable ->
+                            Toast.makeText(context, throwable.friendlyMessage(), Toast.LENGTH_LONG).show()
+                        }
+                }
+            },
+            modifier = Modifier.align(Alignment.End),
+            shape = RoundedCornerShape(12.dp),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Download,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = "XLSX",
+                style = MaterialTheme.typography.labelMedium,
             )
         }
     }
@@ -6564,6 +7842,49 @@ private fun ToolUsageBlock(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SourcesBlock(text: String) {
+    val context = LocalContext.current
+    val sources = remember(text) {
+        text.extractSourceLinks().ifEmpty {
+            text.lines().mapNotNull { line ->
+                val url = UrlRegex.find(line)?.value?.cleanSourceUrl() ?: return@mapNotNull null
+                SourceLink(
+                    title = line.replace(UrlRegex, "").trim('-', ' ', '[', ']').ifBlank { url.toSourceTitle() },
+                    url = url,
+                )
+            }
+        }.distinctBy { it.url }
+    }
+    if (sources.isEmpty()) return
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = "Sources",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontWeight = FontWeight.SemiBold,
+        )
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(sources) { source ->
+                AssistChip(
+                    onClick = { context.openUrl(source.url) },
+                    label = {
+                        Text(
+                            text = source.title,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                )
             }
         }
     }
@@ -8134,7 +9455,7 @@ private fun SettingsSheet(
             )
             ToolToggleRow(
                 title = "Append capability guide",
-                description = "Adds the current model, document, server-tool, and phone-tool capability map to each request so the model knows what is enabled and what the user must enable first.",
+                description = "Adds a live map of model, document, LM Studio MCP/server tools, and Android phone actions to each request so the model chooses the correct side and explains what must be enabled first.",
                 checked = state.appendCapabilityGuideToSystemPrompt,
                 onCheckedChange = onAppendCapabilityGuideToSystemPromptChange,
             )
