@@ -43,7 +43,7 @@ APP_BASE_NAME=`basename "$0"`
 
 cd "$SAVED" >/dev/null || exit
 
-DEFAULT_JVM_OPTS='"-Xmx64m" "-Xms64m"'
+DEFAULT_JVM_OPTS='-Xmx64m -Xms64m'
 
 die () {
     echo
