@@ -25,8 +25,8 @@ android {
         applicationId = "com.mindylab.lmstudiochat"
         minSdk = 26
         targetSdk = 35
-        versionCode = 52
-        versionName = "1.51"
+        versionCode = 55
+        versionName = "1.54"
     }
 
     buildFeatures {

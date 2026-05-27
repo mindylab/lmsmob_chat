@@ -268,6 +268,23 @@ private data class IncomingShareIntent(
     val intent: Intent,
 )
 
+data class PreparedShareContent(
+    val text: String = "",
+    val imageAttachments: List<ChatImageAttachment> = emptyList(),
+    val documentUri: Uri? = null,
+)
+
+enum class ShareDestinationKind {
+    New,
+    Temporary,
+    Existing,
+}
+
+data class ShareDestinationSelection(
+    val kind: ShareDestinationKind,
+    val sessionId: String? = null,
+)
+
 data class NativeToolAction(
     val id: String = UUID.randomUUID().toString(),
     val tool: String,
@@ -375,6 +392,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 var pendingDocumentUri by remember { mutableStateOf<Uri?>(null) }
+                var pendingShareContent by remember { mutableStateOf<PreparedShareContent?>(null) }
                 val uiScope = rememberCoroutineScope()
                 val mainHandler = remember { Handler(Looper.getMainLooper()) }
                 var ttsReady by remember { mutableStateOf(false) }
@@ -603,12 +621,18 @@ class MainActivity : ComponentActivity() {
                 }
                 LaunchedEffect(shareIntentRequest?.id) {
                     val request = shareIntentRequest ?: return@LaunchedEffect
-                    handleIncomingShareIntent(
+                    val preparedContent = prepareIncomingShareIntent(
                         context = context,
                         intent = request.intent,
                         viewModel = viewModel,
-                        onDocumentShared = { uri -> pendingDocumentUri = uri },
                     )
+                    if (preparedContent != null) {
+                        if (viewModel.applyDefaultShareDestination(preparedContent)) {
+                            preparedContent.documentUri?.let { pendingDocumentUri = it }
+                        } else {
+                            pendingShareContent = preparedContent
+                        }
+                    }
                     shareIntentRequests.value = null
                 }
                 LmStudioApp(
@@ -618,6 +642,7 @@ class MainActivity : ComponentActivity() {
                     onCancelSend = viewModel::cancelSending,
                     onSuggestion = viewModel::sendPrompt,
                     onNewChat = viewModel::newChat,
+                    onTemporaryChat = viewModel::temporaryChat,
                     onSelectChat = viewModel::selectChat,
                     onChatSearchChange = viewModel::updateChatSearchQuery,
                     onSelectChatFolder = viewModel::selectChatFolder,
@@ -680,6 +705,7 @@ class MainActivity : ComponentActivity() {
                     onAutoReadAnswersEnabledChange = viewModel::updateAutoReadAnswersEnabled,
                     onAppendCapabilityGuideToSystemPromptChange = viewModel::updateAppendCapabilityGuideToSystemPrompt,
                     onAppendDateTimeToSystemPromptChange = viewModel::updateAppendDateTimeToSystemPrompt,
+                    onShareDefaultSelectionEnabledChange = viewModel::updateShareDefaultSelectionEnabled,
                     onCreateWatchJob = viewModel::createWatchJob,
                     onUpdateWatchJob = viewModel::updateWatchJob,
                     onToggleWatchJob = viewModel::toggleWatchJob,
@@ -728,6 +754,20 @@ class MainActivity : ComponentActivity() {
                     onImportChats = { importLauncher.launch(arrayOf("application/json", "text/*", "*/*")) },
                     onDismissError = viewModel::dismissError,
                 )
+                val shareContent = pendingShareContent
+                if (shareContent != null) {
+                    ShareDestinationDialog(
+                        state = state,
+                        content = shareContent,
+                        onDismiss = { pendingShareContent = null },
+                        onDestinationSelected = { destination ->
+                            viewModel.applyShareDestination(destination, shareContent)
+                            pendingShareContent = null
+                            shareContent.documentUri?.let { pendingDocumentUri = it }
+                        },
+                        onSetDefaultDestination = viewModel::setShareDefaultDestination,
+                    )
+                }
                 val documentUri = pendingDocumentUri
                 if (documentUri != null) {
                     DocumentConversionDialog(
@@ -889,6 +929,7 @@ data class ChatSession(
     val title: String = "New chat",
     val messages: List<ChatMessage> = emptyList(),
     val folderId: String? = null,
+    val isTemporary: Boolean = false,
     val previousResponseId: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = System.currentTimeMillis(),
@@ -949,6 +990,7 @@ data class ChatUiState(
     val autoReadAnswersEnabled: Boolean = false,
     val appendCapabilityGuideToSystemPrompt: Boolean = true,
     val appendDateTimeToSystemPrompt: Boolean = false,
+    val shareDefaultDestination: String = "",
     val systemProfiles: List<SystemPromptProfile> = listOf(
         SystemPromptProfile(
             id = DefaultSystemProfileId,
@@ -1040,6 +1082,7 @@ class ChatViewModel(
             autoReadAnswersEnabled = settingsStore.autoReadAnswersEnabled,
             appendCapabilityGuideToSystemPrompt = settingsStore.appendCapabilityGuideToSystemPrompt,
             appendDateTimeToSystemPrompt = settingsStore.appendDateTimeToSystemPrompt,
+            shareDefaultDestination = settingsStore.shareDefaultDestination,
             temperatureDraft = settingsStore.temperature,
             topPDraft = settingsStore.topP,
             maxTokensDraft = settingsStore.maxTokens,
@@ -1080,6 +1123,20 @@ class ChatViewModel(
                 .joinToString("\n\n")
             current.copy(
                 input = mergedInput,
+                error = null,
+            )
+        }
+    }
+
+    fun applySharedContent(content: PreparedShareContent) {
+        if (content.text.isBlank() && content.imageAttachments.isEmpty()) return
+        _uiState.update { current ->
+            val mergedInput = listOf(current.input.trim(), content.text.trim())
+                .filter { it.isNotBlank() }
+                .joinToString("\n\n")
+            current.copy(
+                input = mergedInput,
+                attachedImages = current.attachedImages + content.imageAttachments,
                 error = null,
             )
         }
@@ -1179,7 +1236,9 @@ class ChatViewModel(
 
     fun selectChat(sessionId: String) {
         val session = _uiState.value.sessions.firstOrNull { it.id == sessionId } ?: return
-        settingsStore.activeSessionId = session.id
+        if (!session.isTemporary) {
+            settingsStore.activeSessionId = session.id
+        }
         _uiState.update {
             it.copy(
                 activeSessionId = session.id,
@@ -1566,24 +1625,112 @@ class ChatViewModel(
     }
 
     fun newChat() {
+        createChat(temporary = false)
+    }
+
+    fun temporaryChat() {
+        createChat(temporary = true)
+    }
+
+    private fun createChat(
+        temporary: Boolean,
+        sharedContent: PreparedShareContent? = null,
+    ) {
         val state = _uiState.value
-        val folderId = state.activeChatFolderId.takeIf { activeFolderId ->
+        val folderId = if (temporary) null else state.activeChatFolderId.takeIf { activeFolderId ->
             state.chatFolders.any { it.id == activeFolderId }
         }
-        val newSession = ChatSession(folderId = folderId)
+        val title = when {
+            temporary -> "Temporary chat"
+            !sharedContent?.text.isNullOrBlank() -> sharedContent?.text.orEmpty().toChatTitle()
+            sharedContent?.imageAttachments?.isNotEmpty() == true -> "Shared image"
+            else -> "New chat"
+        }
+        val newSession = ChatSession(
+            title = title,
+            folderId = folderId,
+            isTemporary = temporary,
+        )
         val sessions = (listOf(newSession) + state.sessions)
             .distinctBy { it.id }
-        settingsStore.activeSessionId = newSession.id
+        if (!temporary) {
+            settingsStore.activeSessionId = newSession.id
+        }
         settingsStore.saveChatSessions(sessions)
         _uiState.update {
             it.copy(
                 sessions = sessions,
                 activeSessionId = newSession.id,
                 messages = emptyList(),
-                input = "",
+                input = sharedContent?.text?.trim().orEmpty(),
+                attachedImages = sharedContent?.imageAttachments.orEmpty(),
                 error = null,
                 previousResponseId = null,
             )
+        }
+    }
+
+    fun newChatWithShare(content: PreparedShareContent) {
+        createChat(temporary = false, sharedContent = content)
+    }
+
+    fun temporaryChatWithShare(content: PreparedShareContent) {
+        createChat(temporary = true, sharedContent = content)
+    }
+
+    fun applyShareToExistingChat(sessionId: String, content: PreparedShareContent) {
+        selectChat(sessionId)
+        applySharedContent(content)
+    }
+
+    fun applyShareDestination(destination: ShareDestinationSelection, content: PreparedShareContent): Boolean =
+        when (destination.kind) {
+            ShareDestinationKind.New -> {
+                newChatWithShare(content)
+                true
+            }
+            ShareDestinationKind.Temporary -> {
+                temporaryChatWithShare(content)
+                true
+            }
+            ShareDestinationKind.Existing -> {
+                val sessionId = destination.sessionId
+                if (sessionId == null || _uiState.value.sessions.none { it.id == sessionId && !it.isTemporary }) {
+                    false
+                } else {
+                    applyShareToExistingChat(sessionId, content)
+                    true
+                }
+            }
+        }
+
+    fun applyDefaultShareDestination(content: PreparedShareContent): Boolean {
+        val storedDestination = settingsStore.shareDefaultDestination
+        val destination = storedDestination.toShareDestinationSelection(_uiState.value.sessions)
+        if (destination == null) {
+            if (storedDestination.isNotBlank()) {
+                settingsStore.shareDefaultDestination = ""
+                _uiState.update { it.copy(shareDefaultDestination = "") }
+            }
+            return false
+        }
+        return applyShareDestination(destination, content)
+    }
+
+    fun setShareDefaultDestination(destination: ShareDestinationSelection) {
+        val storedDestination = destination.toStoredShareDefault()
+        settingsStore.shareDefaultDestination = storedDestination
+        _uiState.update { it.copy(shareDefaultDestination = storedDestination, error = null) }
+    }
+
+    fun updateShareDefaultSelectionEnabled(enabled: Boolean) {
+        if (enabled) {
+            _uiState.update {
+                it.copy(error = "Choose Set default selection from the share popup first.")
+            }
+        } else {
+            settingsStore.shareDefaultDestination = ""
+            _uiState.update { it.copy(shareDefaultDestination = "", error = null) }
         }
     }
 
@@ -2509,6 +2656,12 @@ class SettingsStore(context: Context) {
             preferences.edit().putBoolean("append_capability_guide_to_system_prompt", value).apply()
         }
 
+    var shareDefaultDestination: String
+        get() = preferences.getString("share_default_destination", "") ?: ""
+        set(value) {
+            preferences.edit().putString("share_default_destination", value).apply()
+        }
+
     var temperature: String
         get() = preferences.getString("temperature", "0.7") ?: "0.7"
         set(value) {
@@ -2566,11 +2719,12 @@ class SettingsStore(context: Context) {
     fun loadChatSessions(): List<ChatSession> =
         runCatching {
             chatSessionsFromJson(preferences.getString("chat_history", "").orEmpty())
+                .filterNot { it.isTemporary }
         }.getOrDefault(emptyList())
 
     fun saveChatSessions(sessions: List<ChatSession>) {
         preferences.edit()
-            .putString("chat_history", chatSessionsToJson(sessions))
+            .putString("chat_history", chatSessionsToJson(sessions.filterNot { it.isTemporary }))
             .apply()
     }
 
@@ -2809,6 +2963,7 @@ class SettingsStore(context: Context) {
                             },
                             messages = messages,
                             folderId = sessionJson.optString("folder_id").takeIf { it.isNotBlank() },
+                            isTemporary = false,
                             previousResponseId = sessionJson.optString("previous_response_id").takeIf { it.isNotBlank() },
                             createdAt = sessionJson.optLong("created_at", System.currentTimeMillis()),
                             updatedAt = sessionJson.optLong("updated_at", System.currentTimeMillis()),
@@ -3360,35 +3515,39 @@ private fun Context.openUrl(url: String) {
     }
 }
 
-private suspend fun handleIncomingShareIntent(
+private suspend fun prepareIncomingShareIntent(
     context: Context,
     intent: Intent,
     viewModel: ChatViewModel,
-    onDocumentShared: (Uri) -> Unit,
-) {
-    intent.sharedTextPayload()
-        ?.takeIf { it.isNotBlank() }
-        ?.let(viewModel::receiveSharedText)
-
+): PreparedShareContent? {
+    val text = intent.sharedTextPayload().orEmpty()
     val uris = intent.sharedStreamUris()
-    if (uris.isEmpty()) return
-
     val imageUris = uris.filter { uri -> context.isSharedImage(uri, intent.type) }
     val documentUris = uris.filterNot { uri -> uri in imageUris }
-
-    if (imageUris.isNotEmpty()) {
+    val imageAttachments = if (imageUris.isNotEmpty()) {
         runCatching {
             withContext(Dispatchers.IO) {
                 imageUris.map { uri -> context.imageUriToAttachment(uri) }
             }
-        }.onSuccess(viewModel::attachImages)
-            .onFailure { throwable -> viewModel.showError(throwable.friendlyMessage()) }
+        }.onFailure { throwable ->
+            viewModel.showError(throwable.friendlyMessage())
+        }.getOrDefault(emptyList())
+    } else {
+        emptyList()
     }
 
     if (documentUris.size > 1) {
         viewModel.showError("Only one shared document can be prepared at a time.")
     }
-    documentUris.firstOrNull()?.let(onDocumentShared)
+    val documentUri = documentUris.firstOrNull()
+
+    return PreparedShareContent(
+        text = text,
+        imageAttachments = imageAttachments,
+        documentUri = documentUri,
+    ).takeIf {
+        it.text.isNotBlank() || it.imageAttachments.isNotEmpty() || it.documentUri != null
+    }
 }
 
 private fun Intent.isSupportedShareAction(): Boolean =
@@ -5664,6 +5823,208 @@ private fun String.withIntegration(integrationId: String): String =
         .distinct()
         .joinToString("\n")
 
+private const val ShareDefaultNew = "new"
+private const val ShareDefaultTemporary = "temporary"
+private const val ShareDefaultExistingPrefix = "existing:"
+
+private fun ShareDestinationSelection.toStoredShareDefault(): String =
+    when (kind) {
+        ShareDestinationKind.New -> ShareDefaultNew
+        ShareDestinationKind.Temporary -> ShareDefaultTemporary
+        ShareDestinationKind.Existing -> sessionId
+            ?.takeIf { it.isNotBlank() }
+            ?.let { "$ShareDefaultExistingPrefix$it" }
+            .orEmpty()
+    }
+
+private fun String.toShareDestinationSelection(sessions: List<ChatSession>): ShareDestinationSelection? {
+    val normalized = trim()
+    return when {
+        normalized == ShareDefaultNew -> ShareDestinationSelection(ShareDestinationKind.New)
+        normalized == ShareDefaultTemporary -> ShareDestinationSelection(ShareDestinationKind.Temporary)
+        normalized.startsWith(ShareDefaultExistingPrefix) -> {
+            val sessionId = normalized.removePrefix(ShareDefaultExistingPrefix)
+            if (sessions.any { it.id == sessionId && !it.isTemporary }) {
+                ShareDestinationSelection(ShareDestinationKind.Existing, sessionId)
+            } else {
+                null
+            }
+        }
+        else -> null
+    }
+}
+
+private fun ShareDestinationSelection.label(sessions: List<ChatSession>): String =
+    when (kind) {
+        ShareDestinationKind.New -> "a new chat"
+        ShareDestinationKind.Temporary -> "a temporary chat"
+        ShareDestinationKind.Existing -> {
+            val title = sessions.firstOrNull { it.id == sessionId }?.title.orEmpty()
+            if (title.isBlank()) "the selected existing chat" else "\"$title\""
+        }
+    }
+
+private fun String.shareDefaultDestinationLabel(sessions: List<ChatSession>): String =
+    toShareDestinationSelection(sessions)?.label(sessions) ?: "Not set"
+
+@Composable
+private fun ShareDestinationDialog(
+    state: ChatUiState,
+    content: PreparedShareContent,
+    onDismiss: () -> Unit,
+    onDestinationSelected: (ShareDestinationSelection) -> Unit,
+    onSetDefaultDestination: (ShareDestinationSelection) -> Unit,
+) {
+    var showExisting by remember { mutableStateOf(false) }
+    var setDefaultSelection by remember { mutableStateOf(false) }
+    var pendingDefaultDestination by remember { mutableStateOf<ShareDestinationSelection?>(null) }
+    val sessions = remember(state.sessions) {
+        state.sessions.filterNot { it.isTemporary }
+    }
+    val summary = remember(content) {
+        buildList {
+            if (content.text.isNotBlank()) add("text")
+            if (content.imageAttachments.isNotEmpty()) add("${content.imageAttachments.size} image(s)")
+            if (content.documentUri != null) add("document")
+        }.joinToString(", ").ifBlank { "shared content" }
+    }
+    fun selectDestination(destination: ShareDestinationSelection) {
+        if (setDefaultSelection) {
+            pendingDefaultDestination = destination
+        } else {
+            onDestinationSelected(destination)
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add shared content") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Choose where to place this $summary.")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Set default selection",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            text = "Use the selected destination automatically for future shares.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = setDefaultSelection,
+                        onCheckedChange = { setDefaultSelection = it },
+                    )
+                }
+                if (showExisting) {
+                    LazyColumn(
+                        modifier = Modifier.heightIn(max = 280.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        items(sessions, key = { it.id }) { session ->
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        selectDestination(
+                                            ShareDestinationSelection(
+                                                kind = ShareDestinationKind.Existing,
+                                                sessionId = session.id,
+                                            ),
+                                        )
+                                    },
+                                shape = RoundedCornerShape(10.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                                ) {
+                                    Text(
+                                        text = session.title,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(
+                                        text = "${session.messages.count { it.role == MessageRole.User }} messages",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { selectDestination(ShareDestinationSelection(ShareDestinationKind.New)) }) {
+                Text("New")
+            }
+        },
+        dismissButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick = { selectDestination(ShareDestinationSelection(ShareDestinationKind.Temporary)) }) {
+                    Text("Temporary")
+                }
+                TextButton(
+                    onClick = {
+                        if (sessions.isEmpty()) {
+                            selectDestination(ShareDestinationSelection(ShareDestinationKind.New))
+                        } else {
+                            showExisting = !showExisting
+                        }
+                    },
+                ) {
+                    Text(if (showExisting) "Hide chats" else "Existing")
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+            }
+        },
+    )
+
+    val defaultDestination = pendingDefaultDestination
+    if (defaultDestination != null) {
+        AlertDialog(
+            onDismissRequest = { pendingDefaultDestination = null },
+            title = { Text("Set default share destination?") },
+            text = {
+                Text(
+                    "Future shared content will always go to ${defaultDestination.label(sessions)} without asking. You can turn this off in Settings.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onSetDefaultDestination(defaultDestination)
+                        pendingDefaultDestination = null
+                        onDestinationSelected(defaultDestination)
+                    },
+                ) {
+                    Text("Set default")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDefaultDestination = null }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+}
+
 @Composable
 private fun DocumentConversionDialog(
     canConvertToPlainText: Boolean,
@@ -5796,6 +6157,7 @@ fun LmStudioApp(
     onCancelSend: () -> Unit,
     onSuggestion: (String) -> Unit,
     onNewChat: () -> Unit,
+    onTemporaryChat: () -> Unit,
     onSelectChat: (String) -> Unit,
     onChatSearchChange: (String) -> Unit,
     onSelectChatFolder: (String) -> Unit,
@@ -5831,6 +6193,7 @@ fun LmStudioApp(
     onAutoReadAnswersEnabledChange: (Boolean) -> Unit,
     onAppendCapabilityGuideToSystemPromptChange: (Boolean) -> Unit,
     onAppendDateTimeToSystemPromptChange: (Boolean) -> Unit,
+    onShareDefaultSelectionEnabledChange: (Boolean) -> Unit,
     onCreateWatchJob: (String, String, String, String, String, String, String, String, String, String, String) -> Unit,
     onUpdateWatchJob: (String, String, String, String, String, String, String, String, String, String, String, String, Boolean) -> Unit,
     onToggleWatchJob: (String, Boolean) -> Unit,
@@ -5914,6 +6277,7 @@ fun LmStudioApp(
             onAutoReadAnswersEnabledChange = onAutoReadAnswersEnabledChange,
             onAppendCapabilityGuideToSystemPromptChange = onAppendCapabilityGuideToSystemPromptChange,
             onAppendDateTimeToSystemPromptChange = onAppendDateTimeToSystemPromptChange,
+            onShareDefaultSelectionEnabledChange = onShareDefaultSelectionEnabledChange,
             onSystemProfileSelect = onSystemProfileSelect,
             onSystemProfileNameChange = onSystemProfileNameChange,
             onSystemPromptChange = onSystemPromptChange,
@@ -5961,6 +6325,10 @@ fun LmStudioApp(
                     onNewChat()
                     scope.launch { drawerState.close() }
                 },
+                onTemporaryChat = {
+                    onTemporaryChat()
+                    scope.launch { drawerState.close() }
+                },
                 onSelectChat = { sessionId ->
                     onSelectChat(sessionId)
                     scope.launch { drawerState.close() }
@@ -5990,6 +6358,9 @@ fun LmStudioApp(
                                 text = buildString {
                                     append(state.model.ifBlank { "Local model" })
                                     if (state.serverToolsEnabled) append(" - tools")
+                                    if (state.sessions.firstOrNull { it.id == state.activeSessionId }?.isTemporary == true) {
+                                        append(" - TEMP")
+                                    }
                                 },
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
@@ -6206,6 +6577,7 @@ private fun Int.formatTokenCount(): String =
 private fun DrawerContent(
     state: ChatUiState,
     onNewChat: () -> Unit,
+    onTemporaryChat: () -> Unit,
     onSelectChat: (String) -> Unit,
     onChatSearchChange: (String) -> Unit,
     onSelectChatFolder: (String) -> Unit,
@@ -6248,20 +6620,30 @@ private fun DrawerContent(
                     onClick = onNewChat,
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(12.dp),
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 12.dp),
                 ) {
                     Icon(imageVector = Icons.Filled.Add, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("New chat", maxLines = 1)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("New", maxLines = 1)
+                }
+                OutlinedButton(
+                    onClick = onTemporaryChat,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 12.dp),
+                ) {
+                    Icon(imageVector = Icons.Filled.Refresh, contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Temp", maxLines = 1)
                 }
                 OutlinedButton(
                     onClick = { isCreateFolderOpen = true },
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(12.dp),
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 12.dp),
                 ) {
                     Icon(imageVector = Icons.Filled.Add, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text("Folder", maxLines = 1)
                 }
             }
@@ -6349,15 +6731,27 @@ private fun DrawerContent(
                     ) {
                         ListItem(
                             headlineContent = {
-                                Text(
-                                    text = session.title,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Text(
+                                        text = session.title,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    if (session.isTemporary) {
+                                        TemporaryChatBadge()
+                                    }
+                                }
                             },
                             supportingContent = {
                                 val messageCount = session.messages.count { it.role == MessageRole.User }
-                                val folderSuffix = if (state.activeChatFolderId == AllChatsFolderId) {
+                                val folderSuffix = if (session.isTemporary) {
+                                    " - not saved"
+                                } else if (state.activeChatFolderId == AllChatsFolderId) {
                                     " - ${session.folderName(state.chatFolders)}"
                                 } else {
                                     ""
@@ -6543,6 +6937,24 @@ private fun ChatFolderChip(
 }
 
 @Composable
+private fun TemporaryChatBadge(modifier: Modifier = Modifier) {
+    Surface(
+        color = MaterialTheme.colorScheme.primaryContainer,
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        shape = RoundedCornerShape(50.dp),
+        modifier = modifier,
+    ) {
+        Text(
+            text = "TEMP",
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
 private fun MessagesPanel(
     state: ChatUiState,
     contentPadding: PaddingValues,
@@ -6555,15 +6967,22 @@ private fun MessagesPanel(
 ) {
     val listState = rememberLazyListState()
     var pendingDeleteMessage by remember { mutableStateOf<ChatMessage?>(null) }
+    val isTemporaryChat = state.sessions.firstOrNull { it.id == state.activeSessionId }?.isTemporary == true
 
-    LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.content?.length, state.isSending) {
+    LaunchedEffect(
+        state.messages.size,
+        state.messages.lastOrNull()?.content?.length,
+        state.isSending,
+        isTemporaryChat,
+    ) {
         if (state.messages.isNotEmpty() || state.isSending) {
+            val leadingItems = if (isTemporaryChat) 1 else 0
             val lastVisibleItem = if (state.isSending) {
                 state.messages.size
             } else {
                 state.messages.lastIndex
             }
-            listState.animateScrollToItem(lastVisibleItem.coerceAtLeast(0))
+            listState.animateScrollToItem((leadingItems + lastVisibleItem).coerceAtLeast(0))
         }
     }
 
@@ -6575,6 +6994,12 @@ private fun MessagesPanel(
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 18.dp),
         verticalArrangement = Arrangement.spacedBy(22.dp),
     ) {
+        if (isTemporaryChat) {
+            item(key = "temporary-chat-notice") {
+                TemporaryChatNotice()
+            }
+        }
+
         if (state.messages.isEmpty() && !state.isSending) {
             item {
                 EmptyConversation(onSuggestion = onSuggestion)
@@ -6642,6 +7067,40 @@ private fun MessagesPanel(
                 }
             },
         )
+    }
+}
+
+@Composable
+private fun TemporaryChatNotice() {
+    Surface(
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.78f),
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        shape = RoundedCornerShape(18.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Info,
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = "Temporary chat",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = "This chat is not saved to chat history.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.82f),
+                )
+            }
+        }
     }
 }
 
@@ -9267,6 +9726,7 @@ private fun SettingsSheet(
     onAutoReadAnswersEnabledChange: (Boolean) -> Unit,
     onAppendCapabilityGuideToSystemPromptChange: (Boolean) -> Unit,
     onAppendDateTimeToSystemPromptChange: (Boolean) -> Unit,
+    onShareDefaultSelectionEnabledChange: (Boolean) -> Unit,
     onSystemProfileSelect: (String) -> Unit,
     onSystemProfileNameChange: (String) -> Unit,
     onSystemPromptChange: (String) -> Unit,
@@ -9797,6 +10257,16 @@ private fun SettingsSheet(
                 text = "Chat history",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
+            )
+            ToolToggleRow(
+                title = "Default share destination",
+                description = if (state.shareDefaultDestination.isBlank()) {
+                    "Not set. Use Set default selection in the share popup to choose one."
+                } else {
+                    "Currently sends shared content to ${state.shareDefaultDestination.shareDefaultDestinationLabel(state.sessions)}. Turn off to ask every time."
+                },
+                checked = state.shareDefaultDestination.isNotBlank(),
+                onCheckedChange = onShareDefaultSelectionEnabledChange,
             )
             Row(
                 modifier = Modifier.fillMaxWidth(),
