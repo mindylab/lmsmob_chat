@@ -6,9 +6,11 @@
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey)](LICENSE.md)
 
 Android chat app for LM Studio. Connect your phone to an LM Studio server
-running on your PC and chat with local LLMs over your LAN. Version 1.51 adds
-chat folders, richer MCP image outputs, QR tool support, source chips, and table
-export on top of Watch Jobs, alarms, voice, document, and phone assistant tools.
+running on your PC and chat with local LLMs over your LAN. LMSMOB Chat is built
+for a local-first privacy workflow: your prompts and answers are processed by
+your LM Studio server on your own computer when you use local LM Studio models,
+and version 1.55 adds Supertonic TTS support so read-aloud can also run locally
+on your Android device.
 
 [Download the latest APK](https://github.com/mindylab/lmsmob_chat/releases/latest)
 from the GitHub releases page.
@@ -25,6 +27,8 @@ from the GitHub releases page.
 
 ## Features
 
+- Local-first chat with LM Studio: inference runs on your PC, not a hosted chat
+  service, when you use local LM Studio models.
 - Native Android app built with Kotlin and Jetpack Compose.
 - Works with LM Studio's OpenAI-compatible local server at `/v1`.
 - Supports LM Studio's native `/api/v1/chat` endpoint for server tools.
@@ -42,8 +46,8 @@ from the GitHub releases page.
   Android share sheets.
 - Converts supported documents into text, and can render PDFs as image
   attachments for vision-capable models.
-- Adds optional voice input, text-to-speech output, and automatic answer
-  read-aloud.
+- Adds optional voice input, text-to-speech output, automatic answer read-aloud,
+  and Supertonic TTS engine selection for local on-device speech output.
 - Provides opt-in phone assistant tools for URL opening, map routes, email/SMS
   drafts, phone dialing, calendar/reminder drafts, contact lookup, notification
   digest, local file search, and device status.
@@ -61,6 +65,25 @@ from the GitHub releases page.
 - Shows context usage estimates and advanced generation settings including
   temperature, top-p, max tokens, context length, penalties, and seed.
 - Includes emulator and physical-device LAN setup paths.
+
+## Privacy
+
+LMSMOB Chat does not need a cloud chat service for normal use. The app sends
+your messages to the LM Studio server URL that you configure, usually a PC on
+your own Wi-Fi/LAN, and LM Studio processes those prompts locally when you run
+local models. Chat history is stored on your Android device unless you export,
+share, or delete it.
+
+Voice privacy is also improved when using Supertonic TTS: assistant answers can
+be spoken by the Supertonic Android TTS engine locally on your phone, instead of
+depending on a cloud text-to-speech provider. If you choose the Android system
+TTS engine, privacy depends on the TTS engine selected in Android settings.
+
+MCP/plugin tools are opt-in and can change the privacy boundary. Local tools can
+stay on your PC, but web search, web fetch, YouTube transcript, maps, remote MCP,
+or other network tools may send the specific URLs, queries, or task data needed
+to external websites or services. Only enable integrations and allowed tools
+that you trust.
 
 ## Roadmap
 
@@ -127,6 +150,12 @@ Server-side tools require an LM Studio API token. In LM Studio, create a
 permission token from **Developer > Server Settings > Manage Tokens**, then
 paste it into the app's **API token** field. The token must allow the MCP/tool
 permissions you want to use.
+
+Privacy note: MCP/plugin integrations run outside the Android app, usually on
+the PC running LM Studio. Some tools are local, while others intentionally access
+the internet or remote services. Review each tool's behavior before enabling it,
+especially tools that search the web, fetch pages, call maps, or connect to
+remote MCP servers.
 
 When **Server tools** is enabled, tap the refresh icon beside the model field.
 The app loads model IDs from `/api/v1/models` and prefers currently loaded LLM
