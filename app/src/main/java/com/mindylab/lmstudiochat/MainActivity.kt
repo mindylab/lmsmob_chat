@@ -47,6 +47,7 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.Voice
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Base64
@@ -146,6 +147,7 @@ import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -262,6 +264,60 @@ private const val MaxDocumentTextChars = 24000
 private const val DefaultContextLength = 8000
 private const val AllChatsFolderId = "__all_chats__"
 private const val UnfiledChatsFolderId = "__unfiled_chats__"
+private const val VoiceOutputEngineSystem = "system"
+private const val VoiceOutputEngineSupertonic = "supertonic"
+private const val VoiceOutputLanguageEngineDefault = "engine_default"
+private const val VoiceOutputLanguageDevice = "device"
+private const val VoiceOutputLanguageLithuanian = "lt"
+private const val SupertonicTtsEnginePackage = "com.brahmadeo.supertonic.tts"
+private const val SupertonicTtsInstallUrl = "https://f-droid.org/en/packages/com.brahmadeo.supertonic.tts/"
+
+private data class VoiceOutputLanguageOption(
+    val tag: String,
+    val label: String,
+)
+
+data class VoiceOutputVoiceOption(
+    val name: String,
+    val label: String,
+    val languageTag: String,
+)
+
+private val VoiceOutputLanguageOptions = listOf(
+    VoiceOutputLanguageOption(VoiceOutputLanguageEngineDefault, "TTS engine default"),
+    VoiceOutputLanguageOption(VoiceOutputLanguageDevice, "Device language"),
+    VoiceOutputLanguageOption("en-US", "English"),
+    VoiceOutputLanguageOption("fr-FR", "French"),
+    VoiceOutputLanguageOption("pt-PT", "Portuguese"),
+    VoiceOutputLanguageOption("es-ES", "Spanish"),
+    VoiceOutputLanguageOption("ko-KR", "Korean"),
+    VoiceOutputLanguageOption("ja-JP", "Japanese"),
+    VoiceOutputLanguageOption("ar", "Arabic"),
+    VoiceOutputLanguageOption("bg", "Bulgarian"),
+    VoiceOutputLanguageOption("cs", "Czech"),
+    VoiceOutputLanguageOption("da", "Danish"),
+    VoiceOutputLanguageOption("de-DE", "German"),
+    VoiceOutputLanguageOption("el", "Greek"),
+    VoiceOutputLanguageOption("et", "Estonian"),
+    VoiceOutputLanguageOption("fi", "Finnish"),
+    VoiceOutputLanguageOption("hi-IN", "Hindi"),
+    VoiceOutputLanguageOption("hr", "Croatian"),
+    VoiceOutputLanguageOption("hu", "Hungarian"),
+    VoiceOutputLanguageOption("id", "Indonesian"),
+    VoiceOutputLanguageOption("it-IT", "Italian"),
+    VoiceOutputLanguageOption(VoiceOutputLanguageLithuanian, "Lithuanian"),
+    VoiceOutputLanguageOption("lv", "Latvian"),
+    VoiceOutputLanguageOption("nl", "Dutch"),
+    VoiceOutputLanguageOption("pl", "Polish"),
+    VoiceOutputLanguageOption("ro", "Romanian"),
+    VoiceOutputLanguageOption("ru", "Russian"),
+    VoiceOutputLanguageOption("sk", "Slovak"),
+    VoiceOutputLanguageOption("sl", "Slovenian"),
+    VoiceOutputLanguageOption("sv", "Swedish"),
+    VoiceOutputLanguageOption("tr", "Turkish"),
+    VoiceOutputLanguageOption("uk", "Ukrainian"),
+    VoiceOutputLanguageOption("vi", "Vietnamese"),
+)
 
 private data class IncomingShareIntent(
     val id: Long,
@@ -397,11 +453,24 @@ class MainActivity : ComponentActivity() {
                 val mainHandler = remember { Handler(Looper.getMainLooper()) }
                 var ttsReady by remember { mutableStateOf(false) }
                 var speakingMessageId by remember { mutableStateOf<String?>(null) }
-                val textToSpeech = remember {
-                    TextToSpeech(context.applicationContext) { status ->
-                        mainHandler.post {
-                            ttsReady = status == TextToSpeech.SUCCESS
-                        }
+                var ttsVoiceOptions by remember { mutableStateOf<List<VoiceOutputVoiceOption>>(emptyList()) }
+                val selectedTtsEnginePackage = state.voiceOutputEngine.voiceOutputEnginePackageName()
+                val selectedTtsLanguage = state.voiceOutputLanguage.normalizedVoiceOutputLanguage()
+                val selectedTtsVoiceName = state.voiceOutputVoiceName.trim()
+                val selectedTtsSpeed = state.voiceOutputSpeed.normalizedVoiceOutputSpeed()
+                val selectedTtsEngineAvailable = selectedTtsEnginePackage
+                    ?.let { context.isPackageInstalled(it) }
+                    ?: true
+                val effectiveTtsEnginePackage = selectedTtsEnginePackage.takeIf { selectedTtsEngineAvailable }
+                val textToSpeech = remember(effectiveTtsEnginePackage, selectedTtsLanguage) {
+                    ttsReady = false
+                    val listener = TextToSpeech.OnInitListener { status ->
+                        mainHandler.post { ttsReady = status == TextToSpeech.SUCCESS }
+                    }
+                    if (effectiveTtsEnginePackage == null) {
+                        TextToSpeech(context.applicationContext, listener)
+                    } else {
+                        TextToSpeech(context.applicationContext, listener, effectiveTtsEnginePackage)
                     }
                 }
                 DisposableEffect(textToSpeech) {
@@ -431,6 +500,13 @@ class MainActivity : ComponentActivity() {
                         textToSpeech.shutdown()
                     }
                 }
+                LaunchedEffect(textToSpeech, ttsReady) {
+                    ttsVoiceOptions = if (ttsReady) {
+                        textToSpeech.voiceOutputVoiceOptions()
+                    } else {
+                        emptyList()
+                    }
+                }
                 fun stopSpeaking() {
                     textToSpeech.stop()
                     speakingMessageId = null
@@ -439,11 +515,42 @@ class MainActivity : ComponentActivity() {
                     if (!state.voiceOutputEnabled) return
                     val text = content.speakableAnswerText()
                     if (text.isBlank()) return
-                    if (!ttsReady) {
-                        viewModel.showError("Text-to-speech is not ready yet. Try again in a moment.")
+                    if (!selectedTtsEngineAvailable) {
+                        viewModel.showError("Supertonic TTS engine is not installed. Install it or switch Voice output engine back to System.")
                         return
                     }
-                    textToSpeech.language = Locale.getDefault()
+                    if (!ttsReady) {
+                        viewModel.showError("${state.voiceOutputEngine.voiceOutputEngineLabel()} text-to-speech is not ready yet. Try again in a moment.")
+                        return
+                    }
+                    selectedTtsLanguage.voiceOutputLocale()?.let { locale ->
+                        val languageResult = textToSpeech.setLanguage(locale)
+                        if (
+                            languageResult == TextToSpeech.LANG_MISSING_DATA ||
+                            languageResult == TextToSpeech.LANG_NOT_SUPPORTED
+                        ) {
+                            viewModel.showError("${state.voiceOutputEngine.voiceOutputEngineLabel()} does not support ${selectedTtsLanguage.voiceOutputLanguageLabel()} for this message.")
+                            return
+                        }
+                    }
+                    val rateResult = textToSpeech.setSpeechRate(selectedTtsSpeed)
+                    if (rateResult == TextToSpeech.ERROR) {
+                        viewModel.showError("Could not apply TTS speed ${selectedTtsSpeed.voiceOutputSpeedLabel()}.")
+                        return
+                    }
+                    if (selectedTtsVoiceName.isNotBlank()) {
+                        val voice = textToSpeech.voices
+                            ?.firstOrNull { it.name == selectedTtsVoiceName }
+                        if (voice == null) {
+                            viewModel.showError("Selected speaker voice is not available for ${state.voiceOutputEngine.voiceOutputEngineLabel()}.")
+                            return
+                        }
+                        val voiceResult = textToSpeech.setVoice(voice)
+                        if (voiceResult == TextToSpeech.ERROR) {
+                            viewModel.showError("Could not switch to the selected speaker voice.")
+                            return
+                        }
+                    }
                     val result = textToSpeech.speak(
                         text,
                         TextToSpeech.QUEUE_FLUSH,
@@ -565,6 +672,10 @@ class MainActivity : ComponentActivity() {
                     state.messages.lastOrNull()?.id,
                     state.messages.lastOrNull()?.isStreaming,
                     state.voiceOutputEnabled,
+                    state.voiceOutputEngine,
+                    state.voiceOutputLanguage,
+                    state.voiceOutputVoiceName,
+                    state.voiceOutputSpeed,
                     state.autoReadAnswersEnabled,
                 ) {
                     val lastMessage = state.messages.lastOrNull()
@@ -702,6 +813,11 @@ class MainActivity : ComponentActivity() {
                     },
                     onVoiceInputEnabledChange = viewModel::updateVoiceInputEnabled,
                     onVoiceOutputEnabledChange = viewModel::updateVoiceOutputEnabled,
+                    onVoiceOutputEngineChange = viewModel::updateVoiceOutputEngine,
+                    onVoiceOutputLanguageChange = viewModel::updateVoiceOutputLanguage,
+                    onVoiceOutputVoiceChange = viewModel::updateVoiceOutputVoiceName,
+                    onVoiceOutputSpeedChange = viewModel::updateVoiceOutputSpeed,
+                    voiceOutputVoiceOptions = ttsVoiceOptions,
                     onAutoReadAnswersEnabledChange = viewModel::updateAutoReadAnswersEnabled,
                     onAppendCapabilityGuideToSystemPromptChange = viewModel::updateAppendCapabilityGuideToSystemPrompt,
                     onAppendDateTimeToSystemPromptChange = viewModel::updateAppendDateTimeToSystemPrompt,
@@ -987,6 +1103,10 @@ data class ChatUiState(
     val watchJobs: List<WatchJob> = emptyList(),
     val voiceInputEnabled: Boolean = false,
     val voiceOutputEnabled: Boolean = false,
+    val voiceOutputEngine: String = VoiceOutputEngineSystem,
+    val voiceOutputLanguage: String = VoiceOutputLanguageEngineDefault,
+    val voiceOutputVoiceName: String = "",
+    val voiceOutputSpeed: Float = 1f,
     val autoReadAnswersEnabled: Boolean = false,
     val appendCapabilityGuideToSystemPrompt: Boolean = true,
     val appendDateTimeToSystemPrompt: Boolean = false,
@@ -1079,6 +1199,10 @@ class ChatViewModel(
             watchJobs = WatchJobStore.load(settingsStore.context),
             voiceInputEnabled = settingsStore.voiceInputEnabled,
             voiceOutputEnabled = settingsStore.voiceOutputEnabled,
+            voiceOutputEngine = settingsStore.voiceOutputEngine,
+            voiceOutputLanguage = settingsStore.voiceOutputLanguage,
+            voiceOutputVoiceName = settingsStore.voiceOutputVoiceName,
+            voiceOutputSpeed = settingsStore.voiceOutputSpeed,
             autoReadAnswersEnabled = settingsStore.autoReadAnswersEnabled,
             appendCapabilityGuideToSystemPrompt = settingsStore.appendCapabilityGuideToSystemPrompt,
             appendDateTimeToSystemPrompt = settingsStore.appendDateTimeToSystemPrompt,
@@ -2228,6 +2352,30 @@ class ChatViewModel(
         _uiState.update { it.copy(voiceOutputEnabled = value) }
     }
 
+    fun updateVoiceOutputEngine(value: String) {
+        val normalized = value.normalizedVoiceOutputEngine()
+        settingsStore.voiceOutputEngine = normalized
+        _uiState.update { it.copy(voiceOutputEngine = normalized) }
+    }
+
+    fun updateVoiceOutputLanguage(value: String) {
+        val normalized = value.normalizedVoiceOutputLanguage()
+        settingsStore.voiceOutputLanguage = normalized
+        _uiState.update { it.copy(voiceOutputLanguage = normalized) }
+    }
+
+    fun updateVoiceOutputVoiceName(value: String) {
+        val normalized = value.trim()
+        settingsStore.voiceOutputVoiceName = normalized
+        _uiState.update { it.copy(voiceOutputVoiceName = normalized) }
+    }
+
+    fun updateVoiceOutputSpeed(value: Float) {
+        val normalized = value.normalizedVoiceOutputSpeed()
+        settingsStore.voiceOutputSpeed = normalized
+        _uiState.update { it.copy(voiceOutputSpeed = normalized) }
+    }
+
     fun updateAutoReadAnswersEnabled(value: Boolean) {
         settingsStore.autoReadAnswersEnabled = value
         _uiState.update { it.copy(autoReadAnswersEnabled = value) }
@@ -2636,6 +2784,34 @@ class SettingsStore(context: Context) {
         get() = preferences.getBoolean("voice_output_enabled", false)
         set(value) {
             preferences.edit().putBoolean("voice_output_enabled", value).apply()
+        }
+
+    var voiceOutputEngine: String
+        get() = preferences.getString("voice_output_engine", VoiceOutputEngineSystem)
+            ?.normalizedVoiceOutputEngine()
+            ?: VoiceOutputEngineSystem
+        set(value) {
+            preferences.edit().putString("voice_output_engine", value.normalizedVoiceOutputEngine()).apply()
+        }
+
+    var voiceOutputLanguage: String
+        get() = preferences.getString("voice_output_language", VoiceOutputLanguageEngineDefault)
+            ?.normalizedVoiceOutputLanguage()
+            ?: VoiceOutputLanguageEngineDefault
+        set(value) {
+            preferences.edit().putString("voice_output_language", value.normalizedVoiceOutputLanguage()).apply()
+        }
+
+    var voiceOutputVoiceName: String
+        get() = preferences.getString("voice_output_voice_name", "").orEmpty()
+        set(value) {
+            preferences.edit().putString("voice_output_voice_name", value.trim()).apply()
+        }
+
+    var voiceOutputSpeed: Float
+        get() = preferences.getFloat("voice_output_speed", 1f).normalizedVoiceOutputSpeed()
+        set(value) {
+            preferences.edit().putFloat("voice_output_speed", value.normalizedVoiceOutputSpeed()).apply()
         }
 
     var autoReadAnswersEnabled: Boolean
@@ -3237,7 +3413,7 @@ private fun ChatUiState.capabilityGuideSystemPrompt(): String {
         appendLine("- [$visionStatus] Image understanding: ${if (selectedModelSupportsVision()) "the selected model reports vision support, so the user can attach camera/gallery images." else "the selected model does not report vision support; ask the user to select a vision-capable model before image analysis."}")
         appendLine("- [$reasoningStatus] Thinking toggle: ${if (selectedModelSupportsReasoningToggle()) "the selected model supports on/off reasoning control." else "the selected model does not expose an on/off reasoning control."}")
         appendLine("- [${voiceInputEnabled.status()}] Voice input: user-facing speech-to-text for prompts. You do not directly listen; the app transcribes when the user presses the mic.")
-        appendLine("- [${voiceOutputEnabled.status()}] Voice output: user-facing text-to-speech for assistant answers. You do not directly speak; the app reads answers aloud when enabled.")
+        appendLine("- [${voiceOutputEnabled.status()}] Voice output (${voiceOutputEngine.voiceOutputEngineLabel()}, ${voiceOutputLanguage.voiceOutputLanguageLabel()}, ${voiceOutputVoiceName.ifBlank { "default voice" }}, ${voiceOutputSpeed.voiceOutputSpeedLabel()}): user-facing text-to-speech for assistant answers. You do not directly speak; the app reads answers aloud when enabled.")
         appendLine("- [${autoReadAnswersEnabled.status()}] Auto-read answers: the app can read completed replies aloud when voice output is enabled.")
         appendLine("- [${appendDateTimeToSystemPrompt.status()}] Current date/time in prompt: ${if (appendDateTimeToSystemPrompt) "the app appends the phone date/time separately." else "not appended; ask the user to enable it if exact current phone time matters."}")
         appendLine("- [ENABLED] Chat management UI: the user can search chats, copy/edit/delete messages, delete chats, and import/export history in the app UI. Do not claim to operate these UI controls yourself.")
@@ -5823,6 +5999,133 @@ private fun String.withIntegration(integrationId: String): String =
         .distinct()
         .joinToString("\n")
 
+private fun String.normalizedVoiceOutputEngine(): String =
+    when (trim().lowercase(Locale.ROOT)) {
+        VoiceOutputEngineSupertonic -> VoiceOutputEngineSupertonic
+        else -> VoiceOutputEngineSystem
+    }
+
+private fun String.voiceOutputEnginePackageName(): String? =
+    when (normalizedVoiceOutputEngine()) {
+        VoiceOutputEngineSupertonic -> SupertonicTtsEnginePackage
+        else -> null
+    }
+
+private fun String.voiceOutputEngineLabel(): String =
+    when (normalizedVoiceOutputEngine()) {
+        VoiceOutputEngineSupertonic -> "Supertonic"
+        else -> "System"
+    }
+
+private fun String.normalizedVoiceOutputLanguage(): String {
+    val raw = trim()
+    val normalized = raw.lowercase(Locale.ROOT).replace("-", "_")
+    return when (normalized) {
+        VoiceOutputLanguageEngineDefault,
+        "default",
+        "engine",
+        "engine_default",
+        "tts_default" -> VoiceOutputLanguageEngineDefault
+        VoiceOutputLanguageDevice,
+        "device_language",
+        "phone",
+        "locale" -> VoiceOutputLanguageDevice
+        VoiceOutputLanguageLithuanian,
+        "lt_lt",
+        "lit",
+        "lithuanian" -> VoiceOutputLanguageLithuanian
+        else -> {
+            val byTag = VoiceOutputLanguageOptions.firstOrNull { option ->
+                option.tag.lowercase(Locale.ROOT).replace("-", "_") == normalized ||
+                    option.label.lowercase(Locale.ROOT).replace(" ", "_") == normalized
+            }
+            val byLanguage = VoiceOutputLanguageOptions.firstOrNull { option ->
+                option.tag !in listOf(VoiceOutputLanguageEngineDefault, VoiceOutputLanguageDevice) &&
+                    Locale.forLanguageTag(option.tag).language.equals(normalized, ignoreCase = true)
+            }
+            byTag?.tag ?: byLanguage?.tag ?: VoiceOutputLanguageEngineDefault
+        }
+    }
+}
+
+private fun String.voiceOutputLanguageLabel(): String =
+    VoiceOutputLanguageOptions
+        .firstOrNull { it.tag == normalizedVoiceOutputLanguage() }
+        ?.label
+        ?: Locale.forLanguageTag(normalizedVoiceOutputLanguage()).getDisplayName(Locale.getDefault()).ifBlank {
+            normalizedVoiceOutputLanguage()
+        }
+
+private fun String.voiceOutputLocale(): Locale? =
+    when (normalizedVoiceOutputLanguage()) {
+        VoiceOutputLanguageDevice -> Locale.getDefault()
+        VoiceOutputLanguageEngineDefault -> null
+        else -> Locale.forLanguageTag(normalizedVoiceOutputLanguage())
+    }
+
+private fun Float.normalizedVoiceOutputSpeed(): Float =
+    if (isFinite()) coerceIn(0.5f, 2.0f) else 1f
+
+private fun Float.voiceOutputSpeedLabel(): String =
+    "${String.format(Locale.US, "%.2f", normalizedVoiceOutputSpeed())}x"
+
+private fun Voice.toVoiceOutputVoiceOption(): VoiceOutputVoiceOption {
+    val languageTag = locale.toLanguageTag()
+    val speaker = name.substringAfter("-supertonic-", name)
+    val languageLabel = locale.getDisplayName(Locale.getDefault()).ifBlank { languageTag }
+    val engineLabel = if (name.contains("-supertonic-", ignoreCase = true)) "Supertonic" else "TTS"
+    return VoiceOutputVoiceOption(
+        name = name,
+        label = "$speaker - $languageLabel ($engineLabel)",
+        languageTag = languageTag,
+    )
+}
+
+private fun TextToSpeech.voiceOutputVoiceOptions(): List<VoiceOutputVoiceOption> =
+    runCatching {
+        voices
+            .orEmpty()
+            .map { it.toVoiceOutputVoiceOption() }
+            .distinctBy { it.name }
+            .sortedWith(compareBy<VoiceOutputVoiceOption> { it.languageTag }.thenBy { it.label })
+    }.getOrDefault(emptyList())
+
+private fun String.voiceOutputVoiceLabel(options: List<VoiceOutputVoiceOption>): String =
+    if (isBlank()) {
+        "Engine default voice"
+    } else {
+        options.firstOrNull { it.name == this }?.label ?: this
+    }
+
+private fun List<VoiceOutputVoiceOption>.filteredForLanguage(language: String): List<VoiceOutputVoiceOption> {
+    val locale = language.voiceOutputLocale() ?: return this
+    val filtered = filter {
+        Locale.forLanguageTag(it.languageTag).language.equals(locale.language, ignoreCase = true)
+    }
+    return filtered.ifEmpty { this }
+}
+
+private fun String.voiceOutputLanguageDescription(): String =
+    when (normalizedVoiceOutputLanguage()) {
+        VoiceOutputLanguageEngineDefault -> "Uses the selected TTS engine's own voice and language settings."
+        VoiceOutputLanguageDevice -> "Uses this phone's current Android language."
+        VoiceOutputLanguageLithuanian -> "Forces Lithuanian for LMSMOB read-aloud playback."
+        else -> "Forces ${voiceOutputLanguageLabel()} for LMSMOB read-aloud playback."
+    }
+
+private fun Context.isPackageInstalled(packageName: String): Boolean =
+    runCatching {
+        packageManager.getPackageInfo(packageName, 0)
+    }.isSuccess
+
+private fun Context.openAndroidTtsSettings() {
+    runCatching {
+        startActivity(Intent("com.android.settings.TTS_SETTINGS").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }.recoverCatching {
+        startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
+}
+
 private const val ShareDefaultNew = "new"
 private const val ShareDefaultTemporary = "temporary"
 private const val ShareDefaultExistingPrefix = "existing:"
@@ -6190,6 +6493,11 @@ fun LmStudioApp(
     onWatchJobToolEnabledChange: (Boolean) -> Unit,
     onVoiceInputEnabledChange: (Boolean) -> Unit,
     onVoiceOutputEnabledChange: (Boolean) -> Unit,
+    onVoiceOutputEngineChange: (String) -> Unit,
+    onVoiceOutputLanguageChange: (String) -> Unit,
+    onVoiceOutputVoiceChange: (String) -> Unit,
+    onVoiceOutputSpeedChange: (Float) -> Unit,
+    voiceOutputVoiceOptions: List<VoiceOutputVoiceOption>,
     onAutoReadAnswersEnabledChange: (Boolean) -> Unit,
     onAppendCapabilityGuideToSystemPromptChange: (Boolean) -> Unit,
     onAppendDateTimeToSystemPromptChange: (Boolean) -> Unit,
@@ -6274,6 +6582,11 @@ fun LmStudioApp(
             onWatchJobToolEnabledChange = onWatchJobToolEnabledChange,
             onVoiceInputEnabledChange = onVoiceInputEnabledChange,
             onVoiceOutputEnabledChange = onVoiceOutputEnabledChange,
+            onVoiceOutputEngineChange = onVoiceOutputEngineChange,
+            onVoiceOutputLanguageChange = onVoiceOutputLanguageChange,
+            onVoiceOutputVoiceChange = onVoiceOutputVoiceChange,
+            onVoiceOutputSpeedChange = onVoiceOutputSpeedChange,
+            voiceOutputVoiceOptions = voiceOutputVoiceOptions,
             onAutoReadAnswersEnabledChange = onAutoReadAnswersEnabledChange,
             onAppendCapabilityGuideToSystemPromptChange = onAppendCapabilityGuideToSystemPromptChange,
             onAppendDateTimeToSystemPromptChange = onAppendDateTimeToSystemPromptChange,
@@ -9723,6 +10036,11 @@ private fun SettingsSheet(
     onWatchJobToolEnabledChange: (Boolean) -> Unit,
     onVoiceInputEnabledChange: (Boolean) -> Unit,
     onVoiceOutputEnabledChange: (Boolean) -> Unit,
+    onVoiceOutputEngineChange: (String) -> Unit,
+    onVoiceOutputLanguageChange: (String) -> Unit,
+    onVoiceOutputVoiceChange: (String) -> Unit,
+    onVoiceOutputSpeedChange: (Float) -> Unit,
+    voiceOutputVoiceOptions: List<VoiceOutputVoiceOption>,
     onAutoReadAnswersEnabledChange: (Boolean) -> Unit,
     onAppendCapabilityGuideToSystemPromptChange: (Boolean) -> Unit,
     onAppendDateTimeToSystemPromptChange: (Boolean) -> Unit,
@@ -9745,6 +10063,7 @@ private fun SettingsSheet(
     onImportChats: () -> Unit,
 ) {
     val scrollState = rememberScrollState()
+    val context = LocalContext.current
     var advancedGenerationExpanded by remember { mutableStateOf(false) }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
@@ -10142,12 +10461,242 @@ private fun SettingsSheet(
                 onCheckedChange = onVoiceOutputEnabledChange,
             )
             AnimatedVisibility(visible = state.voiceOutputEnabled) {
-                ToolToggleRow(
-                    title = "Auto-read answers",
-                    description = "Read new assistant replies aloud after generation finishes.",
-                    checked = state.autoReadAnswersEnabled,
-                    onCheckedChange = onAutoReadAnswersEnabledChange,
-                )
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    val selectedVoiceEngine = state.voiceOutputEngine.normalizedVoiceOutputEngine()
+                    val selectedVoiceLanguage = state.voiceOutputLanguage.normalizedVoiceOutputLanguage()
+                    val filteredVoiceOptions = voiceOutputVoiceOptions.filteredForLanguage(selectedVoiceLanguage)
+                    val supertonicInstalled = context.isPackageInstalled(SupertonicTtsEnginePackage)
+                    var languageMenuExpanded by remember { mutableStateOf(false) }
+                    var voiceMenuExpanded by remember { mutableStateOf(false) }
+
+                    Text(
+                        text = "Voice output engine",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        contentPadding = PaddingValues(end = 10.dp),
+                    ) {
+                        item {
+                            FilterChip(
+                                selected = selectedVoiceEngine == VoiceOutputEngineSystem,
+                                onClick = { onVoiceOutputEngineChange(VoiceOutputEngineSystem) },
+                                label = { Text("System") },
+                                leadingIcon = if (selectedVoiceEngine == VoiceOutputEngineSystem) {
+                                    {
+                                        Icon(
+                                            imageVector = Icons.Filled.Check,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                    }
+                                } else {
+                                    null
+                                },
+                            )
+                        }
+                        item {
+                            FilterChip(
+                                selected = selectedVoiceEngine == VoiceOutputEngineSupertonic,
+                                onClick = { onVoiceOutputEngineChange(VoiceOutputEngineSupertonic) },
+                                label = { Text("Supertonic") },
+                                leadingIcon = if (selectedVoiceEngine == VoiceOutputEngineSupertonic) {
+                                    {
+                                        Icon(
+                                            imageVector = Icons.Filled.Check,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                    }
+                                } else {
+                                    null
+                                },
+                            )
+                        }
+                    }
+                    Text(
+                        text = when (selectedVoiceEngine) {
+                            VoiceOutputEngineSupertonic -> if (supertonicInstalled) {
+                                "Uses the installed Supertonic Android TTS engine for read-aloud playback."
+                            } else {
+                                "Supertonic TTS engine is not installed on this phone yet."
+                            }
+                            else -> "Uses the Android system text-to-speech engine selected on this phone."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = "Voice output language",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(
+                            onClick = { languageMenuExpanded = true },
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                text = selectedVoiceLanguage.voiceOutputLanguageLabel(),
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                        DropdownMenu(
+                            expanded = languageMenuExpanded,
+                            onDismissRequest = { languageMenuExpanded = false },
+                            modifier = Modifier.heightIn(max = 320.dp),
+                        ) {
+                            VoiceOutputLanguageOptions.forEach { option ->
+                                DropdownMenuItem(
+                                    text = { Text(option.label) },
+                                    leadingIcon = if (selectedVoiceLanguage == option.tag) {
+                                        {
+                                            Icon(
+                                                imageVector = Icons.Filled.Check,
+                                                contentDescription = null,
+                                            )
+                                        }
+                                    } else {
+                                        null
+                                    },
+                                    onClick = {
+                                        onVoiceOutputLanguageChange(option.tag)
+                                        languageMenuExpanded = false
+                                    },
+                                )
+                            }
+                        }
+                    }
+                    Text(
+                        text = selectedVoiceLanguage.voiceOutputLanguageDescription(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = "Speaker voice",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(
+                            onClick = { voiceMenuExpanded = true },
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = voiceOutputVoiceOptions.isNotEmpty(),
+                        ) {
+                            Text(
+                                text = state.voiceOutputVoiceName.voiceOutputVoiceLabel(voiceOutputVoiceOptions),
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                        DropdownMenu(
+                            expanded = voiceMenuExpanded,
+                            onDismissRequest = { voiceMenuExpanded = false },
+                            modifier = Modifier.heightIn(max = 320.dp),
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Engine default voice") },
+                                leadingIcon = if (state.voiceOutputVoiceName.isBlank()) {
+                                    {
+                                        Icon(
+                                            imageVector = Icons.Filled.Check,
+                                            contentDescription = null,
+                                        )
+                                    }
+                                } else {
+                                    null
+                                },
+                                onClick = {
+                                    onVoiceOutputVoiceChange("")
+                                    voiceMenuExpanded = false
+                                },
+                            )
+                            filteredVoiceOptions.forEach { voice ->
+                                DropdownMenuItem(
+                                    text = { Text(voice.label) },
+                                    leadingIcon = if (state.voiceOutputVoiceName == voice.name) {
+                                        {
+                                            Icon(
+                                                imageVector = Icons.Filled.Check,
+                                                contentDescription = null,
+                                            )
+                                        }
+                                    } else {
+                                        null
+                                    },
+                                    onClick = {
+                                        onVoiceOutputVoiceChange(voice.name)
+                                        voiceMenuExpanded = false
+                                    },
+                                )
+                            }
+                        }
+                    }
+                    Text(
+                        text = if (voiceOutputVoiceOptions.isEmpty()) {
+                            "The selected TTS engine has not exposed speaker voices yet."
+                        } else {
+                            "Shows voices exposed by the selected Android TTS engine."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Text(
+                            text = "Speed",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = state.voiceOutputSpeed.voiceOutputSpeedLabel(),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Slider(
+                        value = state.voiceOutputSpeed.normalizedVoiceOutputSpeed(),
+                        onValueChange = onVoiceOutputSpeedChange,
+                        valueRange = 0.5f..2.0f,
+                        steps = 5,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = { context.openAndroidTtsSettings() },
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text("TTS settings")
+                        }
+                        if (selectedVoiceEngine == VoiceOutputEngineSupertonic && !supertonicInstalled) {
+                            OutlinedButton(
+                                onClick = { context.openUrl(SupertonicTtsInstallUrl) },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text("Install")
+                            }
+                        }
+                    }
+                    ToolToggleRow(
+                        title = "Auto-read answers",
+                        description = "Read new assistant replies aloud after generation finishes.",
+                        checked = state.autoReadAnswersEnabled,
+                        onCheckedChange = onAutoReadAnswersEnabledChange,
+                    )
+                }
             }
 
             HorizontalDivider(color = DividerDefaults.color.copy(alpha = 0.45f))

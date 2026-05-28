@@ -58,9 +58,11 @@ jobs:
           LMSMOB Chat is an Android client for LM Studio local models.
 
           Highlights:
-          - Chat folders for organizing conversations.
-          - MCP image outputs in chat for webpage screenshots and generated QR codes.
-          - Improved tool-result presentation for local web, YouTube transcript, and QR workflows.
+          - Voice output engine selector for System TTS or Supertonic TTS.
+          - Voice output language selector covering Supertonic-supported languages, including Lithuanian.
+          - Speaker voice picker and read-aloud speed control.
+          - In-app Supertonic install path and Android TTS settings shortcut.
+          - Capability prompt now reports the active voice engine, language, voice, and speed.
           - Tested with the MindyLab LM Studio tools repository.
 
           Demo: https://youtu.be/mtZJ2uDz3hY
