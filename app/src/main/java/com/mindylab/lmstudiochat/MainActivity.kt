@@ -205,6 +205,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -278,6 +279,8 @@ private const val VoiceOutputLanguageDevice = "device"
 private const val VoiceOutputLanguageLithuanian = "lt"
 private const val SupertonicTtsQualityParam = "com.brahmadeo.supertonic.tts.DIFFUSION_STEPS"
 private const val SupertonicTtsQualityParamShort = "diffusion_steps"
+private const val SupertonicTtsSynthesisTimeoutParam = "com.brahmadeo.supertonic.tts.SYNTHESIS_TIMEOUT_MS"
+private const val SupertonicTtsSynthesisTimeoutParamShort = "synthesis_timeout_ms"
 private const val SupertonicTtsEnginePackage = "com.brahmadeo.supertonic.tts"
 private const val SupertonicTtsInstallUrl = "https://f-droid.org/en/packages/com.brahmadeo.supertonic.tts/"
 private const val VoiceOutputDefaultChunkChars = 420
@@ -287,8 +290,11 @@ private const val VoiceOutputChunkStepChars = 20
 private const val VoiceOutputDefaultStartBufferChunks = 2
 private const val VoiceOutputMinStartBufferChunks = 1
 private const val VoiceOutputMaxStartBufferChunks = 3
-private const val VoiceOutputSynthesisTimeoutMs = 60000L
-private const val VoiceOutputPreparedWaitTimeoutMs = 65000L
+private const val VoiceOutputSynthesisTimeoutMs = 20000L
+private const val VoiceOutputEngineWatchdogTimeoutMs = 18000L
+private const val VoiceOutputPreparedWaitTimeoutMs = 45000L
+private const val VoiceOutputSynthesisMaxRetries = 1
+private const val VoiceOutputSynthesisRetryDelayMs = 350L
 private const val TtsChunkUtteranceSeparator = "::lmsmob_tts_chunk::"
 private const val TtsSynthesisUtterancePrefix = "synth"
 private const val TtsLogTag = "LMSMOB_TTS"
@@ -387,6 +393,15 @@ data class WatchJob(
     val lastCheckedAt: Long = 0L,
     val lastMatchedAt: Long = 0L,
     val matchCount: Int = 0,
+)
+
+data class WatchPromptResult(
+    val shouldAlert: Boolean,
+    val title: String = "",
+    val detail: String = "",
+    val summary: String = "",
+    val triggerReason: String = "",
+    val sources: List<String> = emptyList(),
 )
 
 private val NativeActionRegex = Regex(
@@ -622,6 +637,8 @@ class MainActivity : ComponentActivity() {
                     val ttsParams = Bundle().apply {
                         putInt(SupertonicTtsQualityParam, selectedTtsQuality)
                         putInt(SupertonicTtsQualityParamShort, selectedTtsQuality)
+                        putLong(SupertonicTtsSynthesisTimeoutParam, VoiceOutputEngineWatchdogTimeoutMs)
+                        putLong(SupertonicTtsSynthesisTimeoutParamShort, VoiceOutputEngineWatchdogTimeoutMs)
                     }
 
                     ttsPlaybackJob?.cancel()
@@ -642,17 +659,21 @@ class MainActivity : ComponentActivity() {
                         },
                     )
 
-                    fun chunkFile(index: Int): File =
-                        File(context.cacheDir, "lmsmob-tts-$runId-$index.wav")
+                    fun chunkFile(index: Int, attempt: Int): File =
+                        File(context.cacheDir, "lmsmob-tts-$runId-$index-$attempt.wav")
 
-                    suspend fun synthesizeChunk(index: Int): File? {
+                    suspend fun synthesizeChunkAttempt(index: Int, attempt: Int): File? {
                         val chunkId = TtsChunkId(messageId = messageId, runId = runId, index = index)
-                        val file = chunkFile(index)
+                        val file = chunkFile(index, attempt)
                         if (file.exists()) file.delete()
-                        val utteranceId = chunkId.toSynthesisUtteranceId()
+                        val utteranceId = chunkId.toSynthesisUtteranceId(attempt)
                         val done = CompletableDeferred<Boolean>()
                         ttsSynthesisResults[utteranceId] = done
                         ttsPlaybackState = ttsPlaybackState?.withChunkStatus(chunkId, TtsChunkStatus.Preparing)
+                        Log.i(
+                            TtsLogTag,
+                            "Synthesizing TTS chunk ${index + 1} of ${chunks.size}, attempt ${attempt + 1}, chars=${chunks[index].length}",
+                        )
                         val result = textToSpeech.synthesizeToFile(
                             chunks[index],
                             Bundle(ttsParams),
@@ -661,7 +682,11 @@ class MainActivity : ComponentActivity() {
                         )
                         if (result == TextToSpeech.ERROR) {
                             ttsSynthesisResults.remove(utteranceId)
-                            ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
+                            file.delete()
+                            Log.w(
+                                TtsLogTag,
+                                "TTS engine rejected chunk ${index + 1} of ${chunks.size}, attempt ${attempt + 1}",
+                            )
                             return null
                         }
                         val success = withTimeoutOrNull(VoiceOutputSynthesisTimeoutMs) {
@@ -669,20 +694,45 @@ class MainActivity : ComponentActivity() {
                         }
                         ttsSynthesisResults.remove(utteranceId)
                         return if (success == true && file.exists() && file.length() > 0L) {
+                            Log.i(
+                                TtsLogTag,
+                                "Ready TTS chunk ${index + 1} of ${chunks.size}, attempt ${attempt + 1}, bytes=${file.length()}",
+                            )
                             file
                         } else {
                             if (success == null) {
                                 Log.w(
                                     TtsLogTag,
-                                    "Timed out while synthesizing TTS chunk ${index + 1} of ${chunks.size}",
+                                    "Timed out after ${VoiceOutputSynthesisTimeoutMs}ms while synthesizing TTS chunk ${index + 1} of ${chunks.size}, attempt ${attempt + 1}",
                                 )
                                 textToSpeech.stop()
+                            } else {
+                                Log.w(
+                                    TtsLogTag,
+                                    "TTS engine failed chunk ${index + 1} of ${chunks.size}, attempt ${attempt + 1}",
+                                )
                             }
                             done.complete(false)
-                            ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
                             file.delete()
                             null
                         }
+                    }
+
+                    suspend fun synthesizeChunk(index: Int): File? {
+                        val chunkId = TtsChunkId(messageId = messageId, runId = runId, index = index)
+                        for (attempt in 0..VoiceOutputSynthesisMaxRetries) {
+                            val file = synthesizeChunkAttempt(index, attempt)
+                            if (file != null) return file
+                            if (attempt < VoiceOutputSynthesisMaxRetries) {
+                                Log.w(
+                                    TtsLogTag,
+                                    "Retrying TTS chunk ${index + 1} of ${chunks.size} after failed attempt ${attempt + 1}",
+                                )
+                                delay(VoiceOutputSynthesisRetryDelayMs)
+                            }
+                        }
+                        ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
+                        return null
                     }
 
                     suspend fun playPreparedChunk(index: Int, file: File): Boolean {
@@ -2418,8 +2468,9 @@ class ChatViewModel(
         val normalizedTextQuery = textQuery.trim()
         val normalizedMatchMode = matchMode.normalizedWatchMatchMode()
         val normalizedAiInstruction = aiInstruction.trim()
-        if (normalizedMatchMode == "ai" && normalizedAiInstruction.isBlank()) {
-            _uiState.update { it.copy(error = "Add AI instructions for AI mode.") }
+        val effectiveTrigger = if (normalizedMatchMode == "prompt") "schedule" else normalizedTrigger
+        if ((normalizedMatchMode == "ai" || normalizedMatchMode == "prompt") && normalizedAiInstruction.isBlank()) {
+            _uiState.update { it.copy(error = if (normalizedMatchMode == "prompt") "Add a scheduled prompt." else "Add AI instructions for AI mode.") }
             return
         }
         if (normalizedMatchMode == "filter" && listOf(normalizedAppQuery, normalizedSenderQuery, normalizedTextQuery).all { it.isBlank() }) {
@@ -2429,13 +2480,13 @@ class ChatViewModel(
         val scheduleMinutes = scheduleMinutesText.toIntOrNull()?.coerceIn(1, 1440) ?: 15
         val job = WatchJob(
             title = normalizedTitle,
-            trigger = normalizedTrigger,
-            appQuery = normalizedAppQuery,
-            senderQuery = normalizedSenderQuery,
-            textQuery = normalizedTextQuery,
+            trigger = effectiveTrigger,
+            appQuery = if (normalizedMatchMode == "prompt") "" else normalizedAppQuery,
+            senderQuery = if (normalizedMatchMode == "prompt") "" else normalizedSenderQuery,
+            textQuery = if (normalizedMatchMode == "prompt") "" else normalizedTextQuery,
             matchMode = normalizedMatchMode,
             aiInstruction = normalizedAiInstruction,
-            scheduleMinutes = if (normalizedTrigger == "schedule") scheduleMinutes else 0,
+            scheduleMinutes = if (effectiveTrigger == "schedule") scheduleMinutes else 0,
             alertMessage = alertMessage.trim(),
             alertMode = alertMode.normalizedWatchAlertMode(),
             lifetime = lifetime.normalizedWatchLifetime(),
@@ -2452,23 +2503,30 @@ class ChatViewModel(
         val appQuery = args.arg("app", "package", "app_query")
         val senderQuery = args.arg("sender", "from", "sender_query")
         val textQuery = args.arg("text", "contains", "query", "text_query")
-        val matchMode = args.arg("match_mode", "matchMode", "mode_type").normalizedWatchMatchMode()
-        val aiInstruction = args.arg("ai_instruction", "instruction", "instructions", "task")
-        if (matchMode == "ai" && aiInstruction.isBlank()) {
-            throw IOException("AI Watch Job needs ai_instruction.")
+        val promptTask = args.arg("prompt", "schedule_prompt", "scheduled_prompt", "task_prompt")
+        val rawMatchMode = args.arg("match_mode", "matchMode", "mode_type")
+        val matchMode = if (rawMatchMode.isBlank() && trigger == "schedule" && promptTask.isNotBlank()) {
+            "prompt"
+        } else {
+            rawMatchMode.normalizedWatchMatchMode()
+        }
+        val effectiveTrigger = if (matchMode == "prompt") "schedule" else trigger
+        val aiInstruction = args.arg("ai_instruction", "instruction", "instructions", "task", "prompt", "schedule_prompt", "scheduled_prompt")
+        if ((matchMode == "ai" || matchMode == "prompt") && aiInstruction.isBlank()) {
+            throw IOException(if (matchMode == "prompt") "Scheduled prompt Watch Job needs prompt." else "AI Watch Job needs ai_instruction.")
         }
         if (matchMode == "filter" && listOf(appQuery, senderQuery, textQuery).all { it.isBlank() }) {
             throw IOException("Watch Job needs at least one app, sender, or text filter.")
         }
         val job = WatchJob(
             title = args.arg("title", "name").ifBlank { "Watch job" },
-            trigger = trigger,
-            appQuery = appQuery,
-            senderQuery = senderQuery,
-            textQuery = textQuery,
+            trigger = effectiveTrigger,
+            appQuery = if (matchMode == "prompt") "" else appQuery,
+            senderQuery = if (matchMode == "prompt") "" else senderQuery,
+            textQuery = if (matchMode == "prompt") "" else textQuery,
             matchMode = matchMode,
             aiInstruction = aiInstruction,
-            scheduleMinutes = if (trigger == "schedule") scheduleMinutes else 0,
+            scheduleMinutes = if (effectiveTrigger == "schedule") scheduleMinutes else 0,
             alertMessage = args.arg("alert", "alert_message", "message"),
             alertMode = args.arg("alert_mode", "alertMode", "mode").normalizedWatchAlertMode(),
             lifetime = args.arg("lifetime", "life_time", "expires").normalizedWatchLifetime(),
@@ -2502,8 +2560,9 @@ class ChatViewModel(
         val normalizedTextQuery = textQuery.trim()
         val normalizedMatchMode = matchMode.normalizedWatchMatchMode()
         val normalizedAiInstruction = aiInstruction.trim()
-        if (normalizedMatchMode == "ai" && normalizedAiInstruction.isBlank()) {
-            _uiState.update { it.copy(error = "Add AI instructions for AI mode.") }
+        val effectiveTrigger = if (normalizedMatchMode == "prompt") "schedule" else normalizedTrigger
+        if ((normalizedMatchMode == "ai" || normalizedMatchMode == "prompt") && normalizedAiInstruction.isBlank()) {
+            _uiState.update { it.copy(error = if (normalizedMatchMode == "prompt") "Add a scheduled prompt." else "Add AI instructions for AI mode.") }
             return
         }
         if (normalizedMatchMode == "filter" && listOf(normalizedAppQuery, normalizedSenderQuery, normalizedTextQuery).all { it.isBlank() }) {
@@ -2513,13 +2572,13 @@ class ChatViewModel(
         val scheduleMinutes = scheduleMinutesText.toIntOrNull()?.coerceIn(1, 1440) ?: existing.scheduleMinutes.coerceAtLeast(15)
         val updated = existing.copy(
             title = normalizedTitle,
-            trigger = normalizedTrigger,
-            appQuery = normalizedAppQuery,
-            senderQuery = normalizedSenderQuery,
-            textQuery = normalizedTextQuery,
+            trigger = effectiveTrigger,
+            appQuery = if (normalizedMatchMode == "prompt") "" else normalizedAppQuery,
+            senderQuery = if (normalizedMatchMode == "prompt") "" else normalizedSenderQuery,
+            textQuery = if (normalizedMatchMode == "prompt") "" else normalizedTextQuery,
             matchMode = normalizedMatchMode,
             aiInstruction = normalizedAiInstruction,
-            scheduleMinutes = if (normalizedTrigger == "schedule") scheduleMinutes else 0,
+            scheduleMinutes = if (effectiveTrigger == "schedule") scheduleMinutes else 0,
             alertMessage = alertMessage.trim(),
             alertMode = alertMode.normalizedWatchAlertMode(),
             lifetime = lifetime.normalizedWatchLifetime(),
@@ -2542,6 +2601,8 @@ class ChatViewModel(
                 appendLine("   filters: ${job.watchJobFiltersText()}")
                 if (job.matchMode.normalizedWatchMatchMode() == "ai") {
                     appendLine("   ai instruction: ${job.aiInstruction}")
+                } else if (job.matchMode.normalizedWatchMatchMode() == "prompt") {
+                    appendLine("   scheduled prompt: ${job.aiInstruction}")
                 }
                 appendLine("   alert: ${job.alertMode.watchAlertModeLabel()}, lifetime: ${job.lifetime.watchLifetimeLabel()}")
                 appendLine("   matches: ${job.matchCount}, last run: ${job.lastRunAt.toWatchJobTime()}, last checked: ${job.lastCheckedAt.toWatchJobTime()}, last match: ${job.lastMatchedAt.toWatchJobTime()}")
@@ -2565,18 +2626,30 @@ class ChatViewModel(
             appQuery = args.optionalArg("app", "package", "app_query")?.trim() ?: existing.appQuery,
             senderQuery = args.optionalArg("sender", "from", "sender_query")?.trim() ?: existing.senderQuery,
             textQuery = args.optionalArg("text", "contains", "query", "text_query")?.trim() ?: existing.textQuery,
-            matchMode = (args.optionalArg("match_mode", "matchMode") ?: existing.matchMode).normalizedWatchMatchMode(),
-            aiInstruction = args.optionalArg("ai_instruction", "instruction", "instructions", "task")?.trim() ?: existing.aiInstruction,
+            matchMode = (
+                args.optionalArg("match_mode", "matchMode")
+                    ?: if (args.optionalArg("prompt", "schedule_prompt", "scheduled_prompt") != null) "prompt" else existing.matchMode
+                ).normalizedWatchMatchMode(),
+            aiInstruction = args.optionalArg("ai_instruction", "instruction", "instructions", "task", "prompt", "schedule_prompt", "scheduled_prompt")?.trim() ?: existing.aiInstruction,
             scheduleMinutes = args.optInt("schedule_minutes", args.optInt("interval_minutes", existing.scheduleMinutes.coerceAtLeast(15))).coerceIn(1, 1440),
             alertMessage = args.optionalArg("alert", "alert_message", "message")?.trim() ?: existing.alertMessage,
             alertMode = (args.optionalArg("alert_mode", "alertMode") ?: existing.alertMode).normalizedWatchAlertMode(),
             lifetime = (args.optionalArg("lifetime", "life_time", "expires") ?: existing.lifetime).normalizedWatchLifetime(),
             enabled = if (args.has("enabled")) args.optBoolean("enabled", existing.enabled) else existing.enabled,
         ).let { job ->
-            if (job.trigger == "schedule") job else job.copy(scheduleMinutes = 0)
+            when {
+                job.matchMode.normalizedWatchMatchMode() == "prompt" -> job.copy(
+                    trigger = "schedule",
+                    appQuery = "",
+                    senderQuery = "",
+                    textQuery = "",
+                )
+                job.trigger == "schedule" -> job
+                else -> job.copy(scheduleMinutes = 0)
+            }
         }
-        if (updated.matchMode == "ai" && updated.aiInstruction.isBlank()) {
-            throw IOException("AI Watch Job needs ai_instruction.")
+        if ((updated.matchMode == "ai" || updated.matchMode == "prompt") && updated.aiInstruction.isBlank()) {
+            throw IOException(if (updated.matchMode == "prompt") "Scheduled prompt Watch Job needs prompt." else "AI Watch Job needs ai_instruction.")
         }
         if (updated.matchMode == "filter" && listOf(updated.appQuery, updated.senderQuery, updated.textQuery).all { it.isBlank() }) {
             throw IOException("Watch Job needs at least one app, sender, or text filter.")
@@ -3821,7 +3894,7 @@ private fun ChatUiState.capabilityGuideSystemPrompt(): String {
         appendLine(phoneToolLine(localFileSearchToolEnabled, "local_file_search", "{\"tool\":\"local_file_search\",\"args\":{\"query\":\"invoice May\"}}", "search the user-selected folder for matching file names and readable text snippets.", "Local file search", "Only the folder granted by the user is searchable."))
         appendLine(phoneToolLine(deviceStatusToolEnabled, "device_status", "{\"tool\":\"device_status\",\"args\":{}}", "return battery, network, storage, app version, and LM Studio connection status.", "Device status"))
         appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_list", "{\"tool\":\"watch_job_list\",\"args\":{}}", "return configured watch jobs with ids, filters, alert modes, lifetime, and enabled state.", "Watch jobs"))
-        appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_create", "{\"tool\":\"watch_job_create\",\"args\":{\"title\":\"Mindylab offer watch\",\"trigger\":\"notification\",\"match_mode\":\"ai\",\"ai_instruction\":\"Alert me if this notification mentions an offer from company Mindylab.\",\"app\":\"\",\"sender\":\"\",\"text\":\"\",\"schedule_minutes\":15,\"alert\":\"Mindylab offer found\",\"alert_mode\":\"alarm\",\"lifetime\":\"noend\"}}", "create a local notification or scheduled watch job. match_mode can be filter or ai. In AI mode, ai_instruction is required and app/sender/text are optional pre-filters. alert_mode can be normal or alarm. lifetime can be once, today, or noend.", "Watch jobs", "Requires notification permission, Notification Listener access, and a reachable LM Studio model for AI mode. Alarm mode is full-screen and intrusive, so use it only when the user clearly wants strong alerts."))
+        appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_create", "{\"tool\":\"watch_job_create\",\"args\":{\"title\":\"AI news watch\",\"trigger\":\"schedule\",\"match_mode\":\"prompt\",\"prompt\":\"Search the web for major Lithuanian AI policy news. Alert only when a credible new item appears and include source URLs.\",\"schedule_minutes\":60,\"alert\":\"AI news found\",\"alert_mode\":\"normal\",\"lifetime\":\"noend\"}}", "create a local notification, notification-history, or scheduled prompt watch job. match_mode can be filter, ai, or prompt. In AI mode, ai_instruction is required and app/sender/text are optional pre-filters. In prompt mode, prompt or ai_instruction is required, trigger is schedule, and LM Studio server tools may be used for web/news tasks. alert_mode can be normal or alarm. lifetime can be once, today, or noend.", "Watch jobs", "Requires notification permission for alerts, Notification Listener access for notification-based jobs, and a reachable LM Studio model. Prompt mode needs Settings > Server tools configured when it should search/fetch the web. Alarm mode is full-screen and intrusive, so use it only when the user clearly wants strong alerts."))
         appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_edit", "{\"tool\":\"watch_job_edit\",\"args\":{\"id\":\"watch-job-id\",\"title\":\"New title\",\"match_mode\":\"ai\",\"ai_instruction\":\"Alert only for Mindylab offers\",\"app\":\"Telegram\",\"sender\":\"Mom\",\"text\":\"urgent\",\"trigger\":\"notification\",\"alert_mode\":\"normal\",\"lifetime\":\"noend\",\"enabled\":true}}", "edit an existing watch job by id or exact title. Omitted fields keep existing values.", "Watch jobs"))
         appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_set_enabled", "{\"tool\":\"watch_job_set_enabled\",\"args\":{\"id\":\"watch-job-id\",\"enabled\":false}}", "enable or disable an existing watch job by id or exact title.", "Watch jobs"))
         appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_delete", "{\"tool\":\"watch_job_delete\",\"args\":{\"id\":\"watch-job-id\"}}", "delete an existing watch job by id or exact title.", "Watch jobs"))
@@ -3883,8 +3956,8 @@ private fun ChatUiState.nativeToolSystemPrompt(): String {
     if (deviceStatusToolEnabled) tools += "device_status {}"
     if (watchJobToolEnabled) {
         tools += "watch_job_list {}"
-        tools += "watch_job_create {title, trigger, match_mode, ai_instruction, app, sender, text, schedule_minutes, alert, alert_mode, lifetime}"
-        tools += "watch_job_edit {id, title, trigger, match_mode, ai_instruction, app, sender, text, schedule_minutes, alert, alert_mode, lifetime, enabled}"
+        tools += "watch_job_create {title, trigger, match_mode, prompt, ai_instruction, app, sender, text, schedule_minutes, alert, alert_mode, lifetime}"
+        tools += "watch_job_edit {id, title, trigger, match_mode, prompt, ai_instruction, app, sender, text, schedule_minutes, alert, alert_mode, lifetime, enabled}"
         tools += "watch_job_set_enabled {id, enabled}"
         tools += "watch_job_delete {id}"
     }
@@ -3896,7 +3969,7 @@ private fun ChatUiState.nativeToolSystemPrompt(): String {
         <lmsmob_action>{"tool":"tool_name","args":{"key":"value"}}</lmsmob_action>
         Available phone-side tools: ${tools.joinToString("; ")}.
         Alarm limitations: Android only lets this app read the next scheduled alarm and create alarm drafts. alarm_list, alarm_edit, and alarm_delete open the Clock alarms screen for the user to view or finish manually.
-        Watch job limitations: watch_job_list can read configured jobs; watch_job_create, watch_job_edit, watch_job_set_enabled, and watch_job_delete manage them after user confirmation. Use watch_job_list first if you do not know a job id. match_mode may be "filter" or "ai". AI mode sends notification content to LM Studio and requires ai_instruction; app, sender, and text become optional pre-filters. alert_mode may be "normal" or "alarm"; alarm mode opens a full-screen alert with repeating sound/vibration until stopped. lifetime may be "once", "today", or "noend". It needs Android notification access and alert permission, and it should be used only for clear user-requested monitoring tasks.
+        Watch job limitations: watch_job_list can read configured jobs; watch_job_create, watch_job_edit, watch_job_set_enabled, and watch_job_delete manage them after user confirmation. Use watch_job_list first if you do not know a job id. match_mode may be "filter", "ai", or "prompt". AI mode sends notification content to LM Studio and requires ai_instruction; app, sender, and text become optional pre-filters. Prompt mode runs a scheduled LM Studio task and requires prompt or ai_instruction; use it for recurring web/news checks only when Server tools are enabled/configured for web access. alert_mode may be "normal" or "alarm"; alarm mode opens a full-screen alert with repeating sound/vibration until stopped. lifetime may be "once", "today", or "noend". It needs Android notification access and alert permission, and it should be used only for clear user-requested monitoring tasks.
         Do not claim the action is complete until the app returns a tool result or the user confirms the draft.
         Phone-side tools are drafts only for calls, SMS, email, calendar, maps, and URLs; the user performs the final send/call/save.
     """.trimIndent()
@@ -4009,8 +4082,14 @@ private fun NativeToolAction.displaySummary(): String =
         "watch_job_create" -> listOf(
             args.arg("title", "name"),
             args.arg("trigger", "mode").ifBlank { "notification" },
-            args.arg("match_mode").ifBlank { "filter" }.watchMatchModeLabel(),
-            args.arg("app", "sender", "text", "query", "contains"),
+            args.arg("match_mode").ifBlank {
+                if (args.arg("prompt", "schedule_prompt", "scheduled_prompt", "task_prompt").isNotBlank()) {
+                    "prompt"
+                } else {
+                    "filter"
+                }
+            }.watchMatchModeLabel(),
+            args.arg("prompt", "schedule_prompt", "scheduled_prompt", "app", "sender", "text", "query", "contains"),
             args.arg("alert_mode").normalizedWatchAlertMode().watchAlertModeLabel(),
             args.arg("lifetime").normalizedWatchLifetime().watchLifetimeLabel(),
         ).filter { it.isNotBlank() }.joinToString(" - ")
@@ -5004,7 +5083,8 @@ class WatchJobReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == WatchJobRunner.Action) {
             val jobId = intent.getStringExtra(WatchJobRunner.ExtraJobId) ?: return
-            WatchJobRunner.runScheduled(context.applicationContext, jobId)
+            val pendingResult = goAsync()
+            WatchJobRunner.runScheduledAsync(context.applicationContext, jobId, pendingResult)
         }
     }
 }
@@ -5012,8 +5092,25 @@ class WatchJobReceiver : BroadcastReceiver() {
 private object WatchJobRunner {
     const val Action = "com.mindylab.lmstudiochat.WATCH_JOB"
     const val ExtraJobId = "job_id"
-    private const val ChannelId = "watch_jobs"
+    private const val NormalChannelId = "watch_jobs"
+    private const val AlarmChannelId = "watch_jobs_alarm"
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    fun runScheduledAsync(
+        context: Context,
+        jobId: String,
+        pendingResult: BroadcastReceiver.PendingResult,
+    ) {
+        scope.launch {
+            try {
+                runScheduled(context, jobId)
+            } catch (throwable: Throwable) {
+                Log.w("WatchJobRunner", "Scheduled watch job failed: $jobId", throwable)
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
 
     fun schedule(context: Context, job: WatchJob) {
         if (!job.enabled || job.trigger != "schedule" || job.scheduleMinutes <= 0) {
@@ -5102,6 +5199,11 @@ private object WatchJobRunner {
             return
         }
 
+        if (job.matchMode.normalizedWatchMatchMode() == "prompt") {
+            runScheduledPrompt(context, job, now, jobs)
+            return
+        }
+
         val notifications = NotificationDigestStore.recent(context)
         val checkAfter = if (job.lastCheckedAt > 0L) job.lastCheckedAt else job.createdAt
         val recentItems = (0 until notifications.length())
@@ -5143,6 +5245,49 @@ private object WatchJobRunner {
         WatchJobStore.save(
             context,
             jobs.map { existing -> if (existing.id == jobId) finalJob else existing },
+        )
+        schedule(context, finalJob)
+    }
+
+    private fun runScheduledPrompt(
+        context: Context,
+        job: WatchJob,
+        now: Long,
+        jobs: List<WatchJob>,
+    ) {
+        val result = runCatching {
+            kotlinx.coroutines.runBlocking {
+                LmStudioClient().evaluateWatchJobPrompt(
+                    settingsStore = SettingsStore(context),
+                    job = job,
+                )
+            }
+        }.onFailure { throwable ->
+            Log.w("WatchJobRunner", "Scheduled prompt Watch Job failed: ${job.id}", throwable)
+        }.getOrElse {
+            WatchPromptResult(shouldAlert = false)
+        }
+
+        val updatedJob = if (result.shouldAlert) {
+            showAlert(
+                context = context,
+                job = job,
+                detail = result.toWatchPromptNotificationDetail(job),
+                titleOverride = result.title.ifBlank { null },
+            )
+            job.copy(
+                lastRunAt = now,
+                lastCheckedAt = now,
+                lastMatchedAt = now,
+                matchCount = job.matchCount + 1,
+            ).afterWatchJobMatch()
+        } else {
+            job.copy(lastRunAt = now, lastCheckedAt = now)
+        }
+        val finalJob = updatedJob.afterWatchJobRun(now)
+        WatchJobStore.save(
+            context,
+            jobs.map { existing -> if (existing.id == job.id) finalJob else existing },
         )
         schedule(context, finalJob)
     }
@@ -5216,17 +5361,45 @@ private object WatchJobRunner {
         return result
     }
 
-    private fun showAlert(context: Context, job: WatchJob, detail: String) {
+    private fun showAlert(
+        context: Context,
+        job: WatchJob,
+        detail: String,
+        titleOverride: String? = null,
+    ) {
         if (!context.hasPostNotificationsPermission()) return
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val isAlarm = job.alertMode.normalizedWatchAlertMode() == "alarm"
+        val channelId = if (isAlarm) AlarmChannelId else NormalChannelId
+        val alarmSound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
         manager.createNotificationChannel(
             NotificationChannel(
-                ChannelId,
+                NormalChannelId,
                 "Watch jobs",
                 NotificationManager.IMPORTANCE_HIGH,
             ).apply {
                 description = "Alerts from LMSMOB notification and schedule watch jobs."
                 enableVibration(true)
+            },
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(
+                AlarmChannelId,
+                "Watch job alarms",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Full-screen alarm alerts from LMSMOB Watch Jobs."
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                enableVibration(true)
+                vibrationPattern = longArrayOf(0, 700, 350, 900, 350, 900)
+                setSound(
+                    alarmSound,
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build(),
+                )
             },
         )
         val pendingIntent = PendingIntent.getActivity(
@@ -5236,7 +5409,8 @@ private object WatchJobRunner {
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val title = job.alertMessage.ifBlank { "Watch job matched: ${job.title}" }
+        val title = titleOverride?.trim()?.ifBlank { null }
+            ?: job.alertMessage.ifBlank { "Watch job matched: ${job.title}" }
         val alertIntent = Intent(context, WatchJobAlertActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             .putExtra(WatchJobAlertActivity.ExtraTitle, title)
@@ -5248,19 +5422,27 @@ private object WatchJobRunner {
             alertIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val notification = Notification.Builder(context, ChannelId)
+        val notification = Notification.Builder(context, channelId)
             .setSmallIcon(R.drawable.ml_logo)
             .setContentTitle(title)
             .setContentText(detail.take(90))
             .setStyle(Notification.BigTextStyle().bigText(detail))
-            .setContentIntent(pendingIntent)
-            .setAutoCancel(true)
-            .setCategory(Notification.CATEGORY_REMINDER)
-            .setPriority(Notification.PRIORITY_HIGH)
-            .setVibrate(longArrayOf(0, 300, 160, 300))
+            .setContentIntent(if (isAlarm) fullScreenIntent else pendingIntent)
+            .setAutoCancel(!isAlarm)
+            .setCategory(if (isAlarm) Notification.CATEGORY_ALARM else Notification.CATEGORY_REMINDER)
+            .setPriority(if (isAlarm) Notification.PRIORITY_MAX else Notification.PRIORITY_HIGH)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setVibrate(
+                if (isAlarm) {
+                    longArrayOf(0, 700, 350, 900, 350, 900)
+                } else {
+                    longArrayOf(0, 300, 160, 300)
+                },
+            )
             .apply {
-                if (job.alertMode.normalizedWatchAlertMode() == "alarm") {
+                if (isAlarm) {
                     setOngoing(true)
+                    setSound(alarmSound)
                     setFullScreenIntent(fullScreenIntent, true)
                 }
             }
@@ -5321,6 +5503,136 @@ private fun JSONObject.watchNotificationDescription(context: Context): String {
         "Text: $text".takeIf { text.isNotBlank() },
         "Subtext: $subText".takeIf { subText.isNotBlank() },
     ).filterNotNull().joinToString("\n")
+}
+
+private fun String.toWatchPromptResult(job: WatchJob): WatchPromptResult {
+    val json = extractFirstJsonObject()
+    if (json != null) {
+        val decision = json.firstNonBlankString(
+            "decision",
+            "final_decision",
+            "status",
+            "result",
+        )
+        val shouldAlert = decision.equals("ALERT", ignoreCase = true) ||
+            decision.equals("YES", ignoreCase = true) ||
+            json.optBoolean("should_alert", false) ||
+            json.optBoolean("alert", false)
+        val title = json.firstNonBlankString(
+            "title",
+            "notification_title",
+            "alert_title",
+        ).take(90)
+        val detail = json.firstNonBlankString(
+            "detail",
+            "message",
+            "notification_detail",
+            "alert_detail",
+        ).take(1800)
+        val summary = json.firstNonBlankString(
+            "summary",
+            "short_summary",
+            "resume",
+            "finding",
+            "findings",
+            "what_found",
+            "what_model_found",
+        ).take(700)
+        val triggerReason = json.firstNonBlankString(
+            "why_triggered",
+            "trigger_reason",
+            "match_reason",
+            "reason",
+            "why",
+        ).take(500)
+        val sources = json.optJSONArray("sources").toStringList().ifEmpty {
+            listOf(
+                json.firstNonBlankString("source_url", "url", "link"),
+            ).filter { it.isNotBlank() }
+        }.take(4)
+        return WatchPromptResult(
+            shouldAlert = shouldAlert,
+            title = title,
+            detail = detail,
+            summary = summary,
+            triggerReason = triggerReason,
+            sources = sources,
+        )
+    }
+
+    val explicitDecision = Regex(
+        "FINAL[_\\s-]*DECISION\\s*[:=\\-]?\\s*(ALERT|IGNORE)\\b",
+        RegexOption.IGNORE_CASE,
+    ).findAll(this).lastOrNull()?.groupValues?.getOrNull(1)
+    val shouldAlert = explicitDecision?.equals("ALERT", ignoreCase = true) == true
+    val detail = lineSequence()
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .filterNot { it.contains("FINAL", ignoreCase = true) && it.contains("DECISION", ignoreCase = true) }
+        .joinToString("\n")
+        .take(1800)
+        .ifBlank { "Scheduled prompt matched:\n${job.aiInstruction}" }
+    return WatchPromptResult(
+        shouldAlert = shouldAlert,
+        title = "",
+        detail = detail,
+        summary = detail.take(700),
+    )
+}
+
+private fun WatchPromptResult.toWatchPromptNotificationDetail(job: WatchJob): String =
+    buildList {
+        val summaryText = summary.ifBlank { detail }.trim()
+        if (summaryText.isNotBlank()) {
+            add(summaryText)
+        }
+        if (triggerReason.isNotBlank()) {
+            add("Why: $triggerReason")
+        }
+        if (detail.isNotBlank() && detail != summaryText) {
+            add(detail)
+        }
+        if (sources.isNotEmpty()) {
+            add("Sources: ${sources.take(3).joinToString(" ")}")
+        }
+    }.joinToString("\n")
+        .take(1800)
+        .ifBlank { "Scheduled prompt matched:\n${job.aiInstruction}" }
+
+private fun String.extractFirstJsonObject(): JSONObject? {
+    val start = indexOf('{')
+    if (start < 0) return null
+    var depth = 0
+    var inString = false
+    var escaped = false
+    for (index in start until length) {
+        val char = this[index]
+        if (escaped) {
+            escaped = false
+            continue
+        }
+        if (char == '\\' && inString) {
+            escaped = true
+            continue
+        }
+        if (char == '"') {
+            inString = !inString
+            continue
+        }
+        if (inString) continue
+        when (char) {
+            '{' -> depth += 1
+            '}' -> {
+                depth -= 1
+                if (depth == 0) {
+                    return runCatching {
+                        JSONObject(substring(start, index + 1))
+                    }.getOrNull()
+                }
+            }
+        }
+    }
+    return null
 }
 
 class LmStudioClient(
@@ -5607,6 +5919,91 @@ class LmStudioClient(
                 .lastOrNull()
             (explicitDecision ?: lineDecision)
                 ?.uppercase(Locale.getDefault()) == "ALERT"
+        }
+    }
+
+    suspend fun evaluateWatchJobPrompt(
+        settingsStore: SettingsStore,
+        job: WatchJob,
+    ): WatchPromptResult = withContext(Dispatchers.IO) {
+        val apiUrl = settingsStore.apiUrl
+        val model = settingsStore.model.ifBlank {
+            throw IOException("Choose a loaded LM Studio model before scheduled prompt Watch Jobs can run.")
+        }
+        val resolvedModel = resolveNativeModelId(
+            apiUrl = apiUrl,
+            apiToken = settingsStore.apiToken,
+            preferredModel = model,
+        )
+        val integrationsJson = if (settingsStore.serverToolsEnabled) {
+            settingsStore.serverIntegrations.toIntegrationsJsonArray(settingsStore.allowedTools)
+        } else {
+            JSONArray()
+        }
+        val nowText = LocalDateTime.now()
+            .atZone(ZoneId.systemDefault())
+            .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z", Locale.getDefault()))
+        val systemPrompt = """
+            You are a scheduled alert evaluator for LMSMOB Chat.
+            Use available LM Studio server tools when the scheduled prompt needs current information.
+            For news, web pages, YouTube, or other live information, use web/search/fetch/transcript tools if they are available.
+            Choose ALERT only when the scheduled task finds a concrete, relevant result worth notifying the user about.
+            Choose IGNORE when there is no relevant result, the information is stale, the task is uncertain, or required tools are unavailable.
+            For ALERT, write a short summary of what you found and a short reason explaining why it triggered the user's scheduled prompt.
+            Return exactly one JSON object and no Markdown:
+            {"decision":"ALERT|IGNORE","title":"short notification title","summary":"1-2 short sentences describing what was found","why_triggered":"short reason this matched the user's prompt","detail":"optional extra key facts","sources":["https://source.example"]}
+        """.trimIndent()
+        val userPrompt = buildString {
+            appendLine("Current phone time: $nowText")
+            appendLine("Watch job title: ${job.title}")
+            appendLine("Alert mode requested by user: ${job.alertMode.watchAlertModeLabel()}")
+            appendLine()
+            appendLine("Scheduled prompt:")
+            appendLine(job.aiInstruction.ifBlank { "Run this scheduled check and alert only for a clear match." })
+            appendLine()
+            if (!settingsStore.serverToolsEnabled) {
+                appendLine("Server tools are disabled for this scheduled run. If the prompt requires live web access, choose IGNORE and explain that web tools are disabled in the detail.")
+            } else if (integrationsJson.length() == 0) {
+                appendLine("Server tools are enabled but no integrations are configured. If the prompt requires live web access, choose IGNORE and explain that no web integration is configured in the detail.")
+            }
+        }
+        val payload = JSONObject()
+            .put("model", resolvedModel)
+            .put("input", userPrompt)
+            .put("system_prompt", systemPrompt)
+            .put("integrations", integrationsJson)
+            .put("store", false)
+            .put("temperature", 0.2)
+
+        val request = Request.Builder()
+            .url(apiUrl.normalizedNativeApiUrl() + "/chat")
+            .withApiToken(settingsStore.apiToken)
+            .post(payload.toString().toRequestBody(jsonMediaType))
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            val body = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                throw IOException("LM Studio returned HTTP ${response.code}: ${body.take(160)}")
+            }
+            val responseJson = JSONObject(body)
+            val output = responseJson.optJSONArray("output") ?: JSONArray()
+            val messageContent = buildString {
+                for (index in 0 until output.length()) {
+                    val item = output.optJSONObject(index) ?: continue
+                    if (item.optString("type") == "message") {
+                        val content = item.optString("content").trim()
+                        if (content.isNotBlank()) {
+                            if (isNotBlank()) append("\n\n")
+                            append(content)
+                        }
+                    }
+                }
+            }
+            val content = messageContent.ifBlank {
+                parseNativeChatResponse(responseJson, resolvedModel).content
+            }
+            content.toWatchPromptResult(job)
         }
     }
 
@@ -8735,12 +9132,13 @@ private fun String.toTtsChunkPreview(): String =
 private fun TtsChunkId.toUtteranceId(): String =
     listOf(messageId, runId.toString(), index.toString()).joinToString(TtsChunkUtteranceSeparator)
 
-private fun TtsChunkId.toSynthesisUtteranceId(): String =
+private fun TtsChunkId.toSynthesisUtteranceId(attempt: Int = 0): String =
     listOf(
         TtsSynthesisUtterancePrefix,
         messageId,
         runId.toString(),
         index.toString(),
+        attempt.toString(),
     ).joinToString(TtsChunkUtteranceSeparator)
 
 private fun String.toTtsChunkId(): TtsChunkId? {
@@ -8753,7 +9151,7 @@ private fun String.toTtsChunkId(): TtsChunkId? {
 
 private fun String.toSynthesisTtsChunkId(): TtsChunkId? {
     val parts = split(TtsChunkUtteranceSeparator)
-    if (parts.size != 4 || parts[0] != TtsSynthesisUtterancePrefix) return null
+    if (parts.size !in 4..5 || parts[0] != TtsSynthesisUtterancePrefix) return null
     val runId = parts[2].toLongOrNull() ?: return null
     val index = parts[3].toIntOrNull() ?: return null
     return TtsChunkId(messageId = parts[1], runId = runId, index = index)
@@ -10003,7 +10401,7 @@ private fun WatchJobsSheet(
             )
             Text(
                 text = if (editingJobId == null) {
-                    "Create local monitors that alert you from captured notifications. Scheduled jobs scan the recent notification history."
+                    "Create local monitors for notifications, notification history, or scheduled LM Studio prompt checks."
                 } else {
                     "Editing a watch job. Save to update the stored filters and schedule."
                 },
@@ -10029,7 +10427,10 @@ private fun WatchJobsSheet(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(
                     selected = trigger == "notification",
-                    onClick = { trigger = "notification" },
+                    onClick = {
+                        trigger = "notification"
+                        if (matchMode == "prompt") matchMode = "ai"
+                    },
                     label = { Text("On notification") },
                 )
                 FilterChip(
@@ -10054,50 +10455,78 @@ private fun WatchJobsSheet(
                     onClick = { matchMode = "ai" },
                     label = { Text("AI") },
                 )
+                FilterChip(
+                    selected = matchMode == "prompt",
+                    onClick = {
+                        matchMode = "prompt"
+                        trigger = "schedule"
+                    },
+                    label = { Text("Prompt") },
+                )
             }
             Text(
-                text = if (matchMode == "ai") {
-                    "AI mode sends matching notifications to LM Studio and expects a strict ALERT or IGNORE decision."
-                } else {
-                    "Filter mode alerts when the local app, sender, and text filters match."
+                text = when (matchMode) {
+                    "ai" -> "AI mode sends matching notifications to LM Studio and expects a strict ALERT or IGNORE decision."
+                    "prompt" -> "Prompt mode runs this scheduled task through LM Studio. Enable Server tools when the task needs web search or fetching."
+                    else -> "Filter mode alerts when the local app, sender, and text filters match."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            OutlinedTextField(
-                value = appQuery,
-                onValueChange = { appQuery = it },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                label = { Text(if (matchMode == "ai") "App pre-filter (optional)" else "App filter") },
-                placeholder = { Text("Telegram") },
-            )
-            OutlinedTextField(
-                value = senderQuery,
-                onValueChange = { senderQuery = it },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                label = { Text(if (matchMode == "ai") "Sender pre-filter (optional)" else "Sender filter") },
-                placeholder = { Text("Mom") },
-            )
-            OutlinedTextField(
-                value = textQuery,
-                onValueChange = { textQuery = it },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                label = { Text(if (matchMode == "ai") "Text pre-filter (optional)" else "Text contains") },
-                placeholder = { Text("urgent") },
-            )
-            AnimatedVisibility(visible = matchMode == "ai") {
+            AnimatedVisibility(visible = matchMode != "prompt") {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    OutlinedTextField(
+                        value = appQuery,
+                        onValueChange = { appQuery = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text(if (matchMode == "ai") "App pre-filter (optional)" else "App filter") },
+                        placeholder = { Text("Telegram") },
+                    )
+                    OutlinedTextField(
+                        value = senderQuery,
+                        onValueChange = { senderQuery = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text(if (matchMode == "ai") "Sender pre-filter (optional)" else "Sender filter") },
+                        placeholder = { Text("Mom") },
+                    )
+                    OutlinedTextField(
+                        value = textQuery,
+                        onValueChange = { textQuery = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text(if (matchMode == "ai") "Text pre-filter (optional)" else "Text contains") },
+                        placeholder = { Text("urgent") },
+                    )
+                }
+            }
+            AnimatedVisibility(visible = matchMode == "ai" || matchMode == "prompt") {
                 OutlinedTextField(
                     value = aiInstruction,
                     onValueChange = { aiInstruction = it },
                     modifier = Modifier.fillMaxWidth(),
                     minLines = 3,
                     maxLines = 6,
-                    label = { Text("AI instruction") },
-                    placeholder = { Text("Alert me if this notification mentions an offer from company Mindylab.") },
-                    supportingText = { Text("Keep it specific. The model returns only ALERT or IGNORE.") },
+                    label = { Text(if (matchMode == "prompt") "Scheduled prompt" else "AI instruction") },
+                    placeholder = {
+                        Text(
+                            if (matchMode == "prompt") {
+                                "Search the web for new Lithuanian AI policy news. Alert only when a credible new item appears and include source URLs."
+                            } else {
+                                "Alert me if this notification mentions an offer from company Mindylab."
+                            },
+                        )
+                    },
+                    supportingText = {
+                        Text(
+                            if (matchMode == "prompt") {
+                                "The model returns ALERT or IGNORE plus notification title/detail. Server tools are used when enabled."
+                            } else {
+                                "Keep it specific. The model returns only ALERT or IGNORE."
+                            },
+                        )
+                    },
                 )
             }
             AnimatedVisibility(visible = trigger == "schedule") {
@@ -10195,14 +10624,18 @@ private fun WatchJobsSheet(
                 }
                 Button(
                     onClick = {
-                    if (matchMode == "ai" && aiInstruction.isBlank()) {
-                        localError = "Add AI instructions for AI mode."
-                        return@Button
-                    }
-                    if (matchMode == "filter" && listOf(appQuery, senderQuery, textQuery).all { it.isBlank() }) {
-                        localError = "Add at least one filter so the job does not alert on every notification."
-                        return@Button
-                    }
+                        if ((matchMode == "ai" || matchMode == "prompt") && aiInstruction.isBlank()) {
+                            localError = if (matchMode == "prompt") {
+                                "Add a scheduled prompt."
+                            } else {
+                                "Add AI instructions for AI mode."
+                            }
+                            return@Button
+                        }
+                        if (matchMode == "filter" && listOf(appQuery, senderQuery, textQuery).all { it.isBlank() }) {
+                            localError = "Add at least one filter so the job does not alert on every notification."
+                            return@Button
+                        }
                         localError = null
                         val jobId = editingJobId
                         if (jobId == null) {
@@ -10327,7 +10760,11 @@ private fun WatchJobCard(
                     )
                     Text(
                         text = if (job.trigger == "schedule") {
-                            "Every ${job.scheduleMinutes} min"
+                            if (job.matchMode.normalizedWatchMatchMode() == "prompt") {
+                                "Prompt every ${job.scheduleMinutes} min"
+                            } else {
+                                "Every ${job.scheduleMinutes} min"
+                            }
                         } else {
                             "On matching notification"
                         },
@@ -10360,13 +10797,19 @@ private fun WatchJobCard(
                 }
             }
             Text(
-                text = buildList {
-                    if (job.appQuery.isNotBlank()) add("App: ${job.appQuery}")
-                    if (job.senderQuery.isNotBlank()) add("Sender: ${job.senderQuery}")
-                    if (job.textQuery.isNotBlank()) add("Text: ${job.textQuery}")
-                }.joinToString("  |  ").ifBlank { "No filters" },
+                text = if (job.matchMode.normalizedWatchMatchMode() == "prompt") {
+                    "Prompt: ${job.aiInstruction}"
+                } else {
+                    buildList {
+                        if (job.appQuery.isNotBlank()) add("App: ${job.appQuery}")
+                        if (job.senderQuery.isNotBlank()) add("Sender: ${job.senderQuery}")
+                        if (job.textQuery.isNotBlank()) add("Text: ${job.textQuery}")
+                    }.joinToString("  |  ").ifBlank { "No filters" }
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = if (job.matchMode.normalizedWatchMatchMode() == "prompt") 2 else Int.MAX_VALUE,
+                overflow = TextOverflow.Ellipsis,
             )
             if (job.matchMode.normalizedWatchMatchMode() == "ai") {
                 Text(
@@ -10512,8 +10955,9 @@ private fun String.normalizedWatchLifetime(): String =
     }
 
 private fun String.normalizedWatchMatchMode(): String =
-    when (trim().lowercase(Locale.getDefault()).replace("_", "-")) {
+    when (trim().lowercase(Locale.getDefault()).replace("_", "-").replace(" ", "-")) {
         "ai", "model", "llm", "smart" -> "ai"
+        "prompt", "scheduled-prompt", "schedule-prompt", "scheduled-task", "task", "web", "internet", "news" -> "prompt"
         else -> "filter"
     }
 
@@ -10528,7 +10972,11 @@ private fun String.watchLifetimeLabel(): String =
     }
 
 private fun String.watchMatchModeLabel(): String =
-    if (normalizedWatchMatchMode() == "ai") "AI" else "Filters"
+    when (normalizedWatchMatchMode()) {
+        "ai" -> "AI"
+        "prompt" -> "Prompt"
+        else -> "Filters"
+    }
 
 private fun WatchJob.watchJobFiltersText(): String =
     buildList {
@@ -10545,7 +10993,10 @@ private fun WatchJob.watchJobToolDescription(): String =
         appendLine("Trigger: $trigger${if (trigger == "schedule") " every $scheduleMinutes minutes" else ""}")
         appendLine("Match mode: ${matchMode.watchMatchModeLabel()}")
         appendLine("Filters: ${watchJobFiltersText()}")
-        if (matchMode.normalizedWatchMatchMode() == "ai") appendLine("AI instruction: $aiInstruction")
+        when (matchMode.normalizedWatchMatchMode()) {
+            "ai" -> appendLine("AI instruction: $aiInstruction")
+            "prompt" -> appendLine("Scheduled prompt: $aiInstruction")
+        }
         appendLine("Alert mode: ${alertMode.watchAlertModeLabel()}")
         appendLine("Lifetime: ${lifetime.watchLifetimeLabel()}")
         appendLine("Matches: $matchCount")

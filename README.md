@@ -9,8 +9,8 @@ Android chat app for LM Studio. Connect your phone to an LM Studio server
 running on your PC and chat with local LLMs over your LAN. LMSMOB Chat is built
 for a local-first privacy workflow: your prompts and answers are processed by
 your LM Studio server on your own computer when you use local LM Studio models,
-and version 1.56 improves Supertonic TTS support so read-aloud can also run locally
-on your Android device.
+with local Supertonic read-aloud and scheduled prompt Watch Jobs for recurring
+LM Studio checks.
 
 [Download the latest APK](https://github.com/mindylab/lmsmob_chat/releases/latest)
 from the GitHub releases page.
@@ -54,10 +54,11 @@ from the GitHub releases page.
   digest, local file search, and device status.
 - Adds alarm tools for reading the next Android alarm, opening the Clock alarm
   screen, and preparing alarm creation drafts.
-- Adds Watch Jobs: local notification or scheduled monitors with filters or
-  LM Studio AI classification, normal notifications, alarm-style full-screen
-  alerts, once/today/no-end lifetimes, and confirmation before model-created
-  jobs are saved.
+- Adds Watch Jobs: local notification monitors, scheduled notification-history
+  checks, and scheduled LM Studio prompt checks with filters, AI classification,
+  server-tool support, normal notifications, alarm-style full-screen alerts,
+  once/today/no-end lifetimes, and confirmation before model-created jobs are
+  saved.
 - Shows source chips when answers include source links.
 - Exports Markdown tables from chat answers as XLSX files.
 - Appends a capability guide to prompts so the selected model knows which
@@ -86,12 +87,15 @@ MCP/plugin tools are opt-in and can change the privacy boundary. Local tools can
 stay on your PC, but web search, web fetch, YouTube transcript, maps, remote MCP,
 or other network tools may send the specific URLs, queries, or task data needed
 to external websites or services. Only enable integrations and allowed tools
-that you trust.
+that you trust. Scheduled prompt Watch Jobs use the configured LM Studio server
+and may use those same server tools when a recurring task needs current web or
+tool data.
 
 ## Roadmap
 
 The 2026 roadmap now builds on the first phone-assistant tools shipped in
-v1.28 and the Watch Jobs release in v1.40:
+v1.28, the Watch Jobs release in v1.40, and scheduled prompt Watch Jobs in
+v1.57:
 
 - Web tools already work through compatible LM Studio MCP/plugin setup, with a
   tested local-web MCP server available in
@@ -100,10 +104,11 @@ v1.28 and the Watch Jobs release in v1.40:
 - Maps route drafts, contact lookup, notification digest, local file search,
   device status, and confirmable phone action drafts are available now.
 - Alarm tools and Watch Jobs are available now for opt-in notification
-  monitors, scheduled checks, and stronger local alerts.
+  monitors, scheduled LM Studio prompt checks, and stronger local alerts.
 - Phone location tools are still planned with explicit Android permission
   controls.
-- Broader cron-style scheduled prompts and safe phone actions are still planned.
+- Broader cron-style task history, pause/resume controls, and safe follow-up
+  phone actions are still planned.
 - A signed release APK workflow is planned for wider distribution.
 
 See the full [2026 roadmap](docs/roadmap-2026.md).

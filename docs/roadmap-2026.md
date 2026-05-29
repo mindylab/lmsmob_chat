@@ -27,6 +27,8 @@ allowlisted, and sensitive phone actions should require clear user control.
 - Version 1.40 adds Watch Jobs for local notification or scheduled monitoring,
   filter or LM Studio AI matching, normal notifications, full-screen alarm
   alerts, and once/today/no-end lifetimes.
+- Version 1.57 adds scheduled prompt Watch Jobs that run recurring LM Studio
+  checks and can use configured server tools for web/news tasks.
 - Version 1.40 adds an optional capability guide so prompts include the current
   model, server-tool, phone-tool, document, voice, vision, and date/time
   capabilities enabled in the app.
@@ -39,8 +41,8 @@ allowlisted, and sensitive phone actions should require clear user control.
 - Add a first-run tool setup guide for LM Studio MCP/plugin integrations.
 - Document supported web tool IDs and recommended allowlists.
 - Improve release packaging with a signed release APK workflow.
-- Polish v1.40 Watch Jobs, alarm permissions, and release notes based on early
-  tester feedback.
+- Polish Watch Jobs, scheduled prompt checks, alarm permissions, and release
+  notes based on early tester feedback.
 
 ## Q3 2026
 
@@ -58,8 +60,8 @@ allowlisted, and sensitive phone actions should require clear user control.
 ## Q4 2026
 
 - Cron-style scheduled tasks:
-  - Build on Watch Jobs with broader scheduled prompts and task workflows.
-  - Allow scheduled prompts to run against LM Studio when the phone is online.
+  - Build on scheduled prompt Watch Jobs with broader task workflows.
+  - Improve recurring LM Studio checks with clearer task history and run status.
   - Support simple phone actions after confirmation, such as opening an app,
     copying text, or preparing a message.
   - Add task history, pause/resume, and safe failure notifications.

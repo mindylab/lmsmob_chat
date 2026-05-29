@@ -10,8 +10,9 @@ server running on your PC.
 
 It supports LM Studio's OpenAI-compatible API, chat history, model refresh,
 vision/image attachments for supported models, LM Studio server tools/MCP
-integrations through `/api/v1/chat`, voice input/output, document sharing,
-alarm tools, Watch Jobs, and opt-in phone assistant tools.
+integrations through `/api/v1/chat`, local Supertonic read-aloud, document
+sharing, alarm tools, scheduled prompt Watch Jobs, and opt-in phone assistant
+tools.
 
 GitHub:
 https://github.com/mindylab/lmsmob_chat
@@ -39,14 +40,15 @@ What it supports:
 - JSON import/export for chat history
 - Image attachments for vision-capable models
 - Android share-sheet import for text, images, PDFs, DOC/DOCX, and XLS/XLSX
-- Optional voice input and read-aloud answers
+- Optional voice input and local Supertonic read-aloud answers
 - Confirmable phone tools for map routes, URL opening, email/SMS drafts,
   calls, calendar/reminder drafts, contacts, notifications, local file search,
   and device status
 - Alarm tools for reading the next alarm, opening Clock, and preparing alarm
   drafts
-- Watch Jobs for local notification or scheduled monitors with filters, LM
-  Studio AI classification, normal alerts, or alarm-style full-screen alerts
+- Watch Jobs for local notification monitors, scheduled LM Studio prompt checks,
+  filters, LM Studio AI classification, normal alerts, or alarm-style
+  full-screen alerts
 - Advanced generation settings and context usage estimates
 - Emulator default URL and physical-device LAN setup
 
