@@ -48,7 +48,10 @@ from the GitHub releases page.
   attachments for vision-capable models.
 - Adds optional voice input, text-to-speech output, automatic answer read-aloud,
   Supertonic TTS engine selection, and chunked local playback controls for long
-  assistant answers.
+  assistant answers. For best performance, use the
+  [MindyLab optimized Supertonic Android engine](https://github.com/mindylab/supersonic_android_all/releases/latest),
+  which includes service isolation and request-level processing controls used by
+  LMSMOB Chat.
 - Provides opt-in phone assistant tools for URL opening, map routes, email/SMS
   drafts, phone dialing, calendar/reminder drafts, contact lookup, notification
   digest, local file search, and device status.
@@ -80,8 +83,11 @@ Voice privacy is also improved when using Supertonic TTS: assistant answers can
 be spoken by the Supertonic Android TTS engine locally on your phone, instead of
 depending on a cloud text-to-speech provider. LMSMOB Chat can split long answers
 into local playback chunks, with quality and buffering controls for smoother
-read-aloud. If you choose the Android system TTS engine, privacy depends on the
-TTS engine selected in Android settings.
+read-aloud. The
+[MindyLab optimized Supertonic Android engine](https://github.com/mindylab/supersonic_android_all/releases/latest)
+is recommended for better long-answer processing. If you choose the Android
+system TTS engine, privacy depends on the TTS engine selected in Android
+settings.
 
 MCP/plugin tools are opt-in and can change the privacy boundary. Local tools can
 stay on your PC, but web search, web fetch, YouTube transcript, maps, remote MCP,
