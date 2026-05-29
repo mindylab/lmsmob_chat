@@ -20,6 +20,7 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.pdf.PdfRenderer
 import android.media.AudioAttributes
+import android.media.MediaPlayer
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.net.ConnectivityManager
@@ -51,6 +52,7 @@ import android.speech.tts.Voice
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Base64
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -172,7 +174,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
@@ -196,6 +200,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -206,6 +211,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -229,6 +235,7 @@ import java.util.concurrent.TimeUnit
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
+import kotlin.math.roundToInt
 import java.util.zip.ZipOutputStream
 
 private const val DefaultApiUrl = "http://10.0.2.2:1234/v1"
@@ -269,8 +276,22 @@ private const val VoiceOutputEngineSupertonic = "supertonic"
 private const val VoiceOutputLanguageEngineDefault = "engine_default"
 private const val VoiceOutputLanguageDevice = "device"
 private const val VoiceOutputLanguageLithuanian = "lt"
+private const val SupertonicTtsQualityParam = "com.brahmadeo.supertonic.tts.DIFFUSION_STEPS"
+private const val SupertonicTtsQualityParamShort = "diffusion_steps"
 private const val SupertonicTtsEnginePackage = "com.brahmadeo.supertonic.tts"
 private const val SupertonicTtsInstallUrl = "https://f-droid.org/en/packages/com.brahmadeo.supertonic.tts/"
+private const val VoiceOutputDefaultChunkChars = 420
+private const val VoiceOutputMinChunkChars = 220
+private const val VoiceOutputMaxChunkChars = 900
+private const val VoiceOutputChunkStepChars = 20
+private const val VoiceOutputDefaultStartBufferChunks = 2
+private const val VoiceOutputMinStartBufferChunks = 1
+private const val VoiceOutputMaxStartBufferChunks = 3
+private const val VoiceOutputSynthesisTimeoutMs = 60000L
+private const val VoiceOutputPreparedWaitTimeoutMs = 65000L
+private const val TtsChunkUtteranceSeparator = "::lmsmob_tts_chunk::"
+private const val TtsSynthesisUtterancePrefix = "synth"
+private const val TtsLogTag = "LMSMOB_TTS"
 
 private data class VoiceOutputLanguageOption(
     val tag: String,
@@ -453,11 +474,19 @@ class MainActivity : ComponentActivity() {
                 val mainHandler = remember { Handler(Looper.getMainLooper()) }
                 var ttsReady by remember { mutableStateOf(false) }
                 var speakingMessageId by remember { mutableStateOf<String?>(null) }
+                var ttsPlaybackJob by remember { mutableStateOf<Job?>(null) }
+                var ttsMediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+                val ttsSynthesisResults = remember { mutableMapOf<String, CompletableDeferred<Boolean>>() }
+                var ttsPlaybackState by remember { mutableStateOf<TtsPlaybackState?>(null) }
+                val ttsRunCounter = remember { AtomicLong(0L) }
                 var ttsVoiceOptions by remember { mutableStateOf<List<VoiceOutputVoiceOption>>(emptyList()) }
                 val selectedTtsEnginePackage = state.voiceOutputEngine.voiceOutputEnginePackageName()
                 val selectedTtsLanguage = state.voiceOutputLanguage.normalizedVoiceOutputLanguage()
                 val selectedTtsVoiceName = state.voiceOutputVoiceName.trim()
                 val selectedTtsSpeed = state.voiceOutputSpeed.normalizedVoiceOutputSpeed()
+                val selectedTtsQuality = state.voiceOutputQuality.normalizedVoiceOutputQuality()
+                val selectedTtsChunkSize = state.voiceOutputChunkSize.normalizedVoiceOutputChunkSize()
+                val selectedTtsStartBuffer = state.voiceOutputStartBuffer.normalizedVoiceOutputStartBuffer()
                 val selectedTtsEngineAvailable = selectedTtsEnginePackage
                     ?.let { context.isPackageInstalled(it) }
                     ?: true
@@ -476,26 +505,57 @@ class MainActivity : ComponentActivity() {
                 DisposableEffect(textToSpeech) {
                     textToSpeech.setOnUtteranceProgressListener(
                         object : UtteranceProgressListener() {
-                            override fun onStart(utteranceId: String?) = Unit
+                            override fun onStart(utteranceId: String?) {
+                                mainHandler.post {
+                                    val chunkId = utteranceId?.toSynthesisTtsChunkId()
+                                    if (chunkId != null) {
+                                        ttsPlaybackState = ttsPlaybackState?.withChunkStatus(
+                                            chunkId,
+                                            TtsChunkStatus.Preparing,
+                                        )
+                                    }
+                                }
+                            }
 
                             override fun onDone(utteranceId: String?) {
                                 mainHandler.post {
-                                    if (speakingMessageId == utteranceId) {
-                                        speakingMessageId = null
+                                    val chunkId = utteranceId?.toSynthesisTtsChunkId()
+                                    if (chunkId == null) {
+                                        return@post
                                     }
+                                    val pendingResult = ttsSynthesisResults.remove(utteranceId)
+                                        ?: return@post
+                                    pendingResult.complete(true)
+                                    ttsPlaybackState = ttsPlaybackState?.withChunkStatus(
+                                        chunkId,
+                                        TtsChunkStatus.Ready,
+                                    )
                                 }
                             }
 
                             override fun onError(utteranceId: String?) {
                                 mainHandler.post {
-                                    if (speakingMessageId == utteranceId) {
-                                        speakingMessageId = null
+                                    val chunkId = utteranceId?.toSynthesisTtsChunkId()
+                                    if (chunkId == null) {
+                                        return@post
                                     }
+                                    val pendingResult = ttsSynthesisResults.remove(utteranceId)
+                                        ?: return@post
+                                    pendingResult.complete(false)
+                                    ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(
+                                        chunkId,
+                                        TtsChunkStatus.Error,
+                                    )
                                 }
                             }
                         },
                     )
                     onDispose {
+                        ttsPlaybackJob?.cancel()
+                        ttsMediaPlayer?.release()
+                        ttsMediaPlayer = null
+                        ttsSynthesisResults.values.forEach { it.complete(false) }
+                        ttsSynthesisResults.clear()
                         textToSpeech.stop()
                         textToSpeech.shutdown()
                     }
@@ -508,13 +568,21 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 fun stopSpeaking() {
+                    ttsPlaybackJob?.cancel()
+                    ttsMediaPlayer?.release()
+                    ttsMediaPlayer = null
+                    ttsSynthesisResults.values.forEach { it.complete(false) }
+                    ttsSynthesisResults.clear()
                     textToSpeech.stop()
                     speakingMessageId = null
+                    ttsPlaybackState = null
                 }
                 fun speakAssistantMessage(messageId: String, content: String) {
                     if (!state.voiceOutputEnabled) return
                     val text = content.speakableAnswerText()
                     if (text.isBlank()) return
+                    val chunks = text.toVoiceOutputChunks(selectedTtsChunkSize)
+                    if (chunks.isEmpty()) return
                     if (!selectedTtsEngineAvailable) {
                         viewModel.showError("Supertonic TTS engine is not installed. Install it or switch Voice output engine back to System.")
                         return
@@ -551,17 +619,189 @@ class MainActivity : ComponentActivity() {
                             return
                         }
                     }
-                    val result = textToSpeech.speak(
-                        text,
-                        TextToSpeech.QUEUE_FLUSH,
-                        null,
-                        messageId,
+                    val ttsParams = Bundle().apply {
+                        putInt(SupertonicTtsQualityParam, selectedTtsQuality)
+                        putInt(SupertonicTtsQualityParamShort, selectedTtsQuality)
+                    }
+
+                    ttsPlaybackJob?.cancel()
+                    ttsMediaPlayer?.release()
+                    ttsMediaPlayer = null
+                    ttsSynthesisResults.values.forEach { it.complete(false) }
+                    ttsSynthesisResults.clear()
+                    val runId = ttsRunCounter.incrementAndGet()
+                    ttsPlaybackState = TtsPlaybackState(
+                        messageId = messageId,
+                        runId = runId,
+                        chunks = chunks.mapIndexed { index, chunk ->
+                            TtsChunkProgress(
+                                index = index,
+                                preview = chunk.toTtsChunkPreview(),
+                                charCount = chunk.length,
+                            )
+                        },
                     )
-                    if (result == TextToSpeech.ERROR) {
-                        speakingMessageId = null
-                        viewModel.showError("Could not start text-to-speech on this device.")
-                    } else {
+
+                    fun chunkFile(index: Int): File =
+                        File(context.cacheDir, "lmsmob-tts-$runId-$index.wav")
+
+                    suspend fun synthesizeChunk(index: Int): File? {
+                        val chunkId = TtsChunkId(messageId = messageId, runId = runId, index = index)
+                        val file = chunkFile(index)
+                        if (file.exists()) file.delete()
+                        val utteranceId = chunkId.toSynthesisUtteranceId()
+                        val done = CompletableDeferred<Boolean>()
+                        ttsSynthesisResults[utteranceId] = done
+                        ttsPlaybackState = ttsPlaybackState?.withChunkStatus(chunkId, TtsChunkStatus.Preparing)
+                        val result = textToSpeech.synthesizeToFile(
+                            chunks[index],
+                            Bundle(ttsParams),
+                            file,
+                            utteranceId,
+                        )
+                        if (result == TextToSpeech.ERROR) {
+                            ttsSynthesisResults.remove(utteranceId)
+                            ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
+                            return null
+                        }
+                        val success = withTimeoutOrNull(VoiceOutputSynthesisTimeoutMs) {
+                            done.await()
+                        }
+                        ttsSynthesisResults.remove(utteranceId)
+                        return if (success == true && file.exists() && file.length() > 0L) {
+                            file
+                        } else {
+                            if (success == null) {
+                                Log.w(
+                                    TtsLogTag,
+                                    "Timed out while synthesizing TTS chunk ${index + 1} of ${chunks.size}",
+                                )
+                                textToSpeech.stop()
+                            }
+                            done.complete(false)
+                            ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
+                            file.delete()
+                            null
+                        }
+                    }
+
+                    suspend fun playPreparedChunk(index: Int, file: File): Boolean {
+                        val chunkId = TtsChunkId(messageId = messageId, runId = runId, index = index)
+                        val done = CompletableDeferred<Boolean>()
+                        ttsPlaybackState = ttsPlaybackState?.withChunkStatus(chunkId, TtsChunkStatus.Playing)
                         speakingMessageId = messageId
+                        val player = MediaPlayer()
+                        ttsMediaPlayer = player
+                        player.setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .build(),
+                        )
+                        player.setOnCompletionListener { completedPlayer ->
+                            completedPlayer.release()
+                            if (ttsMediaPlayer === completedPlayer) ttsMediaPlayer = null
+                            ttsPlaybackState = ttsPlaybackState?.withChunkStatus(chunkId, TtsChunkStatus.Complete)
+                            done.complete(true)
+                        }
+                        player.setOnErrorListener { errorPlayer, _, _ ->
+                            errorPlayer.release()
+                            if (ttsMediaPlayer === errorPlayer) ttsMediaPlayer = null
+                            ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
+                            done.complete(false)
+                            true
+                        }
+                        return runCatching {
+                            player.setDataSource(file.absolutePath)
+                            player.prepare()
+                            player.start()
+                        }.fold(
+                            onSuccess = { done.await() },
+                            onFailure = {
+                                player.release()
+                                if (ttsMediaPlayer === player) ttsMediaPlayer = null
+                                ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
+                                false
+                            },
+                        )
+                    }
+
+                    ttsPlaybackJob = uiScope.launch {
+                        val preparedFiles = mutableMapOf<Int, File>()
+                        val preparedSignals = chunks.indices.associateWith {
+                            CompletableDeferred<File?>()
+                        }
+                        var producerJob: Job? = null
+                        fun isCurrentRun(): Boolean {
+                            val currentPlayback = ttsPlaybackState
+                            return currentPlayback?.messageId == messageId &&
+                                currentPlayback.runId == runId
+                        }
+                        suspend fun synthesizeAndStore(index: Int): Boolean {
+                            val file = synthesizeChunk(index)
+                            if (file != null) preparedFiles[index] = file
+                            preparedSignals[index]?.complete(file)
+                            return file != null
+                        }
+                        suspend fun preparedFileFor(index: Int): File? {
+                            preparedFiles.remove(index)?.let { return it }
+                            return withTimeoutOrNull(VoiceOutputPreparedWaitTimeoutMs) {
+                                preparedSignals[index]?.await()
+                            }
+                        }
+                        fun startProducer(fromIndex: Int) {
+                            if (fromIndex !in chunks.indices) return
+                            producerJob = launch {
+                                for (index in fromIndex until chunks.size) {
+                                    if (!isCurrentRun()) return@launch
+                                    if (!synthesizeAndStore(index)) return@launch
+                                }
+                            }
+                        }
+                        try {
+                            val preloadCount = chunks.size.coerceAtMost(selectedTtsStartBuffer)
+                            repeat(preloadCount) { index ->
+                                if (!isCurrentRun()) return@launch
+                                if (!synthesizeAndStore(index)) {
+                                    speakingMessageId = null
+                                    viewModel.showError("Could not prepare text-to-speech chunk ${index + 1}.")
+                                    return@launch
+                                }
+                            }
+                            startProducer(preloadCount)
+                            speakingMessageId = messageId
+                            for (index in chunks.indices) {
+                                if (!isCurrentRun()) return@launch
+                                val file = preparedFileFor(index)
+                                if (file == null) {
+                                    speakingMessageId = null
+                                    viewModel.showError("Could not prepare text-to-speech chunk ${index + 1}.")
+                                    return@launch
+                                }
+                                val played = playPreparedChunk(index, file)
+                                file.delete()
+                                if (!played) {
+                                    speakingMessageId = null
+                                    viewModel.showError("Could not play text-to-speech chunk ${index + 1}.")
+                                    return@launch
+                                }
+                            }
+                            speakingMessageId = null
+                        } catch (cancelled: CancellationException) {
+                            preparedFiles.values.forEach { it.delete() }
+                            producerJob?.cancel()
+                            throw cancelled
+                        } finally {
+                            producerJob?.cancel()
+                            preparedFiles.values.forEach { it.delete() }
+                            preparedSignals.values.forEach { signal ->
+                                if (!signal.isCompleted) signal.complete(null)
+                            }
+                            ttsMediaPlayer?.release()
+                            ttsMediaPlayer = null
+                            ttsSynthesisResults.values.forEach { it.complete(false) }
+                            ttsSynthesisResults.clear()
+                        }
                     }
                 }
                 var speechRecognizer by remember { mutableStateOf<SpeechRecognizer?>(null) }
@@ -676,6 +916,9 @@ class MainActivity : ComponentActivity() {
                     state.voiceOutputLanguage,
                     state.voiceOutputVoiceName,
                     state.voiceOutputSpeed,
+                    state.voiceOutputQuality,
+                    state.voiceOutputChunkSize,
+                    state.voiceOutputStartBuffer,
                     state.autoReadAnswersEnabled,
                 ) {
                     val lastMessage = state.messages.lastOrNull()
@@ -817,6 +1060,9 @@ class MainActivity : ComponentActivity() {
                     onVoiceOutputLanguageChange = viewModel::updateVoiceOutputLanguage,
                     onVoiceOutputVoiceChange = viewModel::updateVoiceOutputVoiceName,
                     onVoiceOutputSpeedChange = viewModel::updateVoiceOutputSpeed,
+                    onVoiceOutputQualityChange = viewModel::updateVoiceOutputQuality,
+                    onVoiceOutputChunkSizeChange = viewModel::updateVoiceOutputChunkSize,
+                    onVoiceOutputStartBufferChange = viewModel::updateVoiceOutputStartBuffer,
                     voiceOutputVoiceOptions = ttsVoiceOptions,
                     onAutoReadAnswersEnabledChange = viewModel::updateAutoReadAnswersEnabled,
                     onAppendCapabilityGuideToSystemPromptChange = viewModel::updateAppendCapabilityGuideToSystemPrompt,
@@ -864,6 +1110,7 @@ class MainActivity : ComponentActivity() {
                     onSpeakMessage = ::speakAssistantMessage,
                     onStopSpeaking = ::stopSpeaking,
                     speakingMessageId = speakingMessageId,
+                    ttsPlaybackState = ttsPlaybackState,
                     onClearImage = viewModel::clearAttachments,
                     onRefreshModels = { viewModel.refreshModels(silent = false) },
                     onExportChats = { exportLauncher.launch("lm-studio-chat-history.json") },
@@ -1021,6 +1268,64 @@ data class ChatMessage(
     val isStreaming: Boolean = false,
 )
 
+enum class TtsChunkStatus {
+    Pending,
+    Preparing,
+    Ready,
+    Queued,
+    Playing,
+    Complete,
+    Error,
+}
+
+data class TtsChunkProgress(
+    val index: Int,
+    val preview: String,
+    val charCount: Int,
+    val status: TtsChunkStatus = TtsChunkStatus.Pending,
+) {
+    val railWeight: Float = charCount.coerceAtLeast(1).toFloat()
+}
+
+data class TtsPlaybackState(
+    val messageId: String,
+    val runId: Long,
+    val chunks: List<TtsChunkProgress>,
+) {
+    fun withChunkStatus(chunkId: TtsChunkId, status: TtsChunkStatus): TtsPlaybackState {
+        if (messageId != chunkId.messageId || runId != chunkId.runId) return this
+        return copy(
+            chunks = chunks.map { chunk ->
+                if (chunk.index == chunkId.index) chunk.copy(status = status) else chunk
+            },
+        )
+    }
+
+    fun withChunksFromStatus(chunkId: TtsChunkId, status: TtsChunkStatus): TtsPlaybackState {
+        if (messageId != chunkId.messageId || runId != chunkId.runId) return this
+        return copy(
+            chunks = chunks.map { chunk ->
+                if (chunk.index >= chunkId.index && chunk.status != TtsChunkStatus.Complete) {
+                    chunk.copy(status = status)
+                } else {
+                    chunk
+                }
+            },
+        )
+    }
+
+    fun isFinished(): Boolean =
+        chunks.all { chunk ->
+            chunk.status == TtsChunkStatus.Complete || chunk.status == TtsChunkStatus.Error
+        }
+}
+
+data class TtsChunkId(
+    val messageId: String,
+    val runId: Long,
+    val index: Int,
+)
+
 data class ChatImageAttachment(
     val dataUrl: String = "",
     val remoteUrl: String = "",
@@ -1107,6 +1412,9 @@ data class ChatUiState(
     val voiceOutputLanguage: String = VoiceOutputLanguageEngineDefault,
     val voiceOutputVoiceName: String = "",
     val voiceOutputSpeed: Float = 1f,
+    val voiceOutputQuality: Int = 5,
+    val voiceOutputChunkSize: Int = VoiceOutputDefaultChunkChars,
+    val voiceOutputStartBuffer: Int = VoiceOutputDefaultStartBufferChunks,
     val autoReadAnswersEnabled: Boolean = false,
     val appendCapabilityGuideToSystemPrompt: Boolean = true,
     val appendDateTimeToSystemPrompt: Boolean = false,
@@ -1203,6 +1511,9 @@ class ChatViewModel(
             voiceOutputLanguage = settingsStore.voiceOutputLanguage,
             voiceOutputVoiceName = settingsStore.voiceOutputVoiceName,
             voiceOutputSpeed = settingsStore.voiceOutputSpeed,
+            voiceOutputQuality = settingsStore.voiceOutputQuality,
+            voiceOutputChunkSize = settingsStore.voiceOutputChunkSize,
+            voiceOutputStartBuffer = settingsStore.voiceOutputStartBuffer,
             autoReadAnswersEnabled = settingsStore.autoReadAnswersEnabled,
             appendCapabilityGuideToSystemPrompt = settingsStore.appendCapabilityGuideToSystemPrompt,
             appendDateTimeToSystemPrompt = settingsStore.appendDateTimeToSystemPrompt,
@@ -2376,6 +2687,24 @@ class ChatViewModel(
         _uiState.update { it.copy(voiceOutputSpeed = normalized) }
     }
 
+    fun updateVoiceOutputQuality(value: Int) {
+        val normalized = value.normalizedVoiceOutputQuality()
+        settingsStore.voiceOutputQuality = normalized
+        _uiState.update { it.copy(voiceOutputQuality = normalized) }
+    }
+
+    fun updateVoiceOutputChunkSize(value: Int) {
+        val normalized = value.normalizedVoiceOutputChunkSize()
+        settingsStore.voiceOutputChunkSize = normalized
+        _uiState.update { it.copy(voiceOutputChunkSize = normalized) }
+    }
+
+    fun updateVoiceOutputStartBuffer(value: Int) {
+        val normalized = value.normalizedVoiceOutputStartBuffer()
+        settingsStore.voiceOutputStartBuffer = normalized
+        _uiState.update { it.copy(voiceOutputStartBuffer = normalized) }
+    }
+
     fun updateAutoReadAnswersEnabled(value: Boolean) {
         settingsStore.autoReadAnswersEnabled = value
         _uiState.update { it.copy(autoReadAnswersEnabled = value) }
@@ -2812,6 +3141,36 @@ class SettingsStore(context: Context) {
         get() = preferences.getFloat("voice_output_speed", 1f).normalizedVoiceOutputSpeed()
         set(value) {
             preferences.edit().putFloat("voice_output_speed", value.normalizedVoiceOutputSpeed()).apply()
+        }
+
+    var voiceOutputQuality: Int
+        get() = preferences.getInt("voice_output_quality", 5).normalizedVoiceOutputQuality()
+        set(value) {
+            preferences.edit().putInt("voice_output_quality", value.normalizedVoiceOutputQuality()).apply()
+        }
+
+    var voiceOutputChunkSize: Int
+        get() = preferences.getInt(
+            "voice_output_chunk_size",
+            VoiceOutputDefaultChunkChars,
+        ).normalizedVoiceOutputChunkSize()
+        set(value) {
+            preferences.edit().putInt(
+                "voice_output_chunk_size",
+                value.normalizedVoiceOutputChunkSize(),
+            ).apply()
+        }
+
+    var voiceOutputStartBuffer: Int
+        get() = preferences.getInt(
+            "voice_output_start_buffer",
+            VoiceOutputDefaultStartBufferChunks,
+        ).normalizedVoiceOutputStartBuffer()
+        set(value) {
+            preferences.edit().putInt(
+                "voice_output_start_buffer",
+                value.normalizedVoiceOutputStartBuffer(),
+            ).apply()
         }
 
     var autoReadAnswersEnabled: Boolean
@@ -3413,7 +3772,7 @@ private fun ChatUiState.capabilityGuideSystemPrompt(): String {
         appendLine("- [$visionStatus] Image understanding: ${if (selectedModelSupportsVision()) "the selected model reports vision support, so the user can attach camera/gallery images." else "the selected model does not report vision support; ask the user to select a vision-capable model before image analysis."}")
         appendLine("- [$reasoningStatus] Thinking toggle: ${if (selectedModelSupportsReasoningToggle()) "the selected model supports on/off reasoning control." else "the selected model does not expose an on/off reasoning control."}")
         appendLine("- [${voiceInputEnabled.status()}] Voice input: user-facing speech-to-text for prompts. You do not directly listen; the app transcribes when the user presses the mic.")
-        appendLine("- [${voiceOutputEnabled.status()}] Voice output (${voiceOutputEngine.voiceOutputEngineLabel()}, ${voiceOutputLanguage.voiceOutputLanguageLabel()}, ${voiceOutputVoiceName.ifBlank { "default voice" }}, ${voiceOutputSpeed.voiceOutputSpeedLabel()}): user-facing text-to-speech for assistant answers. You do not directly speak; the app reads answers aloud when enabled.")
+        appendLine("- [${voiceOutputEnabled.status()}] Voice output (${voiceOutputEngine.voiceOutputEngineLabel()}, ${voiceOutputLanguage.voiceOutputLanguageLabel()}, ${voiceOutputVoiceName.ifBlank { "default voice" }}, ${voiceOutputSpeed.voiceOutputSpeedLabel()}, ${voiceOutputQuality.voiceOutputQualityLabel()}, ${voiceOutputChunkSize.voiceOutputChunkSizeLabel()} chunks, ${voiceOutputStartBuffer.voiceOutputStartBufferLabel()} start buffer): user-facing text-to-speech for assistant answers. You do not directly speak; the app reads answers aloud when enabled.")
         appendLine("- [${autoReadAnswersEnabled.status()}] Auto-read answers: the app can read completed replies aloud when voice output is enabled.")
         appendLine("- [${appendDateTimeToSystemPrompt.status()}] Current date/time in prompt: ${if (appendDateTimeToSystemPrompt) "the app appends the phone date/time separately." else "not appended; ask the user to enable it if exact current phone time matters."}")
         appendLine("- [ENABLED] Chat management UI: the user can search chats, copy/edit/delete messages, delete chats, and import/export history in the app UI. Do not claim to operate these UI controls yourself.")
@@ -6069,6 +6428,26 @@ private fun Float.normalizedVoiceOutputSpeed(): Float =
 private fun Float.voiceOutputSpeedLabel(): String =
     "${String.format(Locale.US, "%.2f", normalizedVoiceOutputSpeed())}x"
 
+private fun Int.normalizedVoiceOutputQuality(): Int =
+    coerceIn(1, 10)
+
+private fun Int.voiceOutputQualityLabel(): String =
+    "${normalizedVoiceOutputQuality()} steps"
+
+private fun Int.normalizedVoiceOutputChunkSize(): Int {
+    val rounded = (this.toFloat() / VoiceOutputChunkStepChars).roundToInt() * VoiceOutputChunkStepChars
+    return rounded.coerceIn(VoiceOutputMinChunkChars, VoiceOutputMaxChunkChars)
+}
+
+private fun Int.voiceOutputChunkSizeLabel(): String =
+    "${normalizedVoiceOutputChunkSize()} chars"
+
+private fun Int.normalizedVoiceOutputStartBuffer(): Int =
+    coerceIn(VoiceOutputMinStartBufferChunks, VoiceOutputMaxStartBufferChunks)
+
+private fun Int.voiceOutputStartBufferLabel(): String =
+    "${normalizedVoiceOutputStartBuffer()} chunks"
+
 private fun Voice.toVoiceOutputVoiceOption(): VoiceOutputVoiceOption {
     val languageTag = locale.toLanguageTag()
     val speaker = name.substringAfter("-supertonic-", name)
@@ -6497,6 +6876,9 @@ fun LmStudioApp(
     onVoiceOutputLanguageChange: (String) -> Unit,
     onVoiceOutputVoiceChange: (String) -> Unit,
     onVoiceOutputSpeedChange: (Float) -> Unit,
+    onVoiceOutputQualityChange: (Int) -> Unit,
+    onVoiceOutputChunkSizeChange: (Int) -> Unit,
+    onVoiceOutputStartBufferChange: (Int) -> Unit,
     voiceOutputVoiceOptions: List<VoiceOutputVoiceOption>,
     onAutoReadAnswersEnabledChange: (Boolean) -> Unit,
     onAppendCapabilityGuideToSystemPromptChange: (Boolean) -> Unit,
@@ -6528,6 +6910,7 @@ fun LmStudioApp(
     onSpeakMessage: (String, String) -> Unit,
     onStopSpeaking: () -> Unit,
     speakingMessageId: String?,
+    ttsPlaybackState: TtsPlaybackState?,
     onClearImage: () -> Unit,
     onRefreshModels: () -> Unit,
     onExportChats: () -> Unit,
@@ -6586,6 +6969,9 @@ fun LmStudioApp(
             onVoiceOutputLanguageChange = onVoiceOutputLanguageChange,
             onVoiceOutputVoiceChange = onVoiceOutputVoiceChange,
             onVoiceOutputSpeedChange = onVoiceOutputSpeedChange,
+            onVoiceOutputQualityChange = onVoiceOutputQualityChange,
+            onVoiceOutputChunkSizeChange = onVoiceOutputChunkSizeChange,
+            onVoiceOutputStartBufferChange = onVoiceOutputStartBufferChange,
             voiceOutputVoiceOptions = voiceOutputVoiceOptions,
             onAutoReadAnswersEnabledChange = onAutoReadAnswersEnabledChange,
             onAppendCapabilityGuideToSystemPromptChange = onAppendCapabilityGuideToSystemPromptChange,
@@ -6738,6 +7124,7 @@ fun LmStudioApp(
                 onSpeakMessage = onSpeakMessage,
                 onStopSpeaking = onStopSpeaking,
                 speakingMessageId = speakingMessageId,
+                ttsPlaybackState = ttsPlaybackState,
             )
         }
     }
@@ -7277,6 +7664,7 @@ private fun MessagesPanel(
     onSpeakMessage: (String, String) -> Unit,
     onStopSpeaking: () -> Unit,
     speakingMessageId: String?,
+    ttsPlaybackState: TtsPlaybackState?,
 ) {
     val listState = rememberLazyListState()
     var pendingDeleteMessage by remember { mutableStateOf<ChatMessage?>(null) }
@@ -7331,6 +7719,7 @@ private fun MessagesPanel(
                 onSpeakMessage = onSpeakMessage,
                 onStopSpeaking = onStopSpeaking,
                 speakingMessageId = speakingMessageId,
+                ttsPlaybackState = ttsPlaybackState?.takeIf { it.messageId == message.id },
             )
         }
 
@@ -7471,9 +7860,12 @@ private fun MessageRow(
     onSpeakMessage: (String, String) -> Unit,
     onStopSpeaking: () -> Unit,
     speakingMessageId: String?,
+    ttsPlaybackState: TtsPlaybackState?,
 ) {
     val isUser = message.role == MessageRole.User
     val context = LocalContext.current
+    val density = LocalDensity.current
+    var messageContentHeight by remember(message.id, message.content) { mutableStateOf(0.dp) }
     var previewAttachment by remember(message.id) { mutableStateOf<ChatImageAttachment?>(null) }
 
     Row(
@@ -7533,11 +7925,48 @@ private fun MessageRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(modifier = Modifier.height(4.dp))
-                SelectionContainer {
-                    MessageContent(
-                        content = message.content,
-                        isStreaming = message.isStreaming,
-                    )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    val visibleTtsPlaybackState = ttsPlaybackState
+                        ?.takeIf { it.chunks.size > 1 }
+                    val chunkMarkerHeightModifier = if (messageContentHeight > 0.dp) {
+                        Modifier.height(messageContentHeight)
+                    } else {
+                        Modifier.heightIn(min = 28.dp)
+                    }
+                    if (visibleTtsPlaybackState != null) {
+                        TtsChunkProgressRail(
+                            playbackState = visibleTtsPlaybackState,
+                            modifier = chunkMarkerHeightModifier
+                                .padding(top = 2.dp, bottom = 2.dp),
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .onGloballyPositioned { coordinates ->
+                                messageContentHeight = with(density) {
+                                    coordinates.size.height.toDp()
+                                }
+                            },
+                    ) {
+                        SelectionContainer {
+                            MessageContent(
+                                content = message.content,
+                                isStreaming = message.isStreaming,
+                            )
+                        }
+                    }
+                    if (visibleTtsPlaybackState != null) {
+                        TtsActiveChunkMarker(
+                            playbackState = visibleTtsPlaybackState,
+                            modifier = chunkMarkerHeightModifier
+                                .padding(top = 2.dp, bottom = 2.dp),
+                        )
+                    }
                 }
                 if (message.attachments.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(8.dp))
@@ -7571,6 +8000,72 @@ private fun MessageRow(
         )
     }
 }
+
+@Composable
+private fun TtsChunkProgressRail(
+    playbackState: TtsPlaybackState,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .width(5.dp)
+            .heightIn(min = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        playbackState.chunks.forEach { chunk ->
+            Box(
+                modifier = Modifier
+                    .width(5.dp)
+                    .weight(chunk.railWeight)
+                    .clip(RoundedCornerShape(50.dp))
+                    .background(chunk.status.chunkStatusColor()),
+            )
+        }
+    }
+}
+
+@Composable
+private fun TtsActiveChunkMarker(
+    playbackState: TtsPlaybackState,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .width(4.dp)
+            .heightIn(min = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        playbackState.chunks.forEach { chunk ->
+            Box(
+                modifier = Modifier
+                    .width(4.dp)
+                    .weight(chunk.railWeight)
+                    .clip(RoundedCornerShape(50.dp))
+                    .background(
+                        if (chunk.status == TtsChunkStatus.Playing) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            Color.Transparent
+                        },
+                    ),
+            )
+        }
+    }
+}
+
+@Composable
+private fun TtsChunkStatus.chunkStatusColor(): Color =
+    when (this) {
+        TtsChunkStatus.Pending -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f)
+        TtsChunkStatus.Preparing -> MaterialTheme.colorScheme.secondary.copy(alpha = 0.62f)
+        TtsChunkStatus.Ready -> MaterialTheme.colorScheme.tertiary.copy(alpha = 0.78f)
+        TtsChunkStatus.Queued -> MaterialTheme.colorScheme.tertiary.copy(alpha = 0.58f)
+        TtsChunkStatus.Playing -> MaterialTheme.colorScheme.primary
+        TtsChunkStatus.Complete -> Color(0xFF4CCB7F)
+        TtsChunkStatus.Error -> MaterialTheme.colorScheme.error
+    }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -8166,6 +8661,103 @@ private fun String.speakableAnswerText(): String =
         .replace(Regex("\\|\\s*:?-{3,}:?\\s*"), " ")
         .replace(Regex("[ \\t]{2,}"), " ")
         .trim()
+
+private fun String.toVoiceOutputChunks(targetChars: Int = VoiceOutputDefaultChunkChars): List<String> {
+    val normalizedTargetChars = targetChars.normalizedVoiceOutputChunkSize()
+    val normalized = replace("\r\n", "\n")
+        .replace(Regex("[ \\t]+"), " ")
+        .replace(Regex("\\n{3,}"), "\n\n")
+        .trim()
+    if (normalized.isBlank()) return emptyList()
+
+    val segments = normalized
+        .split(Regex("(?<=[.!?…])\\s+|\\n+"))
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .flatMap { it.splitLongVoiceOutputSegment(normalizedTargetChars) }
+
+    val chunks = mutableListOf<String>()
+    val current = StringBuilder()
+    fun flush() {
+        val chunk = current.toString().trim()
+        if (chunk.isNotBlank()) chunks += chunk
+        current.clear()
+    }
+
+    segments.forEach { segment ->
+        if (current.isEmpty()) {
+            current.append(segment)
+        } else if (current.length + 1 + segment.length <= normalizedTargetChars) {
+            current.append(' ').append(segment)
+        } else {
+            flush()
+            current.append(segment)
+        }
+        if (current.length >= normalizedTargetChars) {
+            flush()
+        }
+    }
+    flush()
+
+    return chunks
+}
+
+private fun String.splitLongVoiceOutputSegment(maxChars: Int): List<String> {
+    if (length <= maxChars) return listOf(this)
+    val chunks = mutableListOf<String>()
+    val current = StringBuilder()
+    split(Regex("\\s+")).forEach { word ->
+        if (word.length > maxChars) {
+            if (current.isNotBlank()) {
+                chunks += current.toString().trim()
+                current.clear()
+            }
+            word.chunked(maxChars).forEach { chunks += it }
+        } else if (current.isEmpty()) {
+            current.append(word)
+        } else if (current.length + 1 + word.length <= maxChars) {
+            current.append(' ').append(word)
+        } else {
+            chunks += current.toString().trim()
+            current.clear()
+            current.append(word)
+        }
+    }
+    if (current.isNotBlank()) chunks += current.toString().trim()
+    return chunks
+}
+
+private fun String.toTtsChunkPreview(): String =
+    replace(Regex("\\s+"), " ")
+        .trim()
+        .let { value -> if (value.length <= 80) value else "${value.take(77)}..." }
+
+private fun TtsChunkId.toUtteranceId(): String =
+    listOf(messageId, runId.toString(), index.toString()).joinToString(TtsChunkUtteranceSeparator)
+
+private fun TtsChunkId.toSynthesisUtteranceId(): String =
+    listOf(
+        TtsSynthesisUtterancePrefix,
+        messageId,
+        runId.toString(),
+        index.toString(),
+    ).joinToString(TtsChunkUtteranceSeparator)
+
+private fun String.toTtsChunkId(): TtsChunkId? {
+    val parts = split(TtsChunkUtteranceSeparator)
+    if (parts.size != 3) return null
+    val runId = parts[1].toLongOrNull() ?: return null
+    val index = parts[2].toIntOrNull() ?: return null
+    return TtsChunkId(messageId = parts[0], runId = runId, index = index)
+}
+
+private fun String.toSynthesisTtsChunkId(): TtsChunkId? {
+    val parts = split(TtsChunkUtteranceSeparator)
+    if (parts.size != 4 || parts[0] != TtsSynthesisUtterancePrefix) return null
+    val runId = parts[2].toLongOrNull() ?: return null
+    val index = parts[3].toIntOrNull() ?: return null
+    return TtsChunkId(messageId = parts[1], runId = runId, index = index)
+}
 
 private fun Int.speechRecognitionMessage(): String =
     when (this) {
@@ -10040,6 +10632,9 @@ private fun SettingsSheet(
     onVoiceOutputLanguageChange: (String) -> Unit,
     onVoiceOutputVoiceChange: (String) -> Unit,
     onVoiceOutputSpeedChange: (Float) -> Unit,
+    onVoiceOutputQualityChange: (Int) -> Unit,
+    onVoiceOutputChunkSizeChange: (Int) -> Unit,
+    onVoiceOutputStartBufferChange: (Int) -> Unit,
     voiceOutputVoiceOptions: List<VoiceOutputVoiceOption>,
     onAutoReadAnswersEnabledChange: (Boolean) -> Unit,
     onAppendCapabilityGuideToSystemPromptChange: (Boolean) -> Unit,
@@ -10667,6 +11262,75 @@ private fun SettingsSheet(
                         onValueChange = onVoiceOutputSpeedChange,
                         valueRange = 0.5f..2.0f,
                         steps = 5,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Text(
+                            text = "Quality",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = state.voiceOutputQuality.voiceOutputQualityLabel(),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Slider(
+                        value = state.voiceOutputQuality.normalizedVoiceOutputQuality().toFloat(),
+                        onValueChange = { onVoiceOutputQualityChange(it.roundToInt()) },
+                        valueRange = 1f..10f,
+                        steps = 8,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Text(
+                            text = "Chunk size",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = state.voiceOutputChunkSize.voiceOutputChunkSizeLabel(),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Slider(
+                        value = state.voiceOutputChunkSize.normalizedVoiceOutputChunkSize().toFloat(),
+                        onValueChange = { onVoiceOutputChunkSizeChange(it.roundToInt()) },
+                        valueRange = VoiceOutputMinChunkChars.toFloat()..VoiceOutputMaxChunkChars.toFloat(),
+                        steps = ((VoiceOutputMaxChunkChars - VoiceOutputMinChunkChars) / VoiceOutputChunkStepChars) - 1,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Text(
+                            text = "Start buffer",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = state.voiceOutputStartBuffer.voiceOutputStartBufferLabel(),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Slider(
+                        value = state.voiceOutputStartBuffer.normalizedVoiceOutputStartBuffer().toFloat(),
+                        onValueChange = { onVoiceOutputStartBufferChange(it.roundToInt()) },
+                        valueRange = VoiceOutputMinStartBufferChunks.toFloat()..VoiceOutputMaxStartBufferChunks.toFloat(),
+                        steps = (VoiceOutputMaxStartBufferChunks - VoiceOutputMinStartBufferChunks) - 1,
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Row(

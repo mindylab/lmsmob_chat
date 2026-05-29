@@ -9,7 +9,7 @@ Android chat app for LM Studio. Connect your phone to an LM Studio server
 running on your PC and chat with local LLMs over your LAN. LMSMOB Chat is built
 for a local-first privacy workflow: your prompts and answers are processed by
 your LM Studio server on your own computer when you use local LM Studio models,
-and version 1.55 adds Supertonic TTS support so read-aloud can also run locally
+and version 1.56 improves Supertonic TTS support so read-aloud can also run locally
 on your Android device.
 
 [Download the latest APK](https://github.com/mindylab/lmsmob_chat/releases/latest)
@@ -47,7 +47,8 @@ from the GitHub releases page.
 - Converts supported documents into text, and can render PDFs as image
   attachments for vision-capable models.
 - Adds optional voice input, text-to-speech output, automatic answer read-aloud,
-  and Supertonic TTS engine selection for local on-device speech output.
+  Supertonic TTS engine selection, and chunked local playback controls for long
+  assistant answers.
 - Provides opt-in phone assistant tools for URL opening, map routes, email/SMS
   drafts, phone dialing, calendar/reminder drafts, contact lookup, notification
   digest, local file search, and device status.
@@ -76,8 +77,10 @@ share, or delete it.
 
 Voice privacy is also improved when using Supertonic TTS: assistant answers can
 be spoken by the Supertonic Android TTS engine locally on your phone, instead of
-depending on a cloud text-to-speech provider. If you choose the Android system
-TTS engine, privacy depends on the TTS engine selected in Android settings.
+depending on a cloud text-to-speech provider. LMSMOB Chat can split long answers
+into local playback chunks, with quality and buffering controls for smoother
+read-aloud. If you choose the Android system TTS engine, privacy depends on the
+TTS engine selected in Android settings.
 
 MCP/plugin tools are opt-in and can change the privacy boundary. Local tools can
 stay on your PC, but web search, web fetch, YouTube transcript, maps, remote MCP,

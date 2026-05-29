@@ -58,11 +58,11 @@ jobs:
           LMSMOB Chat is an Android client for LM Studio local models.
 
           Highlights:
-          - Voice output engine selector for System TTS or Supertonic TTS.
-          - Voice output language selector covering Supertonic-supported languages, including Lithuanian.
-          - Speaker voice picker and read-aloud speed control.
-          - In-app Supertonic install path and Android TTS settings shortcut.
-          - Capability prompt now reports the active voice engine, language, voice, and speed.
+          - Chunked text-to-speech playback for long assistant answers.
+          - Progressive TTS preparation and playback indicators in chat messages.
+          - Supertonic TTS quality, chunk size, and start-buffer controls.
+          - Local on-device voice output path when using the Supertonic Android TTS engine.
+          - Capability prompt now reports active voice quality, chunk size, and start buffer.
           - Tested with the MindyLab LM Studio tools repository.
 
           Demo: https://youtu.be/mtZJ2uDz3hY
