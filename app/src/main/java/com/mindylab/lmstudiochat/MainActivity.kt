@@ -67,6 +67,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
@@ -98,6 +99,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.ClickableText
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -119,6 +121,8 @@ import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Refresh
@@ -179,6 +183,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -189,6 +194,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -241,6 +247,9 @@ import java.util.zip.ZipOutputStream
 
 private const val DefaultApiUrl = "http://10.0.2.2:1234/v1"
 private const val LegacyDefaultSystemPrompt = "You are a helpful assistant running locally through LM Studio."
+private const val LegacyTranslateLtPresetId = "translate_lt"
+private const val ChatAppendPresetSampleName = "Summarize"
+private const val ChatAppendPresetSampleText = "summarize this text"
 private val DefaultSystemPrompt = """
     You are LMSMOB Chat, a polite, practical assistant running locally through LM Studio on the user's Android device.
 
@@ -489,6 +498,7 @@ class MainActivity : ComponentActivity() {
                 val mainHandler = remember { Handler(Looper.getMainLooper()) }
                 var ttsReady by remember { mutableStateOf(false) }
                 var speakingMessageId by remember { mutableStateOf<String?>(null) }
+                var ttsPaused by remember { mutableStateOf(false) }
                 var ttsPlaybackJob by remember { mutableStateOf<Job?>(null) }
                 var ttsMediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
                 val ttsSynthesisResults = remember { mutableMapOf<String, CompletableDeferred<Boolean>>() }
@@ -569,6 +579,7 @@ class MainActivity : ComponentActivity() {
                         ttsPlaybackJob?.cancel()
                         ttsMediaPlayer?.release()
                         ttsMediaPlayer = null
+                        ttsPaused = false
                         ttsSynthesisResults.values.forEach { it.complete(false) }
                         ttsSynthesisResults.clear()
                         textToSpeech.stop()
@@ -586,11 +597,30 @@ class MainActivity : ComponentActivity() {
                     ttsPlaybackJob?.cancel()
                     ttsMediaPlayer?.release()
                     ttsMediaPlayer = null
+                    ttsPaused = false
                     ttsSynthesisResults.values.forEach { it.complete(false) }
                     ttsSynthesisResults.clear()
                     textToSpeech.stop()
                     speakingMessageId = null
                     ttsPlaybackState = null
+                }
+                fun pauseSpeaking() {
+                    val player = ttsMediaPlayer ?: return
+                    runCatching {
+                        if (player.isPlaying) {
+                            player.pause()
+                            ttsPaused = true
+                        }
+                    }
+                }
+                fun resumeSpeaking() {
+                    val player = ttsMediaPlayer ?: return
+                    runCatching {
+                        player.start()
+                        ttsPaused = false
+                    }.onFailure {
+                        viewModel.showError("Could not resume text-to-speech playback.")
+                    }
                 }
                 fun speakAssistantMessage(messageId: String, content: String) {
                     if (!state.voiceOutputEnabled) return
@@ -644,6 +674,7 @@ class MainActivity : ComponentActivity() {
                     ttsPlaybackJob?.cancel()
                     ttsMediaPlayer?.release()
                     ttsMediaPlayer = null
+                    ttsPaused = false
                     ttsSynthesisResults.values.forEach { it.complete(false) }
                     ttsSynthesisResults.clear()
                     val runId = ttsRunCounter.incrementAndGet()
@@ -751,12 +782,14 @@ class MainActivity : ComponentActivity() {
                         player.setOnCompletionListener { completedPlayer ->
                             completedPlayer.release()
                             if (ttsMediaPlayer === completedPlayer) ttsMediaPlayer = null
+                            ttsPaused = false
                             ttsPlaybackState = ttsPlaybackState?.withChunkStatus(chunkId, TtsChunkStatus.Complete)
                             done.complete(true)
                         }
                         player.setOnErrorListener { errorPlayer, _, _ ->
                             errorPlayer.release()
                             if (ttsMediaPlayer === errorPlayer) ttsMediaPlayer = null
+                            ttsPaused = false
                             ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
                             done.complete(false)
                             true
@@ -770,6 +803,7 @@ class MainActivity : ComponentActivity() {
                             onFailure = {
                                 player.release()
                                 if (ttsMediaPlayer === player) ttsMediaPlayer = null
+                                ttsPaused = false
                                 ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
                                 false
                             },
@@ -849,6 +883,7 @@ class MainActivity : ComponentActivity() {
                             }
                             ttsMediaPlayer?.release()
                             ttsMediaPlayer = null
+                            ttsPaused = false
                             ttsSynthesisResults.values.forEach { it.complete(false) }
                             ttsSynthesisResults.clear()
                         }
@@ -1125,6 +1160,13 @@ class MainActivity : ComponentActivity() {
                     onSystemProfileSelect = viewModel::selectSystemProfile,
                     onSystemProfileNameChange = viewModel::updateSystemProfileNameDraft,
                     onSystemPromptChange = viewModel::updateSystemPromptDraft,
+                    onChatAppendPresetApply = viewModel::applyChatAppendPreset,
+                    onChatAppendPresetSelect = viewModel::selectChatAppendPreset,
+                    onChatAppendPresetNameChange = viewModel::updateChatAppendPresetNameDraft,
+                    onChatAppendPresetTextChange = viewModel::updateChatAppendPresetTextDraft,
+                    onChatAppendPresetSave = viewModel::saveChatAppendPreset,
+                    onChatAppendPresetCreate = viewModel::createChatAppendPreset,
+                    onChatAppendPresetDelete = viewModel::deleteChatAppendPreset,
                     onTemperatureChange = viewModel::updateTemperature,
                     onTopPChange = viewModel::updateTopP,
                     onMaxTokensChange = viewModel::updateMaxTokens,
@@ -1159,7 +1201,10 @@ class MainActivity : ComponentActivity() {
                     isListening = isListening,
                     onSpeakMessage = ::speakAssistantMessage,
                     onStopSpeaking = ::stopSpeaking,
+                    onPauseSpeaking = ::pauseSpeaking,
+                    onResumeSpeaking = ::resumeSpeaking,
                     speakingMessageId = speakingMessageId,
+                    ttsPaused = ttsPaused,
                     ttsPlaybackState = ttsPlaybackState,
                     onClearImage = viewModel::clearAttachments,
                     onRefreshModels = { viewModel.refreshModels(silent = false) },
@@ -1418,6 +1463,12 @@ data class SystemPromptProfile(
     val prompt: String,
 )
 
+data class ChatAppendPreset(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String,
+    val template: String,
+)
+
 data class GenerationSettings(
     val temperature: Double? = 0.7,
     val topP: Double? = null,
@@ -1479,6 +1530,10 @@ data class ChatUiState(
     val activeSystemProfileId: String = DefaultSystemProfileId,
     val systemProfileNameDraft: String = "Default",
     val systemPromptDraft: String = DefaultSystemPrompt,
+    val chatAppendPresets: List<ChatAppendPreset> = emptyList(),
+    val activeChatAppendPresetId: String = "",
+    val chatAppendPresetNameDraft: String = ChatAppendPresetSampleName,
+    val chatAppendPresetTextDraft: String = ChatAppendPresetSampleText,
     val temperatureDraft: String = "0.7",
     val topPDraft: String = "",
     val maxTokensDraft: String = "",
@@ -1530,6 +1585,10 @@ class ChatViewModel(
     private val initialProfiles = settingsStore.loadSystemProfiles()
     private val initialActiveProfile = initialProfiles.firstOrNull { it.id == settingsStore.activeSystemProfileId }
         ?: initialProfiles.first()
+    private val initialChatAppendPresets = settingsStore.loadChatAppendPresets()
+    private val initialActiveChatAppendPreset = initialChatAppendPresets
+        .firstOrNull { it.id == settingsStore.activeChatAppendPresetId }
+        ?: initialChatAppendPresets.firstOrNull()
 
     private val _uiState = MutableStateFlow(
         ChatUiState(
@@ -1579,6 +1638,10 @@ class ChatViewModel(
             activeSystemProfileId = initialActiveProfile.id,
             systemProfileNameDraft = initialActiveProfile.name,
             systemPromptDraft = initialActiveProfile.prompt,
+            chatAppendPresets = initialChatAppendPresets,
+            activeChatAppendPresetId = initialActiveChatAppendPreset?.id.orEmpty(),
+            chatAppendPresetNameDraft = initialActiveChatAppendPreset?.name ?: ChatAppendPresetSampleName,
+            chatAppendPresetTextDraft = initialActiveChatAppendPreset?.template ?: ChatAppendPresetSampleText,
             reasoningEnabled = settingsStore.reasoningEnabled,
         ),
     )
@@ -1591,12 +1654,22 @@ class ChatViewModel(
         settingsStore.saveChatFolders(initialFolders)
         settingsStore.activeSystemProfileId = initialActiveProfile.id
         settingsStore.saveSystemProfiles(initialProfiles)
+        settingsStore.activeChatAppendPresetId = initialActiveChatAppendPreset?.id.orEmpty()
+        settingsStore.saveChatAppendPresets(initialChatAppendPresets)
         WatchJobStore.load(settingsStore.context).forEach { WatchJobRunner.schedule(settingsStore.context, it) }
         refreshModels(silent = true)
     }
 
     fun updateInput(value: String) {
         _uiState.update { it.copy(input = value) }
+    }
+
+    fun applyChatAppendPreset(presetId: String) {
+        _uiState.update { current ->
+            val preset = current.chatAppendPresets.firstOrNull { it.id == presetId }
+                ?: return@update current
+            current.copy(input = preset.applyToChatText(current.input))
+        }
     }
 
     fun receiveSharedText(value: String) {
@@ -2921,6 +2994,105 @@ class ChatViewModel(
         }
     }
 
+    fun selectChatAppendPreset(presetId: String) {
+        val preset = _uiState.value.chatAppendPresets.firstOrNull { it.id == presetId } ?: return
+        settingsStore.activeChatAppendPresetId = preset.id
+        _uiState.update {
+            it.copy(
+                activeChatAppendPresetId = preset.id,
+                chatAppendPresetNameDraft = preset.name,
+                chatAppendPresetTextDraft = preset.template,
+            )
+        }
+    }
+
+    fun updateChatAppendPresetNameDraft(value: String) {
+        _uiState.update { it.copy(chatAppendPresetNameDraft = value) }
+    }
+
+    fun updateChatAppendPresetTextDraft(value: String) {
+        _uiState.update { it.copy(chatAppendPresetTextDraft = value) }
+    }
+
+    fun saveChatAppendPreset() {
+        val state = _uiState.value
+        val name = state.chatAppendPresetNameDraft.trim().ifBlank { ChatAppendPresetSampleName }
+        val template = state.chatAppendPresetTextDraft.trim().ifBlank { ChatAppendPresetSampleText }
+        val activeId = state.activeChatAppendPresetId.ifBlank { UUID.randomUUID().toString() }
+        val preset = ChatAppendPreset(
+            id = activeId,
+            name = name,
+            template = template,
+        )
+        val presets = state.chatAppendPresets.map {
+            if (it.id == activeId) preset else it
+        }.let { updated ->
+            if (updated.any { it.id == activeId }) updated else updated + preset
+        }
+        settingsStore.activeChatAppendPresetId = preset.id
+        settingsStore.saveChatAppendPresets(presets)
+        _uiState.update {
+            it.copy(
+                chatAppendPresets = presets,
+                activeChatAppendPresetId = preset.id,
+                chatAppendPresetNameDraft = preset.name,
+                chatAppendPresetTextDraft = preset.template,
+            )
+        }
+    }
+
+    fun createChatAppendPreset() {
+        val preset = ChatAppendPreset(
+            name = ChatAppendPresetSampleName,
+            template = ChatAppendPresetSampleText,
+        )
+        val presets = _uiState.value.chatAppendPresets + preset
+        settingsStore.activeChatAppendPresetId = preset.id
+        settingsStore.saveChatAppendPresets(presets)
+        _uiState.update {
+            it.copy(
+                chatAppendPresets = presets,
+                activeChatAppendPresetId = preset.id,
+                chatAppendPresetNameDraft = preset.name,
+                chatAppendPresetTextDraft = preset.template,
+            )
+        }
+    }
+
+    fun deleteChatAppendPreset(presetId: String) {
+        val state = _uiState.value
+        val presets = state.chatAppendPresets.filterNot { it.id == presetId }
+        if (presets.size == state.chatAppendPresets.size) return
+        if (presets.isEmpty()) {
+            settingsStore.activeChatAppendPresetId = ""
+            settingsStore.saveChatAppendPresets(emptyList())
+            _uiState.update {
+                it.copy(
+                    chatAppendPresets = emptyList(),
+                    activeChatAppendPresetId = "",
+                    chatAppendPresetNameDraft = ChatAppendPresetSampleName,
+                    chatAppendPresetTextDraft = ChatAppendPresetSampleText,
+                )
+            }
+            return
+        }
+        val activePreset = if (state.activeChatAppendPresetId == presetId) {
+            presets.first()
+        } else {
+            presets.firstOrNull { it.id == state.activeChatAppendPresetId } ?: presets.first()
+        }
+        settingsStore.activeChatAppendPresetId = activePreset.id
+        settingsStore.saveChatAppendPresets(presets)
+        _uiState.update {
+            it.copy(
+                chatAppendPresets = presets,
+                activeChatAppendPresetId = activePreset.id,
+                chatAppendPresetNameDraft = activePreset.name,
+                chatAppendPresetTextDraft = activePreset.template,
+            )
+        }
+    }
+
     fun updateReasoningEnabled(value: Boolean) {
         settingsStore.reasoningEnabled = value
         _uiState.update { it.copy(reasoningEnabled = value) }
@@ -3324,6 +3496,12 @@ class SettingsStore(context: Context) {
             preferences.edit().putString("active_system_profile_id", value).apply()
         }
 
+    var activeChatAppendPresetId: String
+        get() = preferences.getString("active_chat_append_preset_id", "").orEmpty()
+        set(value) {
+            preferences.edit().putString("active_chat_append_preset_id", value).apply()
+        }
+
     fun loadChatSessions(): List<ChatSession> =
         runCatching {
             chatSessionsFromJson(preferences.getString("chat_history", "").orEmpty())
@@ -3364,6 +3542,17 @@ class SettingsStore(context: Context) {
             .apply()
     }
 
+    fun loadChatAppendPresets(): List<ChatAppendPreset> =
+        runCatching {
+            chatAppendPresetsFromJson(preferences.getString("chat_append_presets", "").orEmpty())
+        }.getOrDefault(defaultChatAppendPresets())
+
+    fun saveChatAppendPresets(presets: List<ChatAppendPreset>) {
+        preferences.edit()
+            .putString("chat_append_presets", chatAppendPresetsToJson(presets))
+            .apply()
+    }
+
     companion object {
         fun defaultSystemProfiles(): List<SystemPromptProfile> =
             listOf(
@@ -3373,6 +3562,45 @@ class SettingsStore(context: Context) {
                     prompt = DefaultSystemPrompt,
                 ),
             )
+
+        fun defaultChatAppendPresets(): List<ChatAppendPreset> = emptyList()
+
+        fun chatAppendPresetsToJson(presets: List<ChatAppendPreset>): String {
+            val presetsJson = JSONArray()
+            presets.forEach { preset ->
+                presetsJson.put(
+                    JSONObject()
+                        .put("id", preset.id)
+                        .put("name", preset.name)
+                        .put("template", preset.template),
+                )
+            }
+            return JSONObject()
+                .put("version", 1)
+                .put("presets", presetsJson)
+                .toString()
+        }
+
+        fun chatAppendPresetsFromJson(json: String): List<ChatAppendPreset> {
+            if (json.isBlank()) return defaultChatAppendPresets()
+            val presetsJson = JSONObject(json).optJSONArray("presets") ?: JSONArray()
+            val presets = buildList {
+                for (index in 0 until presetsJson.length()) {
+                    val presetJson = presetsJson.optJSONObject(index) ?: continue
+                    add(
+                        ChatAppendPreset(
+                            id = presetJson.optString("id").ifBlank { UUID.randomUUID().toString() },
+                            name = presetJson.optString("name").ifBlank { "Preset ${index + 1}" },
+                            template = presetJson.optString("template")
+                                .ifBlank { presetJson.optString("text") }
+                                .ifBlank { ChatAppendPresetSampleText },
+                        ),
+                    )
+                }
+            }
+            return presets
+                .filterNot { it.isLegacyTranslateLtPreset() }
+        }
 
         fun systemProfilesToJson(profiles: List<SystemPromptProfile>): String {
             val profilesJson = JSONArray()
@@ -4128,6 +4356,19 @@ private fun Context.openUrl(url: String) {
         Toast.makeText(this, "Could not open link", Toast.LENGTH_SHORT).show()
     }
 }
+
+private fun ChatAppendPreset.applyToChatText(chatText: String): String {
+    val baseText = chatText.trimEnd()
+    val appendText = template.trim()
+    if (appendText.isBlank()) return chatText
+    if (baseText.isBlank()) return appendText
+    return "$baseText $appendText"
+}
+
+private fun ChatAppendPreset.isLegacyTranslateLtPreset(): Boolean =
+    id == LegacyTranslateLtPresetId &&
+        name == "Translate LT" &&
+        template == "{chat text} translate text to Lithuanian language"
 
 private suspend fun prepareIncomingShareIntent(
     context: Context,
@@ -7288,6 +7529,13 @@ fun LmStudioApp(
     onSystemProfileSelect: (String) -> Unit,
     onSystemProfileNameChange: (String) -> Unit,
     onSystemPromptChange: (String) -> Unit,
+    onChatAppendPresetApply: (String) -> Unit,
+    onChatAppendPresetSelect: (String) -> Unit,
+    onChatAppendPresetNameChange: (String) -> Unit,
+    onChatAppendPresetTextChange: (String) -> Unit,
+    onChatAppendPresetSave: () -> Unit,
+    onChatAppendPresetCreate: () -> Unit,
+    onChatAppendPresetDelete: (String) -> Unit,
     onTemperatureChange: (String) -> Unit,
     onTopPChange: (String) -> Unit,
     onMaxTokensChange: (String) -> Unit,
@@ -7306,7 +7554,10 @@ fun LmStudioApp(
     isListening: Boolean,
     onSpeakMessage: (String, String) -> Unit,
     onStopSpeaking: () -> Unit,
+    onPauseSpeaking: () -> Unit,
+    onResumeSpeaking: () -> Unit,
     speakingMessageId: String?,
+    ttsPaused: Boolean,
     ttsPlaybackState: TtsPlaybackState?,
     onClearImage: () -> Unit,
     onRefreshModels: () -> Unit,
@@ -7377,6 +7628,12 @@ fun LmStudioApp(
             onSystemProfileSelect = onSystemProfileSelect,
             onSystemProfileNameChange = onSystemProfileNameChange,
             onSystemPromptChange = onSystemPromptChange,
+            onChatAppendPresetSelect = onChatAppendPresetSelect,
+            onChatAppendPresetNameChange = onChatAppendPresetNameChange,
+            onChatAppendPresetTextChange = onChatAppendPresetTextChange,
+            onChatAppendPresetSave = onChatAppendPresetSave,
+            onChatAppendPresetCreate = onChatAppendPresetCreate,
+            onChatAppendPresetDelete = onChatAppendPresetDelete,
             onTemperatureChange = onTemperatureChange,
             onTopPChange = onTopPChange,
             onMaxTokensChange = onMaxTokensChange,
@@ -7507,6 +7764,7 @@ fun LmStudioApp(
                     isListening = isListening,
                     onClearImage = onClearImage,
                     onReasoningEnabledChange = onReasoningEnabledChange,
+                    onChatAppendPresetApply = onChatAppendPresetApply,
                     onDismissError = onDismissError,
                 )
             },
@@ -7520,7 +7778,10 @@ fun LmStudioApp(
                 onDeleteMessage = onDeleteMessage,
                 onSpeakMessage = onSpeakMessage,
                 onStopSpeaking = onStopSpeaking,
+                onPauseSpeaking = onPauseSpeaking,
+                onResumeSpeaking = onResumeSpeaking,
                 speakingMessageId = speakingMessageId,
+                ttsPaused = ttsPaused,
                 ttsPlaybackState = ttsPlaybackState,
             )
         }
@@ -8060,7 +8321,10 @@ private fun MessagesPanel(
     onDeleteMessage: (String) -> Unit,
     onSpeakMessage: (String, String) -> Unit,
     onStopSpeaking: () -> Unit,
+    onPauseSpeaking: () -> Unit,
+    onResumeSpeaking: () -> Unit,
     speakingMessageId: String?,
+    ttsPaused: Boolean,
     ttsPlaybackState: TtsPlaybackState?,
 ) {
     val listState = rememberLazyListState()
@@ -8115,7 +8379,10 @@ private fun MessagesPanel(
                 voiceOutputEnabled = state.voiceOutputEnabled,
                 onSpeakMessage = onSpeakMessage,
                 onStopSpeaking = onStopSpeaking,
+                onPauseSpeaking = onPauseSpeaking,
+                onResumeSpeaking = onResumeSpeaking,
                 speakingMessageId = speakingMessageId,
+                ttsPaused = ttsPaused,
                 ttsPlaybackState = ttsPlaybackState?.takeIf { it.messageId == message.id },
             )
         }
@@ -8256,7 +8523,10 @@ private fun MessageRow(
     voiceOutputEnabled: Boolean,
     onSpeakMessage: (String, String) -> Unit,
     onStopSpeaking: () -> Unit,
+    onPauseSpeaking: () -> Unit,
+    onResumeSpeaking: () -> Unit,
     speakingMessageId: String?,
+    ttsPaused: Boolean,
     ttsPlaybackState: TtsPlaybackState?,
 ) {
     val isUser = message.role == MessageRole.User
@@ -8307,11 +8577,14 @@ private fun MessageRow(
                     canDelete = !message.isStreaming,
                     canSpeak = false,
                     isSpeaking = false,
+                    isSpeechPaused = false,
                     onCopy = { context.copyToClipboard(message.content) },
                     onEdit = { onEditMessage(message.id) },
                     onDelete = { onDeleteMessage(message.id) },
                     onSpeak = {},
                     onStopSpeaking = {},
+                    onPauseSpeaking = {},
+                    onResumeSpeaking = {},
                 )
             }
         } else {
@@ -8380,11 +8653,14 @@ private fun MessageRow(
                         !message.isStreaming &&
                         message.content.speakableAnswerText().isNotBlank(),
                     isSpeaking = speakingMessageId == message.id,
+                    isSpeechPaused = ttsPaused && speakingMessageId == message.id,
                     onCopy = { context.copyToClipboard(message.content) },
                     onEdit = {},
                     onDelete = { onDeleteMessage(message.id) },
                     onSpeak = { onSpeakMessage(message.id, message.content) },
                     onStopSpeaking = onStopSpeaking,
+                    onPauseSpeaking = onPauseSpeaking,
+                    onResumeSpeaking = onResumeSpeaking,
                 )
             }
         }
@@ -9398,20 +9674,103 @@ private fun parseMarkdownTableRow(line: String): List<String> {
         .map { it.normalizeInlineRichText().trim() }
 }
 
+private const val UrlAnnotationTag = "URL"
+private val BoldMarkdownRegex = Regex("\\*\\*(.+?)\\*\\*")
+
 private fun markdownAnnotatedString(text: String): AnnotatedString {
-    val pattern = Regex("\\*\\*(.+?)\\*\\*")
     val normalized = text.normalizeInlineRichText()
     return buildAnnotatedString {
-        var index = 0
-        pattern.findAll(normalized).forEach { match ->
-            append(normalized.substring(index, match.range.first))
-            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-                append(match.groupValues[1])
-            }
-            index = match.range.last + 1
-        }
-        append(normalized.substring(index))
+        appendMarkdownLinksAndText(normalized)
     }
+}
+
+private fun AnnotatedString.Builder.appendMarkdownLinksAndText(text: String) {
+    var index = 0
+    MarkdownLinkRegex.findAll(text).forEach { match ->
+        appendPlainLinksAndBold(text.substring(index, match.range.first))
+        val title = match.groupValues.getOrNull(1).orEmpty().ifBlank { match.groupValues.getOrNull(2).orEmpty() }
+        val url = match.groupValues.getOrNull(2).orEmpty().cleanSourceUrl()
+        if (url.startsWith("http")) {
+            pushStringAnnotation(UrlAnnotationTag, url)
+            withStyle(
+                SpanStyle(
+                    color = Color(0xFF4FC3F7),
+                    textDecoration = TextDecoration.Underline,
+                ),
+            ) {
+                append(title)
+            }
+            pop()
+        } else {
+            append(match.value)
+        }
+        index = match.range.last + 1
+    }
+    appendPlainLinksAndBold(text.substring(index))
+}
+
+private fun AnnotatedString.Builder.appendPlainLinksAndBold(text: String) {
+    var index = 0
+    UrlRegex.findAll(text).forEach { match ->
+        appendBoldMarkdown(text.substring(index, match.range.first))
+        val rawUrl = match.value
+        val url = rawUrl.cleanSourceUrl()
+        val trailing = rawUrl.removePrefix(url)
+        if (url.startsWith("http")) {
+            pushStringAnnotation(UrlAnnotationTag, url)
+            withStyle(
+                SpanStyle(
+                    color = Color(0xFF4FC3F7),
+                    textDecoration = TextDecoration.Underline,
+                ),
+            ) {
+                append(url)
+            }
+            pop()
+            append(trailing)
+        } else {
+            append(rawUrl)
+        }
+        index = match.range.last + 1
+    }
+    appendBoldMarkdown(text.substring(index))
+}
+
+private fun AnnotatedString.Builder.appendBoldMarkdown(text: String) {
+    var index = 0
+    BoldMarkdownRegex.findAll(text).forEach { match ->
+        append(text.substring(index, match.range.first))
+        withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+            append(match.groupValues[1])
+        }
+        index = match.range.last + 1
+    }
+    append(text.substring(index))
+}
+
+@Composable
+private fun MarkdownText(
+    text: String,
+    modifier: Modifier = Modifier,
+    style: TextStyle = MaterialTheme.typography.bodyLarge,
+    color: Color = MaterialTheme.colorScheme.onSurface,
+    fontWeight: FontWeight? = null,
+) {
+    val context = LocalContext.current
+    val annotatedText = remember(text) { markdownAnnotatedString(text) }
+    ClickableText(
+        text = annotatedText,
+        modifier = modifier,
+        style = style.copy(
+            color = color,
+            fontWeight = fontWeight ?: style.fontWeight,
+        ),
+        onClick = { offset ->
+            annotatedText.getStringAnnotations(UrlAnnotationTag, offset, offset)
+                .firstOrNull()
+                ?.let { annotation -> context.openUrl(annotation.item) }
+        },
+    )
 }
 
 @Composable
@@ -9423,14 +9782,14 @@ private fun RichTextBlock(text: String) {
     ) {
         blocks.forEach { block ->
             when (block.type) {
-                RichBlockType.Heading -> Text(
-                    text = markdownAnnotatedString(block.text),
+                RichBlockType.Heading -> MarkdownText(
+                    text = block.text,
                     style = MaterialTheme.typography.titleSmall,
                     color = MaterialTheme.colorScheme.onSurface,
                     fontWeight = FontWeight.SemiBold,
                 )
-                RichBlockType.Paragraph -> Text(
-                    text = markdownAnnotatedString(block.text),
+                RichBlockType.Paragraph -> MarkdownText(
+                    text = block.text,
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurface,
                 )
@@ -9443,8 +9802,8 @@ private fun RichTextBlock(text: String) {
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.primary,
                     )
-                    Text(
-                        text = markdownAnnotatedString(block.text),
+                    MarkdownText(
+                        text = block.text,
                         modifier = Modifier.weight(1f),
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onSurface,
@@ -9542,8 +9901,8 @@ private fun RichTableRow(
     }
     Row(modifier = Modifier.background(background)) {
         columnWidths.forEachIndexed { index, width ->
-            Text(
-                text = markdownAnnotatedString(cells.getOrElse(index) { "" }),
+            MarkdownText(
+                text = cells.getOrElse(index) { "" },
                 modifier = Modifier
                     .width(width)
                     .padding(horizontal = 10.dp, vertical = 9.dp),
@@ -9815,11 +10174,14 @@ private fun MessageActions(
     canDelete: Boolean,
     canSpeak: Boolean,
     isSpeaking: Boolean,
+    isSpeechPaused: Boolean,
     onCopy: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onSpeak: () -> Unit,
     onStopSpeaking: () -> Unit,
+    onPauseSpeaking: () -> Unit,
+    onResumeSpeaking: () -> Unit,
 ) {
     Row(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
@@ -9851,16 +10213,41 @@ private fun MessageActions(
             }
         }
         if (canSpeak) {
-            IconButton(
-                onClick = if (isSpeaking) onStopSpeaking else onSpeak,
-                modifier = Modifier.size(34.dp),
-            ) {
-                Icon(
-                    imageVector = if (isSpeaking) Icons.Filled.Stop else Icons.AutoMirrored.Filled.VolumeUp,
-                    contentDescription = if (isSpeaking) "Stop speaking" else "Read aloud",
-                    modifier = Modifier.size(17.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            if (isSpeaking) {
+                IconButton(
+                    onClick = if (isSpeechPaused) onResumeSpeaking else onPauseSpeaking,
+                    modifier = Modifier.size(34.dp),
+                ) {
+                    Icon(
+                        imageVector = if (isSpeechPaused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                        contentDescription = if (isSpeechPaused) "Resume speaking" else "Pause speaking",
+                        modifier = Modifier.size(17.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                IconButton(
+                    onClick = onStopSpeaking,
+                    modifier = Modifier.size(34.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Stop,
+                        contentDescription = "Stop speaking",
+                        modifier = Modifier.size(17.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                IconButton(
+                    onClick = onSpeak,
+                    modifier = Modifier.size(34.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                        contentDescription = "Read aloud",
+                        modifier = Modifier.size(17.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
         if (canEdit) {
@@ -10096,6 +10483,63 @@ private fun AttachedDocumentChip(
 }
 
 @Composable
+private fun PresetDrawer(
+    presets: List<ChatAppendPreset>,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    onPresetClick: (String) -> Unit,
+) {
+    if (presets.isEmpty()) return
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .pointerInput(presets.size, expanded) {
+                detectVerticalDragGestures { _, dragAmount ->
+                    when {
+                        dragAmount < -6f -> onExpandedChange(true)
+                        dragAmount > 6f -> onExpandedChange(false)
+                    }
+                }
+            },
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        AnimatedVisibility(visible = expanded) {
+            LazyRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(end = 4.dp),
+            ) {
+                items(presets) { preset ->
+                    FilterChip(
+                        selected = false,
+                        onClick = { onPresetClick(preset.id) },
+                        label = {
+                            Text(
+                                text = preset.name,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        },
+                    )
+                }
+            }
+        }
+        if (!expanded) {
+            Box(
+                modifier = Modifier
+                    .width(96.dp)
+                    .height(4.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(MaterialTheme.colorScheme.primary)
+                    .clickable { onExpandedChange(true) },
+            )
+        }
+    }
+}
+
+@Composable
 private fun ChatComposer(
     state: ChatUiState,
     input: String,
@@ -10116,11 +10560,19 @@ private fun ChatComposer(
     isListening: Boolean,
     onClearImage: () -> Unit,
     onReasoningEnabledChange: (Boolean) -> Unit,
+    onChatAppendPresetApply: (String) -> Unit,
     onDismissError: () -> Unit,
 ) {
     val focusManager = LocalFocusManager.current
     val canSend = (input.isNotBlank() || attachedImages.isNotEmpty() || attachedDocumentText != null) && !isSending
     var previewAttachment by remember { mutableStateOf<ChatImageAttachment?>(null) }
+    var presetsExpanded by remember { mutableStateOf(false) }
+
+    LaunchedEffect(state.chatAppendPresets.isEmpty()) {
+        if (state.chatAppendPresets.isEmpty()) {
+            presetsExpanded = false
+        }
+    }
 
     Surface(
         color = MaterialTheme.colorScheme.surface,
@@ -10132,7 +10584,7 @@ private fun ChatComposer(
                 .navigationBarsPadding()
                 .imePadding()
                 .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             AnimatedVisibility(visible = error != null) {
                 Surface(
@@ -10218,6 +10670,16 @@ private fun ChatComposer(
                     }
                 }
             }
+
+            PresetDrawer(
+                presets = state.chatAppendPresets,
+                expanded = presetsExpanded,
+                onExpandedChange = { presetsExpanded = it },
+                onPresetClick = { presetId ->
+                    onChatAppendPresetApply(presetId)
+                    presetsExpanded = false
+                },
+            )
 
             Surface(
                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.75f),
@@ -11094,6 +11556,12 @@ private fun SettingsSheet(
     onSystemProfileSelect: (String) -> Unit,
     onSystemProfileNameChange: (String) -> Unit,
     onSystemPromptChange: (String) -> Unit,
+    onChatAppendPresetSelect: (String) -> Unit,
+    onChatAppendPresetNameChange: (String) -> Unit,
+    onChatAppendPresetTextChange: (String) -> Unit,
+    onChatAppendPresetSave: () -> Unit,
+    onChatAppendPresetCreate: () -> Unit,
+    onChatAppendPresetDelete: (String) -> Unit,
     onTemperatureChange: (String) -> Unit,
     onTopPChange: (String) -> Unit,
     onMaxTokensChange: (String) -> Unit,
@@ -11400,6 +11868,88 @@ private fun SettingsSheet(
                 }
                 Button(
                     onClick = onSystemProfileSave,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("Save")
+                }
+            }
+
+            HorizontalDivider(color = DividerDefaults.color.copy(alpha = 0.45f))
+
+            Text(
+                text = "Chat text presets",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(end = 10.dp),
+            ) {
+                items(state.chatAppendPresets) { preset ->
+                    FilterChip(
+                        selected = state.activeChatAppendPresetId == preset.id,
+                        onClick = { onChatAppendPresetSelect(preset.id) },
+                        label = {
+                            Text(
+                                text = preset.name,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        },
+                        leadingIcon = if (state.activeChatAppendPresetId == preset.id) {
+                            {
+                                Icon(
+                                    imageVector = Icons.Filled.Check,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                            }
+                        } else {
+                            null
+                        },
+                        modifier = Modifier.widthIn(max = 220.dp),
+                    )
+                }
+            }
+            OutlinedTextField(
+                value = state.chatAppendPresetNameDraft,
+                onValueChange = onChatAppendPresetNameChange,
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("Preset name") },
+                placeholder = { Text(ChatAppendPresetSampleName) },
+            )
+            OutlinedTextField(
+                value = state.chatAppendPresetTextDraft,
+                onValueChange = onChatAppendPresetTextChange,
+                modifier = Modifier.fillMaxWidth(),
+                minLines = 2,
+                maxLines = 5,
+                label = { Text("Append text") },
+                placeholder = { Text(ChatAppendPresetSampleText) },
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onChatAppendPresetCreate,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("New")
+                }
+                OutlinedButton(
+                    onClick = { onChatAppendPresetDelete(state.activeChatAppendPresetId) },
+                    modifier = Modifier.weight(1f),
+                    enabled = state.activeChatAppendPresetId.isNotBlank(),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("Delete")
+                }
+                Button(
+                    onClick = onChatAppendPresetSave,
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(12.dp),
                 ) {

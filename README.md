@@ -38,7 +38,8 @@ from the GitHub releases page.
 - Displays MCP image outputs in chat, including web page screenshots and
   generated QR codes returned by LM Studio tools.
 - Refreshes loaded LM Studio models from the app settings.
-- Keeps chat sessions locally with folders, search, and session switching.
+- Keeps chat sessions locally with folders, search, session switching, and
+  reusable chat text presets for quickly appending common instructions.
 - Supports copy, edit, delete, and cancel actions in chat.
 - Imports and exports chat history as JSON.
 - Supports image attachments for vision-capable models.
@@ -47,8 +48,8 @@ from the GitHub releases page.
 - Converts supported documents into text, and can render PDFs as image
   attachments for vision-capable models.
 - Adds optional voice input, text-to-speech output, automatic answer read-aloud,
-  Supertonic TTS engine selection, and chunked local playback controls for long
-  assistant answers. For best performance, use the
+  Supertonic TTS engine selection, and chunked local playback controls with
+  pause/resume for long assistant answers. For best performance, use the
   [MindyLab optimized Supertonic Android engine](https://github.com/mindylab/supersonic_android_all/releases/latest),
   which includes service isolation and request-level processing controls used by
   LMSMOB Chat.
@@ -62,7 +63,7 @@ from the GitHub releases page.
   server-tool support, normal notifications, alarm-style full-screen alerts,
   once/today/no-end lifetimes, and confirmation before model-created jobs are
   saved.
-- Shows source chips when answers include source links.
+- Shows clickable source chips and clickable links in rich chat answers.
 - Exports Markdown tables from chat answers as XLSX files.
 - Appends a capability guide to prompts so the selected model knows which
   server tools, phone tools, vision, reasoning, voice, document, and date/time
@@ -101,7 +102,7 @@ tool data.
 
 The 2026 roadmap now builds on the first phone-assistant tools shipped in
 v1.28, the Watch Jobs release in v1.40, and scheduled prompt Watch Jobs in
-v1.57:
+v1.58:
 
 - Web tools already work through compatible LM Studio MCP/plugin setup, with a
   tested local-web MCP server available in
