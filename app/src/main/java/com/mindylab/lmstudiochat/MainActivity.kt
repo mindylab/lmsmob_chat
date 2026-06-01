@@ -231,6 +231,7 @@ import java.io.File
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Instant
+import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -250,6 +251,22 @@ private const val LegacyDefaultSystemPrompt = "You are a helpful assistant runni
 private const val LegacyTranslateLtPresetId = "translate_lt"
 private const val ChatAppendPresetSampleName = "Summarize"
 private const val ChatAppendPresetSampleText = "summarize this text"
+private const val WatchScheduleInterval = "interval"
+private const val WatchScheduleDaily = "daily"
+private const val WatchScheduleWeekly = "weekly"
+private const val WatchScheduleMonthly = "monthly"
+private const val WatchScheduleOnce = "once"
+private const val DefaultWatchScheduleTime = "09:00"
+private const val DefaultWatchScheduleWeekday = "monday"
+private val WatchScheduleWeekdayOptions = listOf(
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
 private val DefaultSystemPrompt = """
     You are LMSMOB Chat, a polite, practical assistant running locally through LM Studio on the user's Android device.
 
@@ -271,7 +288,7 @@ private val DefaultSystemPrompt = """
     - Prefer answering directly when no tool is needed.
     - If web search, URL fetching, YouTube transcript, QR generation/scanning, or page screenshot work is needed, use LM Studio server-side tools only when server tools are enabled.
     - If an Android phone-side action is needed, describe what you want to do and emit exactly one action block in the format the app provides.
-    - Never use <lmsmob_action> for LM Studio MCP/plugin tools such as web_search, web_fetch, youtube_transcript, qr_generate, qr_scan, or web_page_to_images.
+    - Never use <lmsmob_action> for LM Studio MCP/plugin tools such as web_search, web_fetch, youtube_transcript, qr_generate, qr_scan, reverse_image_search, or web_page_to_images.
     - Treat calls, SMS, email, calendar, reminders, alarms, URLs, maps, contacts, files, notifications, and watch jobs as sensitive. Never claim they are finished until the app returns a tool result or the user confirms the draft.
     - For monitoring or recurring tasks, prefer clear, narrow watch-job filters such as app, sender, and text condition.
     - If a capability is not enabled or not listed, tell the user how to enable it instead of pretending you used it.
@@ -393,6 +410,11 @@ data class WatchJob(
     val matchMode: String = "filter",
     val aiInstruction: String = "",
     val scheduleMinutes: Int = 0,
+    val scheduleKind: String = WatchScheduleInterval,
+    val scheduleTime: String = DefaultWatchScheduleTime,
+    val scheduleDate: String = "",
+    val scheduleWeekday: String = DefaultWatchScheduleWeekday,
+    val scheduleMonthDay: Int = 1,
     val alertMessage: String = "",
     val alertMode: String = "normal",
     val lifetime: String = "noend",
@@ -429,6 +451,7 @@ private val AllowedToolPresets = listOf(
     "youtube_transcript",
     "qr_generate",
     "qr_scan",
+    "reverse_image_search",
     "web_page_to_images",
 )
 
@@ -1939,6 +1962,12 @@ class ChatViewModel(
         val allowedTools = state.allowedTools
         val previousResponseId = activeSession.previousResponseId
         val promptAttachments = attachedImages
+        val toolRequestPrompt = requestPrompt.withReverseImageSearchAttachmentHints(
+            attachments = promptAttachments,
+            serverToolsEnabled = serverToolsEnabled,
+            integrations = serverIntegrations,
+            allowedTools = allowedTools,
+        )
         val systemPrompt = state.activeSystemPrompt()
         val generationSettings = state.generationSettings()
         stopRequested = false
@@ -2049,7 +2078,7 @@ class ChatViewModel(
                     apiUrl = apiUrl,
                     model = model,
                     apiToken = apiToken,
-                    prompt = requestPrompt,
+                    prompt = toolRequestPrompt,
                     attachments = promptAttachments,
                     systemPrompt = systemPrompt,
                     previousResponseId = previousResponseId,
@@ -2528,6 +2557,11 @@ class ChatViewModel(
         matchMode: String,
         aiInstruction: String,
         scheduleMinutesText: String,
+        scheduleKind: String,
+        scheduleTime: String,
+        scheduleDate: String,
+        scheduleWeekday: String,
+        scheduleMonthDayText: String,
         alertMessage: String,
         alertMode: String,
         lifetime: String,
@@ -2551,6 +2585,11 @@ class ChatViewModel(
             return
         }
         val scheduleMinutes = scheduleMinutesText.toIntOrNull()?.coerceIn(1, 1440) ?: 15
+        val normalizedScheduleKind = scheduleKind.normalizedWatchScheduleKind()
+        val normalizedScheduleTime = scheduleTime.normalizedWatchScheduleTime()
+        val normalizedScheduleDate = scheduleDate.ifBlank { defaultWatchScheduleDate() }.normalizedWatchScheduleDate()
+        val normalizedScheduleWeekday = scheduleWeekday.normalizedWatchScheduleWeekday()
+        val scheduleMonthDay = scheduleMonthDayText.toIntOrNull()?.coerceIn(1, 31) ?: 1
         val job = WatchJob(
             title = normalizedTitle,
             trigger = effectiveTrigger,
@@ -2560,6 +2599,11 @@ class ChatViewModel(
             matchMode = normalizedMatchMode,
             aiInstruction = normalizedAiInstruction,
             scheduleMinutes = if (effectiveTrigger == "schedule") scheduleMinutes else 0,
+            scheduleKind = if (effectiveTrigger == "schedule") normalizedScheduleKind else WatchScheduleInterval,
+            scheduleTime = normalizedScheduleTime,
+            scheduleDate = normalizedScheduleDate,
+            scheduleWeekday = normalizedScheduleWeekday,
+            scheduleMonthDay = scheduleMonthDay,
             alertMessage = alertMessage.trim(),
             alertMode = alertMode.normalizedWatchAlertMode(),
             lifetime = lifetime.normalizedWatchLifetime(),
@@ -2568,11 +2612,27 @@ class ChatViewModel(
     }
 
     fun createWatchJobFromArgs(args: JSONObject): WatchJob {
-        val trigger = args.arg("trigger", "mode")
+        val triggerText = args.arg("trigger", "mode")
+        val trigger = triggerText
             .lowercase(Locale.getDefault())
-            .let { if (it == "schedule" || it == "scheduled") "schedule" else "notification" }
+            .let {
+                if (
+                    it == "schedule" ||
+                    it == "scheduled" ||
+                    (triggerText.isBlank() && args.hasAny("schedule_kind", "schedule_type", "schedule_time", "schedule_date", "schedule_weekday", "schedule_month_day", "schedule_minutes", "interval_minutes"))
+                ) {
+                    "schedule"
+                } else {
+                    "notification"
+                }
+            }
         val scheduleMinutes = args.optInt("schedule_minutes", args.optInt("interval_minutes", 15))
             .coerceIn(1, 1440)
+        val scheduleKind = args.watchScheduleKindArg()
+        val scheduleTime = args.watchScheduleTimeArg()
+        val scheduleDate = args.watchScheduleDateArg()
+        val scheduleWeekday = args.watchScheduleWeekdayArg()
+        val scheduleMonthDay = args.watchScheduleMonthDayArg()
         val appQuery = args.arg("app", "package", "app_query")
         val senderQuery = args.arg("sender", "from", "sender_query")
         val textQuery = args.arg("text", "contains", "query", "text_query")
@@ -2600,6 +2660,11 @@ class ChatViewModel(
             matchMode = matchMode,
             aiInstruction = aiInstruction,
             scheduleMinutes = if (effectiveTrigger == "schedule") scheduleMinutes else 0,
+            scheduleKind = if (effectiveTrigger == "schedule") scheduleKind else WatchScheduleInterval,
+            scheduleTime = scheduleTime,
+            scheduleDate = scheduleDate,
+            scheduleWeekday = scheduleWeekday,
+            scheduleMonthDay = scheduleMonthDay,
             alertMessage = args.arg("alert", "alert_message", "message"),
             alertMode = args.arg("alert_mode", "alertMode", "mode").normalizedWatchAlertMode(),
             lifetime = args.arg("lifetime", "life_time", "expires").normalizedWatchLifetime(),
@@ -2618,6 +2683,11 @@ class ChatViewModel(
         matchMode: String,
         aiInstruction: String,
         scheduleMinutesText: String,
+        scheduleKind: String,
+        scheduleTime: String,
+        scheduleDate: String,
+        scheduleWeekday: String,
+        scheduleMonthDayText: String,
         alertMessage: String,
         alertMode: String,
         lifetime: String,
@@ -2643,6 +2713,11 @@ class ChatViewModel(
             return
         }
         val scheduleMinutes = scheduleMinutesText.toIntOrNull()?.coerceIn(1, 1440) ?: existing.scheduleMinutes.coerceAtLeast(15)
+        val normalizedScheduleKind = scheduleKind.normalizedWatchScheduleKind()
+        val normalizedScheduleTime = scheduleTime.normalizedWatchScheduleTime(existing.scheduleTime.ifBlank { DefaultWatchScheduleTime })
+        val normalizedScheduleDate = scheduleDate.ifBlank { existing.scheduleDate.ifBlank { defaultWatchScheduleDate() } }.normalizedWatchScheduleDate()
+        val normalizedScheduleWeekday = scheduleWeekday.normalizedWatchScheduleWeekday()
+        val scheduleMonthDay = scheduleMonthDayText.toIntOrNull()?.coerceIn(1, 31) ?: existing.scheduleMonthDay.coerceIn(1, 31)
         val updated = existing.copy(
             title = normalizedTitle,
             trigger = effectiveTrigger,
@@ -2652,6 +2727,11 @@ class ChatViewModel(
             matchMode = normalizedMatchMode,
             aiInstruction = normalizedAiInstruction,
             scheduleMinutes = if (effectiveTrigger == "schedule") scheduleMinutes else 0,
+            scheduleKind = if (effectiveTrigger == "schedule") normalizedScheduleKind else WatchScheduleInterval,
+            scheduleTime = normalizedScheduleTime,
+            scheduleDate = normalizedScheduleDate,
+            scheduleWeekday = normalizedScheduleWeekday,
+            scheduleMonthDay = scheduleMonthDay,
             alertMessage = alertMessage.trim(),
             alertMode = alertMode.normalizedWatchAlertMode(),
             lifetime = lifetime.normalizedWatchLifetime(),
@@ -2669,7 +2749,7 @@ class ChatViewModel(
                 appendLine("${index + 1}. ${job.title}")
                 appendLine("   id: ${job.id}")
                 appendLine("   enabled: ${job.enabled}")
-                appendLine("   trigger: ${job.trigger}${if (job.trigger == "schedule") " every ${job.scheduleMinutes} min" else ""}")
+                appendLine("   trigger: ${job.trigger}${if (job.trigger == "schedule") " (${job.watchScheduleDescription()})" else ""}")
                 appendLine("   match mode: ${job.matchMode.watchMatchModeLabel()}")
                 appendLine("   filters: ${job.watchJobFiltersText()}")
                 if (job.matchMode.normalizedWatchMatchMode() == "ai") {
@@ -2693,7 +2773,8 @@ class ChatViewModel(
             }
         val updated = existing.copy(
             title = newTitle?.trim()?.ifBlank { existing.title } ?: existing.title,
-            trigger = (args.optionalArg("trigger", "mode") ?: existing.trigger)
+            trigger = (args.optionalArg("trigger", "mode")
+                ?: if (args.hasAny("schedule_kind", "schedule_type", "schedule_time", "schedule_date", "schedule_weekday", "schedule_month_day", "schedule_minutes", "interval_minutes")) "schedule" else existing.trigger)
                 .lowercase(Locale.getDefault())
                 .let { if (it == "schedule" || it == "scheduled") "schedule" else "notification" },
             appQuery = args.optionalArg("app", "package", "app_query")?.trim() ?: existing.appQuery,
@@ -2705,6 +2786,11 @@ class ChatViewModel(
                 ).normalizedWatchMatchMode(),
             aiInstruction = args.optionalArg("ai_instruction", "instruction", "instructions", "task", "prompt", "schedule_prompt", "scheduled_prompt")?.trim() ?: existing.aiInstruction,
             scheduleMinutes = args.optInt("schedule_minutes", args.optInt("interval_minutes", existing.scheduleMinutes.coerceAtLeast(15))).coerceIn(1, 1440),
+            scheduleKind = args.watchScheduleKindArg(existing.scheduleKind),
+            scheduleTime = args.watchScheduleTimeArg(existing.scheduleTime.ifBlank { DefaultWatchScheduleTime }),
+            scheduleDate = args.watchScheduleDateArg(existing.scheduleDate.ifBlank { defaultWatchScheduleDate() }),
+            scheduleWeekday = args.watchScheduleWeekdayArg(existing.scheduleWeekday),
+            scheduleMonthDay = args.watchScheduleMonthDayArg(existing.scheduleMonthDay.coerceIn(1, 31)),
             alertMessage = args.optionalArg("alert", "alert_message", "message")?.trim() ?: existing.alertMessage,
             alertMode = (args.optionalArg("alert_mode", "alertMode") ?: existing.alertMode).normalizedWatchAlertMode(),
             lifetime = (args.optionalArg("lifetime", "life_time", "expires") ?: existing.lifetime).normalizedWatchLifetime(),
@@ -2718,7 +2804,7 @@ class ChatViewModel(
                     textQuery = "",
                 )
                 job.trigger == "schedule" -> job
-                else -> job.copy(scheduleMinutes = 0)
+                else -> job.copy(scheduleMinutes = 0, scheduleKind = WatchScheduleInterval)
             }
         }
         if ((updated.matchMode == "ai" || updated.matchMode == "prompt") && updated.aiInstruction.isBlank()) {
@@ -4100,7 +4186,7 @@ private fun ChatUiState.capabilityGuideSystemPrompt(): String {
         appendLine()
         appendLine("Phone-side action format:")
         appendLine("- For enabled phone-side actions, reply with a short explanation and exactly one block: <lmsmob_action>{\"tool\":\"tool_name\",\"args\":{\"key\":\"value\"}}</lmsmob_action>")
-        appendLine("- The only valid tool names inside <lmsmob_action> are the phone-side tools listed below. Do not put server-side names such as web_search, web_fetch, youtube_transcript, qr_generate, qr_scan, or web_page_to_images inside <lmsmob_action>.")
+        appendLine("- The only valid tool names inside <lmsmob_action> are the phone-side tools listed below. Do not put server-side names such as web_search, web_fetch, youtube_transcript, qr_generate, qr_scan, reverse_image_search, or web_page_to_images inside <lmsmob_action>.")
         appendLine("- For disabled phone-side actions, do not emit an action block. Ask the user to enable the specific tool in Settings > Phone tools. Enabling a tool is the user's consent to allow the app to offer that action with confirmation.")
         appendLine("- Calls, SMS, email, maps, URLs, calendar, reminders, alarms, contacts, files, notifications, and watch jobs are sensitive. The app asks for confirmation; never say the final action is complete until the app returns a tool result or the user confirms a draft.")
         appendLine()
@@ -4122,8 +4208,8 @@ private fun ChatUiState.capabilityGuideSystemPrompt(): String {
         appendLine(phoneToolLine(localFileSearchToolEnabled, "local_file_search", "{\"tool\":\"local_file_search\",\"args\":{\"query\":\"invoice May\"}}", "search the user-selected folder for matching file names and readable text snippets.", "Local file search", "Only the folder granted by the user is searchable."))
         appendLine(phoneToolLine(deviceStatusToolEnabled, "device_status", "{\"tool\":\"device_status\",\"args\":{}}", "return battery, network, storage, app version, and LM Studio connection status.", "Device status"))
         appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_list", "{\"tool\":\"watch_job_list\",\"args\":{}}", "return configured watch jobs with ids, filters, alert modes, lifetime, and enabled state.", "Watch jobs"))
-        appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_create", "{\"tool\":\"watch_job_create\",\"args\":{\"title\":\"AI news watch\",\"trigger\":\"schedule\",\"match_mode\":\"prompt\",\"prompt\":\"Search the web for major Lithuanian AI policy news. Alert only when a credible new item appears and include source URLs.\",\"schedule_minutes\":60,\"alert\":\"AI news found\",\"alert_mode\":\"normal\",\"lifetime\":\"noend\"}}", "create a local notification, notification-history, or scheduled prompt watch job. match_mode can be filter, ai, or prompt. In AI mode, ai_instruction is required and app/sender/text are optional pre-filters. In prompt mode, prompt or ai_instruction is required, trigger is schedule, and LM Studio server tools may be used for web/news tasks. alert_mode can be normal or alarm. lifetime can be once, today, or noend.", "Watch jobs", "Requires notification permission for alerts, Notification Listener access for notification-based jobs, and a reachable LM Studio model. Prompt mode needs Settings > Server tools configured when it should search/fetch the web. Alarm mode is full-screen and intrusive, so use it only when the user clearly wants strong alerts."))
-        appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_edit", "{\"tool\":\"watch_job_edit\",\"args\":{\"id\":\"watch-job-id\",\"title\":\"New title\",\"match_mode\":\"ai\",\"ai_instruction\":\"Alert only for Mindylab offers\",\"app\":\"Telegram\",\"sender\":\"Mom\",\"text\":\"urgent\",\"trigger\":\"notification\",\"alert_mode\":\"normal\",\"lifetime\":\"noend\",\"enabled\":true}}", "edit an existing watch job by id or exact title. Omitted fields keep existing values.", "Watch jobs"))
+        appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_create", "{\"tool\":\"watch_job_create\",\"args\":{\"title\":\"AI news watch\",\"trigger\":\"schedule\",\"match_mode\":\"prompt\",\"prompt\":\"Search the web for major Lithuanian AI policy news. Alert only when a credible new item appears and include source URLs.\",\"schedule_kind\":\"daily\",\"schedule_time\":\"09:00\",\"alert\":\"AI news found\",\"alert_mode\":\"normal\",\"lifetime\":\"noend\"}}", "create a local notification, notification-history, or scheduled prompt watch job. match_mode can be filter, ai, or prompt. In AI mode, ai_instruction is required and app/sender/text are optional pre-filters. In prompt mode, prompt or ai_instruction is required, trigger is schedule, and LM Studio server tools may be used for web/news tasks. Scheduling supports schedule_minutes/interval_minutes or schedule_kind interval, daily, weekly, monthly, once with schedule_time HH:mm, schedule_weekday, schedule_month_day, and schedule_date yyyy-MM-dd. alert_mode can be normal or alarm. lifetime can be once, today, or noend.", "Watch jobs", "Requires notification permission for alerts, Notification Listener access for notification-based jobs, and a reachable LM Studio model. Prompt mode needs Settings > Server tools configured when it should search/fetch the web. Alarm mode is full-screen and intrusive, so use it only when the user clearly wants strong alerts."))
+        appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_edit", "{\"tool\":\"watch_job_edit\",\"args\":{\"id\":\"watch-job-id\",\"title\":\"New title\",\"match_mode\":\"ai\",\"ai_instruction\":\"Alert only for Mindylab offers\",\"app\":\"Telegram\",\"sender\":\"Mom\",\"text\":\"urgent\",\"trigger\":\"notification\",\"alert_mode\":\"normal\",\"lifetime\":\"noend\",\"enabled\":true}}", "edit an existing watch job by id or exact title. Omitted fields keep existing values, including schedule fields unless provided.", "Watch jobs"))
         appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_set_enabled", "{\"tool\":\"watch_job_set_enabled\",\"args\":{\"id\":\"watch-job-id\",\"enabled\":false}}", "enable or disable an existing watch job by id or exact title.", "Watch jobs"))
         appendLine(phoneToolLine(watchJobToolEnabled, "watch_job_delete", "{\"tool\":\"watch_job_delete\",\"args\":{\"id\":\"watch-job-id\"}}", "delete an existing watch job by id or exact title.", "Watch jobs"))
     }.trim()
@@ -4140,7 +4226,7 @@ private fun serverIntegrationToolHints(integrations: String, allowedTools: Strin
     val normalized = integrations.lowercase()
     val hints = mutableListOf<String>()
     if ("local-web" in normalized) {
-        hints += "mcp/local-web: web_search finds public web results; web_fetch reads one URL; web_search_and_fetch searches then reads top results; youtube_transcript reads YouTube transcripts; qr_generate creates QR images; qr_scan reads QR images; web_page_to_images captures webpage screenshots. For webpage screenshots, capture the full scrollable page by default. Use viewportOnly=true only when the user explicitly asks for only the top/current visible viewport."
+        hints += "mcp/local-web: web_search finds public web results; web_fetch reads one URL; web_search_and_fetch searches then reads top results; youtube_transcript reads YouTube transcripts; qr_generate creates QR images; qr_scan reads QR images; reverse_image_search sends image binary/base64 to the configured reverse-image API and returns matching pages, web entities, matching images, and visually similar images; web_page_to_images captures webpage screenshots. For webpage screenshots, capture the full scrollable page by default. Use viewportOnly=true only when the user explicitly asks for only the top/current visible viewport."
     }
     if ("youtube" in normalized && "local-web" !in normalized) {
         hints += "YouTube MCP/plugin integration: use it for YouTube video lookup or transcript tasks when available."
@@ -4184,8 +4270,8 @@ private fun ChatUiState.nativeToolSystemPrompt(): String {
     if (deviceStatusToolEnabled) tools += "device_status {}"
     if (watchJobToolEnabled) {
         tools += "watch_job_list {}"
-        tools += "watch_job_create {title, trigger, match_mode, prompt, ai_instruction, app, sender, text, schedule_minutes, alert, alert_mode, lifetime}"
-        tools += "watch_job_edit {id, title, trigger, match_mode, prompt, ai_instruction, app, sender, text, schedule_minutes, alert, alert_mode, lifetime, enabled}"
+        tools += "watch_job_create {title, trigger, match_mode, prompt, ai_instruction, app, sender, text, schedule_minutes, schedule_kind, schedule_time, schedule_date, schedule_weekday, schedule_month_day, alert, alert_mode, lifetime}"
+        tools += "watch_job_edit {id, title, trigger, match_mode, prompt, ai_instruction, app, sender, text, schedule_minutes, schedule_kind, schedule_time, schedule_date, schedule_weekday, schedule_month_day, alert, alert_mode, lifetime, enabled}"
         tools += "watch_job_set_enabled {id, enabled}"
         tools += "watch_job_delete {id}"
     }
@@ -4197,7 +4283,7 @@ private fun ChatUiState.nativeToolSystemPrompt(): String {
         <lmsmob_action>{"tool":"tool_name","args":{"key":"value"}}</lmsmob_action>
         Available phone-side tools: ${tools.joinToString("; ")}.
         Alarm limitations: Android only lets this app read the next scheduled alarm and create alarm drafts. alarm_list, alarm_edit, and alarm_delete open the Clock alarms screen for the user to view or finish manually.
-        Watch job limitations: watch_job_list can read configured jobs; watch_job_create, watch_job_edit, watch_job_set_enabled, and watch_job_delete manage them after user confirmation. Use watch_job_list first if you do not know a job id. match_mode may be "filter", "ai", or "prompt". AI mode sends notification content to LM Studio and requires ai_instruction; app, sender, and text become optional pre-filters. Prompt mode runs a scheduled LM Studio task and requires prompt or ai_instruction; use it for recurring web/news checks only when Server tools are enabled/configured for web access. alert_mode may be "normal" or "alarm"; alarm mode opens a full-screen alert with repeating sound/vibration until stopped. lifetime may be "once", "today", or "noend". It needs Android notification access and alert permission, and it should be used only for clear user-requested monitoring tasks.
+        Watch job limitations: watch_job_list can read configured jobs; watch_job_create, watch_job_edit, watch_job_set_enabled, and watch_job_delete manage them after user confirmation. Use watch_job_list first if you do not know a job id. match_mode may be "filter", "ai", or "prompt". AI mode sends notification content to LM Studio and requires ai_instruction; app, sender, and text become optional pre-filters. Prompt mode runs a scheduled LM Studio task and requires prompt or ai_instruction; use it for recurring web/news checks only when Server tools are enabled/configured for web access. For schedules, use either schedule_minutes/interval_minutes for interval jobs or schedule_kind "daily", "weekly", "monthly", or "once" with schedule_time "HH:mm"; weekly also accepts schedule_weekday, monthly accepts schedule_month_day, and once accepts schedule_date "yyyy-MM-dd". alert_mode may be "normal" or "alarm"; alarm mode opens a full-screen alert with repeating sound/vibration until stopped. lifetime may be "once", "today", or "noend". It needs Android notification access and alert permission, and it should be used only for clear user-requested monitoring tasks.
         Do not claim the action is complete until the app returns a tool result or the user confirms the draft.
         Phone-side tools are drafts only for calls, SMS, email, calendar, maps, and URLs; the user performs the final send/call/save.
     """.trimIndent()
@@ -4318,6 +4404,9 @@ private fun NativeToolAction.displaySummary(): String =
                 }
             }.watchMatchModeLabel(),
             args.arg("prompt", "schedule_prompt", "scheduled_prompt", "app", "sender", "text", "query", "contains"),
+            args.watchScheduleKindArg().takeIf {
+                args.arg("trigger", "mode").lowercase(Locale.getDefault()).contains("schedule") || it != WatchScheduleInterval
+            } ?: "",
             args.arg("alert_mode").normalizedWatchAlertMode().watchAlertModeLabel(),
             args.arg("lifetime").normalizedWatchLifetime().watchLifetimeLabel(),
         ).filter { it.isNotBlank() }.joinToString(" - ")
@@ -4334,12 +4423,43 @@ private fun JSONObject.arg(vararg names: String): String {
     return ""
 }
 
+private fun JSONObject.hasAny(vararg names: String): Boolean =
+    names.any { has(it) }
+
 private fun JSONObject.optionalArg(vararg names: String): String? {
     names.forEach { name ->
         if (has(name)) return optString(name)
     }
     return null
 }
+
+private fun JSONObject.watchScheduleKindArg(default: String = WatchScheduleInterval): String {
+    optionalArg("schedule_kind", "schedule_type", "schedule_cadence", "cadence", "recurrence", "frequency")
+        ?.let { return it.normalizedWatchScheduleKind() }
+    return when {
+        hasAny("schedule_date", "start_date", "run_date") -> WatchScheduleOnce
+        hasAny("schedule_month_day", "month_day", "day_of_month") -> WatchScheduleMonthly
+        hasAny("schedule_weekday", "weekday", "day_of_week") -> WatchScheduleWeekly
+        hasAny("schedule_time", "start_time", "time") && !hasAny("schedule_minutes", "interval_minutes") -> WatchScheduleDaily
+        else -> default.normalizedWatchScheduleKind()
+    }
+}
+
+private fun JSONObject.watchScheduleTimeArg(default: String = DefaultWatchScheduleTime): String =
+    (optionalArg("schedule_time", "start_time", "time") ?: default).normalizedWatchScheduleTime(default)
+
+private fun JSONObject.watchScheduleDateArg(defaultDate: String = defaultWatchScheduleDate()): String =
+    (optionalArg("schedule_date", "start_date", "run_date") ?: defaultDate.ifBlank { defaultWatchScheduleDate() })
+        .normalizedWatchScheduleDate()
+
+private fun JSONObject.watchScheduleWeekdayArg(default: String = DefaultWatchScheduleWeekday): String =
+    (optionalArg("schedule_weekday", "weekday", "day_of_week") ?: default).normalizedWatchScheduleWeekday()
+
+private fun JSONObject.watchScheduleMonthDayArg(default: Int = 1): Int =
+    (optionalArg("schedule_month_day", "month_day", "day_of_month") ?: default.toString())
+        .toIntOrNull()
+        ?.coerceIn(1, 31)
+        ?: default.coerceIn(1, 31)
 
 private fun Context.copyToClipboard(text: String) {
     val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -5266,6 +5386,11 @@ private object WatchJobStore {
                     .put("match_mode", job.matchMode)
                     .put("ai_instruction", job.aiInstruction)
                     .put("schedule_minutes", job.scheduleMinutes)
+                    .put("schedule_kind", job.scheduleKind)
+                    .put("schedule_time", job.scheduleTime)
+                    .put("schedule_date", job.scheduleDate)
+                    .put("schedule_weekday", job.scheduleWeekday)
+                    .put("schedule_month_day", job.scheduleMonthDay)
                     .put("alert_message", job.alertMessage)
                     .put("alert_mode", job.alertMode)
                     .put("lifetime", job.lifetime)
@@ -5304,6 +5429,11 @@ private object WatchJobStore {
                         matchMode = item.optString("match_mode").normalizedWatchMatchMode(),
                         aiInstruction = item.optString("ai_instruction"),
                         scheduleMinutes = item.optInt("schedule_minutes", 0),
+                        scheduleKind = item.optString("schedule_kind").normalizedWatchScheduleKind(),
+                        scheduleTime = item.optString("schedule_time").normalizedWatchScheduleTime(),
+                        scheduleDate = item.optString("schedule_date").ifBlank { defaultWatchScheduleDate() }.normalizedWatchScheduleDate(),
+                        scheduleWeekday = item.optString("schedule_weekday").normalizedWatchScheduleWeekday(),
+                        scheduleMonthDay = item.optInt("schedule_month_day", 1).coerceIn(1, 31),
                         alertMessage = item.optString("alert_message"),
                         alertMode = item.optString("alert_mode").normalizedWatchAlertMode(),
                         lifetime = item.optString("lifetime").normalizedWatchLifetime(),
@@ -5354,7 +5484,8 @@ private object WatchJobRunner {
     }
 
     fun schedule(context: Context, job: WatchJob) {
-        if (!job.enabled || job.trigger != "schedule" || job.scheduleMinutes <= 0) {
+        val triggerAt = job.nextScheduledRunAt()
+        if (triggerAt == null) {
             cancel(context, job.id)
             return
         }
@@ -5367,7 +5498,6 @@ private object WatchJobRunner {
                 .putExtra(ExtraJobId, job.id),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val triggerAt = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(job.scheduleMinutes.toLong())
         alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
     }
 
@@ -5710,7 +5840,13 @@ private fun WatchJob.afterWatchJobMatch(): WatchJob =
     }
 
 private fun WatchJob.afterWatchJobRun(now: Long): WatchJob =
-    if (isWatchJobExpired(now)) copy(enabled = false, lastRunAt = now) else this
+    if (trigger == "schedule" && scheduleKind.normalizedWatchScheduleKind() == WatchScheduleOnce) {
+        copy(enabled = false, lastRunAt = now)
+    } else if (isWatchJobExpired(now)) {
+        copy(enabled = false, lastRunAt = now)
+    } else {
+        this
+    }
 
 private fun StatusBarNotification.toWatchNotificationJson(): JSONObject {
     val extras = notification.extras
@@ -6941,6 +7077,64 @@ private fun String.toNativeInput(attachments: List<ChatImageAttachment>): Any {
     return input
 }
 
+private fun String.withReverseImageSearchAttachmentHints(
+    attachments: List<ChatImageAttachment>,
+    serverToolsEnabled: Boolean,
+    integrations: String,
+    allowedTools: String,
+): String {
+    if (!serverToolsEnabled) return this
+    if (!integrations.contains("local-web", ignoreCase = true)) return this
+    if (!allowedTools.allowsServerTool("reverse_image_search")) return this
+    if (!requestsReverseImageSearch()) return this
+
+    val imageHints = attachments
+        .filter { it.dataUrl.startsWith("data:image/", ignoreCase = true) }
+        .take(3)
+        .mapIndexed { index, attachment ->
+            "Image ${index + 1} (${attachment.label}): ${attachment.dataUrl}"
+        }
+
+    if (imageHints.isEmpty()) return this
+
+    return buildString {
+        append(this@withReverseImageSearchAttachmentHints)
+        append("\n\n[Tool-only image data for reverse_image_search]\n")
+        appendLine("If the user asks to search, identify, or find the source of the attached image online, call reverse_image_search with one of these imageUrl values exactly. Do not quote these data URLs in the final answer.")
+        imageHints.forEach { appendLine(it) }
+        append("[/Tool-only image data for reverse_image_search]")
+    }
+}
+
+private fun String.requestsReverseImageSearch(): Boolean {
+    val normalized = lowercase(Locale.ROOT)
+    return listOf(
+        "reverse image",
+        "image search",
+        "photo search",
+        "picture search",
+        "search this image",
+        "search this photo",
+        "search this picture",
+        "search online",
+        "find this image",
+        "find this photo",
+        "find online",
+        "where is this from",
+        "source of this image",
+        "identify this image",
+        "identify this photo",
+    ).any { it in normalized }
+}
+
+private fun String.allowsServerTool(toolName: String): Boolean =
+    trim().isBlank() ||
+        lines()
+            .flatMap { line -> line.split(",") }
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .any { it.equals(toolName, ignoreCase = true) }
+
 private fun String.toIntegrationsJsonArray(allowedTools: String): JSONArray {
     val trimmed = trim()
     if (trimmed.isBlank()) return JSONArray()
@@ -7522,8 +7716,8 @@ fun LmStudioApp(
     onAppendCapabilityGuideToSystemPromptChange: (Boolean) -> Unit,
     onAppendDateTimeToSystemPromptChange: (Boolean) -> Unit,
     onShareDefaultSelectionEnabledChange: (Boolean) -> Unit,
-    onCreateWatchJob: (String, String, String, String, String, String, String, String, String, String, String) -> Unit,
-    onUpdateWatchJob: (String, String, String, String, String, String, String, String, String, String, String, String, Boolean) -> Unit,
+    onCreateWatchJob: (String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String) -> Unit,
+    onUpdateWatchJob: (String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, Boolean) -> Unit,
     onToggleWatchJob: (String, Boolean) -> Unit,
     onDeleteWatchJob: (String) -> Unit,
     onSystemProfileSelect: (String) -> Unit,
@@ -10778,15 +10972,15 @@ private fun ChatComposer(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun WatchJobsSheet(
     state: ChatUiState,
     onDismiss: () -> Unit,
     selectedUtilityTab: UtilityTab,
     onUtilityTabSelected: (UtilityTab) -> Unit,
-    onCreateWatchJob: (String, String, String, String, String, String, String, String, String, String, String) -> Unit,
-    onUpdateWatchJob: (String, String, String, String, String, String, String, String, String, String, String, String, Boolean) -> Unit,
+    onCreateWatchJob: (String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String) -> Unit,
+    onUpdateWatchJob: (String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, Boolean) -> Unit,
     onToggleWatchJob: (String, Boolean) -> Unit,
     onDeleteWatchJob: (String) -> Unit,
 ) {
@@ -10799,6 +10993,11 @@ private fun WatchJobsSheet(
     var matchMode by remember { mutableStateOf("filter") }
     var aiInstruction by remember { mutableStateOf("") }
     var scheduleMinutes by remember { mutableStateOf("15") }
+    var scheduleKind by remember { mutableStateOf(WatchScheduleInterval) }
+    var scheduleTime by remember { mutableStateOf(DefaultWatchScheduleTime) }
+    var scheduleDate by remember { mutableStateOf(defaultWatchScheduleDate()) }
+    var scheduleWeekday by remember { mutableStateOf(DefaultWatchScheduleWeekday) }
+    var scheduleMonthDay by remember { mutableStateOf("1") }
     var alertMessage by remember { mutableStateOf("") }
     var alertMode by remember { mutableStateOf("normal") }
     var lifetime by remember { mutableStateOf("noend") }
@@ -10816,6 +11015,11 @@ private fun WatchJobsSheet(
         matchMode = "filter"
         aiInstruction = ""
         scheduleMinutes = "15"
+        scheduleKind = WatchScheduleInterval
+        scheduleTime = DefaultWatchScheduleTime
+        scheduleDate = defaultWatchScheduleDate()
+        scheduleWeekday = DefaultWatchScheduleWeekday
+        scheduleMonthDay = "1"
         alertMessage = ""
         alertMode = "normal"
         lifetime = "noend"
@@ -10833,6 +11037,11 @@ private fun WatchJobsSheet(
         matchMode = job.matchMode.normalizedWatchMatchMode()
         aiInstruction = job.aiInstruction
         scheduleMinutes = job.scheduleMinutes.takeIf { it > 0 }?.toString() ?: "15"
+        scheduleKind = job.scheduleKind.normalizedWatchScheduleKind()
+        scheduleTime = job.scheduleTime.normalizedWatchScheduleTime()
+        scheduleDate = job.scheduleDate.ifBlank { defaultWatchScheduleDate() }.normalizedWatchScheduleDate()
+        scheduleWeekday = job.scheduleWeekday.normalizedWatchScheduleWeekday()
+        scheduleMonthDay = job.scheduleMonthDay.coerceIn(1, 31).toString()
         alertMessage = job.alertMessage
         alertMode = job.alertMode.normalizedWatchAlertMode()
         lifetime = job.lifetime.normalizedWatchLifetime()
@@ -10992,13 +11201,128 @@ private fun WatchJobsSheet(
                 )
             }
             AnimatedVisibility(visible = trigger == "schedule") {
-                GenerationNumberField(
-                    value = scheduleMinutes,
-                    onValueChange = { scheduleMinutes = it },
-                    label = "Check every minutes",
-                    modifier = Modifier.fillMaxWidth(),
-                    decimal = false,
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "Schedule",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        listOf(
+                            WatchScheduleInterval to "Interval",
+                            WatchScheduleDaily to "Daily",
+                            WatchScheduleWeekly to "Weekly",
+                            WatchScheduleMonthly to "Monthly",
+                            WatchScheduleOnce to "Once",
+                        ).forEach { (kind, label) ->
+                            FilterChip(
+                                selected = scheduleKind == kind,
+                                onClick = { scheduleKind = kind },
+                                label = { Text(label) },
+                            )
+                        }
+                    }
+                    when (scheduleKind) {
+                        WatchScheduleDaily -> {
+                            OutlinedTextField(
+                                value = scheduleTime,
+                                onValueChange = { scheduleTime = it },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = true,
+                                label = { Text("Start time") },
+                                placeholder = { Text("09:00") },
+                            )
+                        }
+                        WatchScheduleWeekly -> {
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                WatchScheduleWeekdayOptions.forEach { weekday ->
+                                    FilterChip(
+                                        selected = scheduleWeekday == weekday,
+                                        onClick = { scheduleWeekday = weekday },
+                                        label = { Text(weekday.watchScheduleWeekdayShortLabel()) },
+                                    )
+                                }
+                            }
+                            OutlinedTextField(
+                                value = scheduleTime,
+                                onValueChange = { scheduleTime = it },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = true,
+                                label = { Text("Start time") },
+                                placeholder = { Text("09:00") },
+                            )
+                        }
+                        WatchScheduleMonthly -> {
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                GenerationNumberField(
+                                    value = scheduleMonthDay,
+                                    onValueChange = { scheduleMonthDay = it },
+                                    label = "Day",
+                                    modifier = Modifier.weight(1f),
+                                    decimal = false,
+                                )
+                                OutlinedTextField(
+                                    value = scheduleTime,
+                                    onValueChange = { scheduleTime = it },
+                                    modifier = Modifier.weight(1f),
+                                    singleLine = true,
+                                    label = { Text("Time") },
+                                    placeholder = { Text("09:00") },
+                                )
+                            }
+                        }
+                        WatchScheduleOnce -> {
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                OutlinedTextField(
+                                    value = scheduleDate,
+                                    onValueChange = { scheduleDate = it },
+                                    modifier = Modifier.weight(1.2f),
+                                    singleLine = true,
+                                    label = { Text("Date") },
+                                    placeholder = { Text("2026-06-01") },
+                                )
+                                OutlinedTextField(
+                                    value = scheduleTime,
+                                    onValueChange = { scheduleTime = it },
+                                    modifier = Modifier.weight(0.8f),
+                                    singleLine = true,
+                                    label = { Text("Time") },
+                                    placeholder = { Text("09:00") },
+                                )
+                            }
+                        }
+                        else -> {
+                            GenerationNumberField(
+                                value = scheduleMinutes,
+                                onValueChange = { scheduleMinutes = it },
+                                label = "Check every minutes",
+                                modifier = Modifier.fillMaxWidth(),
+                                decimal = false,
+                            )
+                        }
+                    }
+                    Text(
+                        text = WatchJob(
+                            title = title.ifBlank { "Preview" },
+                            trigger = "schedule",
+                            matchMode = matchMode,
+                            scheduleMinutes = scheduleMinutes.toIntOrNull()?.coerceIn(1, 1440) ?: 15,
+                            scheduleKind = scheduleKind,
+                            scheduleTime = scheduleTime,
+                            scheduleDate = scheduleDate,
+                            scheduleWeekday = scheduleWeekday,
+                            scheduleMonthDay = scheduleMonthDay.toIntOrNull()?.coerceIn(1, 31) ?: 1,
+                        ).watchScheduleDescription(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
             OutlinedTextField(
                 value = alertMessage,
@@ -11098,6 +11422,20 @@ private fun WatchJobsSheet(
                             localError = "Add at least one filter so the job does not alert on every notification."
                             return@Button
                         }
+                        val effectiveTrigger = if (matchMode == "prompt") "schedule" else trigger
+                        if (effectiveTrigger == "schedule" && scheduleKind == WatchScheduleOnce) {
+                            val nextRun = WatchJob(
+                                title = title.ifBlank { "Preview" },
+                                trigger = "schedule",
+                                scheduleKind = WatchScheduleOnce,
+                                scheduleTime = scheduleTime,
+                                scheduleDate = scheduleDate,
+                            ).nextScheduledRunAt()
+                            if (nextRun == null) {
+                                localError = "Set a future date and time for a one-time schedule."
+                                return@Button
+                            }
+                        }
                         localError = null
                         val jobId = editingJobId
                         if (jobId == null) {
@@ -11110,6 +11448,11 @@ private fun WatchJobsSheet(
                                 matchMode,
                                 aiInstruction,
                                 scheduleMinutes,
+                                scheduleKind,
+                                scheduleTime,
+                                scheduleDate,
+                                scheduleWeekday,
+                                scheduleMonthDay,
                                 alertMessage,
                                 alertMode,
                                 lifetime,
@@ -11125,6 +11468,11 @@ private fun WatchJobsSheet(
                                 matchMode,
                                 aiInstruction,
                                 scheduleMinutes,
+                                scheduleKind,
+                                scheduleTime,
+                                scheduleDate,
+                                scheduleWeekday,
+                                scheduleMonthDay,
                                 alertMessage,
                                 alertMode,
                                 lifetime,
@@ -11221,15 +11569,7 @@ private fun WatchJobCard(
                         fontWeight = FontWeight.SemiBold,
                     )
                     Text(
-                        text = if (job.trigger == "schedule") {
-                            if (job.matchMode.normalizedWatchMatchMode() == "prompt") {
-                                "Prompt every ${job.scheduleMinutes} min"
-                            } else {
-                                "Every ${job.scheduleMinutes} min"
-                            }
-                        } else {
-                            "On matching notification"
-                        },
+                        text = job.watchScheduleDescription(),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -11423,6 +11763,179 @@ private fun String.normalizedWatchMatchMode(): String =
         else -> "filter"
     }
 
+private fun String.normalizedWatchScheduleKind(): String =
+    when (trim().lowercase(Locale.getDefault()).replace("_", "-").replace(" ", "-")) {
+        "daily", "day", "every-day", "everyday" -> WatchScheduleDaily
+        "weekly", "week", "every-week" -> WatchScheduleWeekly
+        "monthly", "month", "every-month" -> WatchScheduleMonthly
+        "once", "one-time", "one-off", "single", "date", "scheduled-date" -> WatchScheduleOnce
+        else -> WatchScheduleInterval
+    }
+
+private fun defaultWatchScheduleDate(now: Long = System.currentTimeMillis()): String =
+    Instant.ofEpochMilli(now)
+        .atZone(ZoneId.systemDefault())
+        .toLocalDate()
+        .format(DateTimeFormatter.ISO_LOCAL_DATE)
+
+private fun String.normalizedWatchScheduleDate(fallbackMillis: Long = System.currentTimeMillis()): String =
+    runCatching {
+        LocalDate.parse(trim(), DateTimeFormatter.ISO_LOCAL_DATE)
+            .format(DateTimeFormatter.ISO_LOCAL_DATE)
+    }.getOrElse {
+        defaultWatchScheduleDate(fallbackMillis)
+    }
+
+private fun String.normalizedWatchScheduleTime(fallback: String = DefaultWatchScheduleTime): String {
+    fun parse(raw: String): Pair<Int, Int>? {
+        val value = raw.trim()
+        val colonMatch = Regex("""^(\d{1,2}):(\d{1,2})$""").matchEntire(value)
+        if (colonMatch != null) {
+            val hour = colonMatch.groupValues[1].toIntOrNull()
+            val minute = colonMatch.groupValues[2].toIntOrNull()
+            if (hour != null && minute != null && hour in 0..23 && minute in 0..59) {
+                return hour to minute
+            }
+        }
+        val compact = value.filter { it.isDigit() }
+        if (compact.length == 3 || compact.length == 4) {
+            val hour = compact.dropLast(2).toIntOrNull()
+            val minute = compact.takeLast(2).toIntOrNull()
+            if (hour != null && minute != null && hour in 0..23 && minute in 0..59) {
+                return hour to minute
+            }
+        }
+        return null
+    }
+    val parsed = parse(this) ?: parse(fallback) ?: (9 to 0)
+    return String.format(Locale.US, "%02d:%02d", parsed.first, parsed.second)
+}
+
+private fun String.watchScheduleTimeParts(): Pair<Int, Int> {
+    val parts = normalizedWatchScheduleTime().split(":")
+    return (parts.getOrNull(0)?.toIntOrNull() ?: 9) to (parts.getOrNull(1)?.toIntOrNull() ?: 0)
+}
+
+private fun String.normalizedWatchScheduleWeekday(): String =
+    when (trim().lowercase(Locale.getDefault()).replace("_", "-").replace(" ", "-")) {
+        "1", "mon", "monday" -> "monday"
+        "2", "tue", "tues", "tuesday" -> "tuesday"
+        "3", "wed", "wednesday" -> "wednesday"
+        "4", "thu", "thur", "thurs", "thursday" -> "thursday"
+        "5", "fri", "friday" -> "friday"
+        "6", "sat", "saturday" -> "saturday"
+        "7", "sun", "sunday" -> "sunday"
+        else -> DefaultWatchScheduleWeekday
+    }
+
+private fun String.watchScheduleWeekdayLabel(): String =
+    when (normalizedWatchScheduleWeekday()) {
+        "tuesday" -> "Tuesday"
+        "wednesday" -> "Wednesday"
+        "thursday" -> "Thursday"
+        "friday" -> "Friday"
+        "saturday" -> "Saturday"
+        "sunday" -> "Sunday"
+        else -> "Monday"
+    }
+
+private fun String.watchScheduleWeekdayShortLabel(): String =
+    when (normalizedWatchScheduleWeekday()) {
+        "tuesday" -> "Tue"
+        "wednesday" -> "Wed"
+        "thursday" -> "Thu"
+        "friday" -> "Fri"
+        "saturday" -> "Sat"
+        "sunday" -> "Sun"
+        else -> "Mon"
+    }
+
+private fun String.toWatchCalendarDayOfWeek(): Int =
+    when (normalizedWatchScheduleWeekday()) {
+        "tuesday" -> Calendar.TUESDAY
+        "wednesday" -> Calendar.WEDNESDAY
+        "thursday" -> Calendar.THURSDAY
+        "friday" -> Calendar.FRIDAY
+        "saturday" -> Calendar.SATURDAY
+        "sunday" -> Calendar.SUNDAY
+        else -> Calendar.MONDAY
+    }
+
+private fun Calendar.setWatchScheduleTime(time: Pair<Int, Int>) {
+    set(Calendar.HOUR_OF_DAY, time.first)
+    set(Calendar.MINUTE, time.second)
+    set(Calendar.SECOND, 0)
+    set(Calendar.MILLISECOND, 0)
+}
+
+private fun Calendar.setWatchScheduleMonthDay(day: Int) {
+    set(Calendar.DAY_OF_MONTH, minOf(day.coerceIn(1, 31), getActualMaximum(Calendar.DAY_OF_MONTH)))
+}
+
+private fun WatchJob.nextScheduledRunAt(now: Long = System.currentTimeMillis()): Long? {
+    if (!enabled || trigger != "schedule") return null
+    val time = scheduleTime.watchScheduleTimeParts()
+    return when (scheduleKind.normalizedWatchScheduleKind()) {
+        WatchScheduleDaily -> {
+            Calendar.getInstance().apply {
+                timeInMillis = now
+                setWatchScheduleTime(time)
+                if (timeInMillis <= now) add(Calendar.DAY_OF_YEAR, 1)
+            }.timeInMillis
+        }
+        WatchScheduleWeekly -> {
+            Calendar.getInstance().apply {
+                timeInMillis = now
+                set(Calendar.DAY_OF_WEEK, scheduleWeekday.toWatchCalendarDayOfWeek())
+                setWatchScheduleTime(time)
+                if (timeInMillis <= now) add(Calendar.WEEK_OF_YEAR, 1)
+            }.timeInMillis
+        }
+        WatchScheduleMonthly -> {
+            Calendar.getInstance().apply {
+                timeInMillis = now
+                setWatchScheduleTime(time)
+                setWatchScheduleMonthDay(scheduleMonthDay)
+                if (timeInMillis <= now) {
+                    add(Calendar.MONTH, 1)
+                    setWatchScheduleMonthDay(scheduleMonthDay)
+                    setWatchScheduleTime(time)
+                }
+            }.timeInMillis
+        }
+        WatchScheduleOnce -> {
+            val date = runCatching {
+                LocalDate.parse(
+                    scheduleDate.ifBlank { defaultWatchScheduleDate(now) },
+                    DateTimeFormatter.ISO_LOCAL_DATE,
+                )
+            }.getOrNull() ?: return null
+            val target = date.atTime(time.first, time.second)
+                .atZone(ZoneId.systemDefault())
+                .toInstant()
+                .toEpochMilli()
+            target.takeIf { it > now }
+        }
+        else -> {
+            val minutes = scheduleMinutes.takeIf { it > 0 } ?: return null
+            now + TimeUnit.MINUTES.toMillis(minutes.coerceIn(1, 1440).toLong())
+        }
+    }
+}
+
+private fun WatchJob.watchScheduleDescription(): String {
+    if (trigger != "schedule") return "On matching notification"
+    val action = if (matchMode.normalizedWatchMatchMode() == "prompt") "Prompt" else "Check"
+    val time = scheduleTime.normalizedWatchScheduleTime()
+    return when (scheduleKind.normalizedWatchScheduleKind()) {
+        WatchScheduleDaily -> "$action daily at $time"
+        WatchScheduleWeekly -> "$action weekly on ${scheduleWeekday.watchScheduleWeekdayLabel()} at $time"
+        WatchScheduleMonthly -> "$action monthly on day ${scheduleMonthDay.coerceIn(1, 31)} at $time"
+        WatchScheduleOnce -> "$action once on ${scheduleDate.ifBlank { defaultWatchScheduleDate() }.normalizedWatchScheduleDate()} at $time"
+        else -> "$action every ${scheduleMinutes.coerceIn(1, 1440)} min"
+    }
+}
+
 private fun String.watchAlertModeLabel(): String =
     if (normalizedWatchAlertMode() == "alarm") "Alarm" else "Normal"
 
@@ -11452,7 +11965,7 @@ private fun WatchJob.watchJobToolDescription(): String =
         appendLine("Title: $title")
         appendLine("ID: $id")
         appendLine("Enabled: $enabled")
-        appendLine("Trigger: $trigger${if (trigger == "schedule") " every $scheduleMinutes minutes" else ""}")
+        appendLine("Trigger: $trigger${if (trigger == "schedule") " (${watchScheduleDescription()})" else ""}")
         appendLine("Match mode: ${matchMode.watchMatchModeLabel()}")
         appendLine("Filters: ${watchJobFiltersText()}")
         when (matchMode.normalizedWatchMatchMode()) {

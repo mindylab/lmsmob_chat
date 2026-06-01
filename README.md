@@ -35,8 +35,9 @@ from the GitHub releases page.
 - Connects to LM Studio MCP/plugin integrations such as `mcp/local-web`.
 - Tested companion LM Studio tools are published at
   [mindylab/lm_studio_tools](https://github.com/mindylab/lm_studio_tools).
-- Displays MCP image outputs in chat, including web page screenshots and
-  generated QR codes returned by LM Studio tools.
+- Displays MCP image outputs in chat, including web page screenshots,
+  reverse image search results, and generated QR codes returned by LM Studio
+  tools.
 - Refreshes loaded LM Studio models from the app settings.
 - Keeps chat sessions locally with folders, search, session switching, and
   reusable chat text presets for quickly appending common instructions.
@@ -60,9 +61,9 @@ from the GitHub releases page.
   screen, and preparing alarm creation drafts.
 - Adds Watch Jobs: local notification monitors, scheduled notification-history
   checks, and scheduled LM Studio prompt checks with filters, AI classification,
-  server-tool support, normal notifications, alarm-style full-screen alerts,
-  once/today/no-end lifetimes, and confirmation before model-created jobs are
-  saved.
+  server-tool support, interval/daily/weekly/monthly/one-time scheduling,
+  normal notifications, alarm-style full-screen alerts, once/today/no-end
+  lifetimes, and confirmation before model-created jobs are saved.
 - Shows clickable source chips and clickable links in rich chat answers.
 - Exports Markdown tables from chat answers as XLSX files.
 - Appends a capability guide to prompts so the selected model knows which
@@ -102,7 +103,7 @@ tool data.
 
 The 2026 roadmap now builds on the first phone-assistant tools shipped in
 v1.28, the Watch Jobs release in v1.40, and scheduled prompt Watch Jobs in
-v1.58:
+v1.59:
 
 - Web tools already work through compatible LM Studio MCP/plugin setup, with a
   tested local-web MCP server available in
@@ -111,7 +112,8 @@ v1.58:
 - Maps route drafts, contact lookup, notification digest, local file search,
   device status, and confirmable phone action drafts are available now.
 - Alarm tools and Watch Jobs are available now for opt-in notification
-  monitors, scheduled LM Studio prompt checks, and stronger local alerts.
+  monitors, scheduled LM Studio prompt checks, daily/weekly/monthly/one-time
+  schedules, and stronger local alerts.
 - Phone location tools are still planned with explicit Android permission
   controls.
 - Broader cron-style task history, pause/resume controls, and safe follow-up
@@ -158,8 +160,8 @@ The tested LM Studio tools repo is
 [mindylab/lm_studio_tools](https://github.com/mindylab/lm_studio_tools). It
 contains the `local-web` MCP server used with LMSMOB Chat, including
 `web_search`, `web_fetch`, `web_search_and_fetch`, `youtube_transcript`,
-`qr_generate`, `qr_scan`, and `web_page_to_images`, plus ready-to-copy
-`mcp.json` examples.
+`qr_generate`, `qr_scan`, `reverse_image_search`, and `web_page_to_images`,
+plus ready-to-copy `mcp.json` examples.
 
 Server-side tools require an LM Studio API token. In LM Studio, create a
 permission token from **Developer > Server Settings > Manage Tokens**, then
@@ -207,6 +209,7 @@ web_search_and_fetch
 youtube_transcript
 qr_generate
 qr_scan
+reverse_image_search
 web_page_to_images
 ```
 

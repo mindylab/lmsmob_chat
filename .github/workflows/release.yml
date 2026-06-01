@@ -58,11 +58,11 @@ jobs:
           LMSMOB Chat is an Android client for LM Studio local models.
 
           Highlights:
-          - Chat text presets for quickly appending reusable instructions to a message.
-          - Pause/resume controls for long local text-to-speech playback.
-          - Clickable links inside rich assistant answers and source blocks.
-          - Scheduled prompt Watch Jobs for recurring LM Studio checks.
-          - MCP image outputs can appear in chat, including screenshots and QR codes.
+          - Watch Jobs now support interval, daily, weekly, monthly, and one-time schedules.
+          - Scheduled prompt Watch Jobs show clearer schedule descriptions in the app and tool results.
+          - LM Studio server-tool guidance now includes reverse_image_search.
+          - Image attachments can add reverse image search hints when that MCP tool is allowed.
+          - Gradle includes compatibility aliases for IDE unit/android test task discovery.
           - Tested with the MindyLab LM Studio tools repository.
 
           Demo: https://youtu.be/mtZJ2uDz3hY

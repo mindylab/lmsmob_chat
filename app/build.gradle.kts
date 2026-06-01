@@ -25,8 +25,8 @@ android {
         applicationId = "com.mindylab.lmstudiochat"
         minSdk = 26
         targetSdk = 35
-        versionCode = 59
-        versionName = "1.58"
+        versionCode = 60
+        versionName = "1.59"
     }
 
     buildFeatures {
@@ -63,6 +63,18 @@ tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach 
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
+}
+
+tasks.register("unitTestClasses") {
+    group = "verification"
+    description = "Compatibility alias for IDE task lists that expect unitTestClasses."
+    dependsOn("compileDebugUnitTestSources")
+}
+
+tasks.register("androidTestClasses") {
+    group = "verification"
+    description = "Compatibility alias for IDE task lists that expect androidTestClasses."
+    dependsOn("compileDebugAndroidTestSources")
 }
 
 dependencies {
