@@ -109,6 +109,8 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.ArrowDropUp
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
@@ -251,6 +253,8 @@ private const val LegacyDefaultSystemPrompt = "You are a helpful assistant runni
 private const val LegacyTranslateLtPresetId = "translate_lt"
 private const val ChatAppendPresetSampleName = "Summarize"
 private const val ChatAppendPresetSampleText = "summarize this text"
+private const val ChatFastScrollSideLeft = "left"
+private const val ChatFastScrollSideRight = "right"
 private const val WatchScheduleInterval = "interval"
 private const val WatchScheduleDaily = "daily"
 private const val WatchScheduleWeekly = "weekly"
@@ -614,6 +618,17 @@ class MainActivity : ComponentActivity() {
                         textToSpeech.voiceOutputVoiceOptions()
                     } else {
                         emptyList()
+                    }
+                }
+                DisposableEffect(speakingMessageId, ttsPaused) {
+                    val keepScreenOn = speakingMessageId != null && !ttsPaused
+                    if (keepScreenOn) {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                    onDispose {
+                        if (keepScreenOn) {
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        }
                     }
                 }
                 fun stopSpeaking() {
@@ -1176,6 +1191,8 @@ class MainActivity : ComponentActivity() {
                     onAppendCapabilityGuideToSystemPromptChange = viewModel::updateAppendCapabilityGuideToSystemPrompt,
                     onAppendDateTimeToSystemPromptChange = viewModel::updateAppendDateTimeToSystemPrompt,
                     onShareDefaultSelectionEnabledChange = viewModel::updateShareDefaultSelectionEnabled,
+                    onChatFastScrollEnabledChange = viewModel::updateChatFastScrollEnabled,
+                    onChatFastScrollSideChange = viewModel::updateChatFastScrollSide,
                     onCreateWatchJob = viewModel::createWatchJob,
                     onUpdateWatchJob = viewModel::updateWatchJob,
                     onToggleWatchJob = viewModel::toggleWatchJob,
@@ -1557,6 +1574,8 @@ data class ChatUiState(
     val activeChatAppendPresetId: String = "",
     val chatAppendPresetNameDraft: String = ChatAppendPresetSampleName,
     val chatAppendPresetTextDraft: String = ChatAppendPresetSampleText,
+    val chatFastScrollEnabled: Boolean = true,
+    val chatFastScrollSide: String = ChatFastScrollSideRight,
     val temperatureDraft: String = "0.7",
     val topPDraft: String = "",
     val maxTokensDraft: String = "",
@@ -1665,6 +1684,8 @@ class ChatViewModel(
             activeChatAppendPresetId = initialActiveChatAppendPreset?.id.orEmpty(),
             chatAppendPresetNameDraft = initialActiveChatAppendPreset?.name ?: ChatAppendPresetSampleName,
             chatAppendPresetTextDraft = initialActiveChatAppendPreset?.template ?: ChatAppendPresetSampleText,
+            chatFastScrollEnabled = settingsStore.chatFastScrollEnabled,
+            chatFastScrollSide = settingsStore.chatFastScrollSide,
             reasoningEnabled = settingsStore.reasoningEnabled,
         ),
     )
@@ -2533,6 +2554,17 @@ class ChatViewModel(
     fun updateWatchJobToolEnabled(value: Boolean) {
         settingsStore.watchJobToolEnabled = value
         _uiState.update { it.copy(watchJobToolEnabled = value, previousResponseId = null) }
+    }
+
+    fun updateChatFastScrollEnabled(value: Boolean) {
+        settingsStore.chatFastScrollEnabled = value
+        _uiState.update { it.copy(chatFastScrollEnabled = value) }
+    }
+
+    fun updateChatFastScrollSide(value: String) {
+        val normalized = value.normalizedChatFastScrollSide()
+        settingsStore.chatFastScrollSide = normalized
+        _uiState.update { it.copy(chatFastScrollSide = normalized) }
     }
 
     fun openWatchJobs() {
@@ -3526,6 +3558,20 @@ class SettingsStore(context: Context) {
         get() = preferences.getString("share_default_destination", "") ?: ""
         set(value) {
             preferences.edit().putString("share_default_destination", value).apply()
+        }
+
+    var chatFastScrollEnabled: Boolean
+        get() = preferences.getBoolean("chat_fast_scroll_enabled", true)
+        set(value) {
+            preferences.edit().putBoolean("chat_fast_scroll_enabled", value).apply()
+        }
+
+    var chatFastScrollSide: String
+        get() = preferences.getString("chat_fast_scroll_side", ChatFastScrollSideRight)
+            ?.normalizedChatFastScrollSide()
+            ?: ChatFastScrollSideRight
+        set(value) {
+            preferences.edit().putString("chat_fast_scroll_side", value.normalizedChatFastScrollSide()).apply()
         }
 
     var temperature: String
@@ -7716,6 +7762,8 @@ fun LmStudioApp(
     onAppendCapabilityGuideToSystemPromptChange: (Boolean) -> Unit,
     onAppendDateTimeToSystemPromptChange: (Boolean) -> Unit,
     onShareDefaultSelectionEnabledChange: (Boolean) -> Unit,
+    onChatFastScrollEnabledChange: (Boolean) -> Unit,
+    onChatFastScrollSideChange: (String) -> Unit,
     onCreateWatchJob: (String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String) -> Unit,
     onUpdateWatchJob: (String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, Boolean) -> Unit,
     onToggleWatchJob: (String, Boolean) -> Unit,
@@ -7819,6 +7867,8 @@ fun LmStudioApp(
             onAppendCapabilityGuideToSystemPromptChange = onAppendCapabilityGuideToSystemPromptChange,
             onAppendDateTimeToSystemPromptChange = onAppendDateTimeToSystemPromptChange,
             onShareDefaultSelectionEnabledChange = onShareDefaultSelectionEnabledChange,
+            onChatFastScrollEnabledChange = onChatFastScrollEnabledChange,
+            onChatFastScrollSideChange = onChatFastScrollSideChange,
             onSystemProfileSelect = onSystemProfileSelect,
             onSystemProfileNameChange = onSystemProfileNameChange,
             onSystemPromptChange = onSystemPromptChange,
@@ -8522,8 +8572,89 @@ private fun MessagesPanel(
     ttsPlaybackState: TtsPlaybackState?,
 ) {
     val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
     var pendingDeleteMessage by remember { mutableStateOf<ChatMessage?>(null) }
     val isTemporaryChat = state.sessions.firstOrNull { it.id == state.activeSessionId }?.isTemporary == true
+    val leadingItems = if (isTemporaryChat) 1 else 0
+    val playingChunkIndex = ttsPlaybackState
+        ?.chunks
+        ?.firstOrNull { it.status == TtsChunkStatus.Playing }
+        ?.index
+
+    fun currentTtsTargetMessage(): ChatMessage? {
+        speakingMessageId?.let { activeId ->
+            state.messages.firstOrNull { it.id == activeId }?.let { return it }
+        }
+        val visibleMessageIds = listState.layoutInfo.visibleItemsInfo
+            .mapNotNull { it.key as? String }
+        visibleMessageIds.forEach { id ->
+            val message = state.messages.firstOrNull { it.id == id }
+            if (
+                message != null &&
+                message.role == MessageRole.Assistant &&
+                !message.isStreaming &&
+                message.content.speakableAnswerText().isNotBlank()
+            ) {
+                return message
+            }
+        }
+        val currentIndex = (listState.firstVisibleItemIndex - leadingItems)
+            .coerceIn(0, state.messages.lastIndex.coerceAtLeast(0))
+        return state.messages
+            .drop(currentIndex)
+            .firstOrNull {
+                it.role == MessageRole.Assistant &&
+                    !it.isStreaming &&
+                    it.content.speakableAnswerText().isNotBlank()
+            }
+            ?: state.messages
+                .take(currentIndex + 1)
+                .lastOrNull {
+                    it.role == MessageRole.Assistant &&
+                        !it.isStreaming &&
+                        it.content.speakableAnswerText().isNotBlank()
+                }
+    }
+
+    fun toggleCurrentTtsMessage() {
+        if (!state.voiceOutputEnabled) return
+        val target = currentTtsTargetMessage() ?: return
+        when {
+            speakingMessageId == target.id && ttsPaused -> onResumeSpeaking()
+            speakingMessageId == target.id -> onPauseSpeaking()
+            else -> onSpeakMessage(target.id, target.content)
+        }
+    }
+
+    fun scrollByMessage(direction: Int) {
+        if (state.messages.isEmpty()) return
+        val firstMessageIndex = listState.firstVisibleItemIndex - leadingItems
+        val currentMessageIndex = firstMessageIndex.coerceIn(0, state.messages.lastIndex)
+        if (direction > 0 && currentMessageIndex >= state.messages.lastIndex) {
+            scope.launch {
+                listState.animateScrollToItem(
+                    index = leadingItems + state.messages.lastIndex,
+                    scrollOffset = Int.MAX_VALUE / 4,
+                )
+            }
+            return
+        }
+        val targetMessageIndex = if (direction < 0) {
+            if (
+                firstMessageIndex in state.messages.indices &&
+                listState.firstVisibleItemScrollOffset > 36
+            ) {
+                currentMessageIndex
+            } else {
+                currentMessageIndex - 1
+            }
+        } else {
+            currentMessageIndex + 1
+        }.coerceIn(0, state.messages.lastIndex)
+        scope.launch {
+            listState.animateScrollToItem(leadingItems + targetMessageIndex)
+        }
+    }
 
     LaunchedEffect(
         state.messages.size,
@@ -8532,7 +8663,6 @@ private fun MessagesPanel(
         isTemporaryChat,
     ) {
         if (state.messages.isNotEmpty() || state.isSending) {
-            val leadingItems = if (isTemporaryChat) 1 else 0
             val lastVisibleItem = if (state.isSending) {
                 state.messages.size
             } else {
@@ -8542,49 +8672,110 @@ private fun MessagesPanel(
         }
     }
 
-    LazyColumn(
-        state = listState,
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(contentPadding),
-        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(22.dp),
-    ) {
-        if (isTemporaryChat) {
-            item(key = "temporary-chat-notice") {
-                TemporaryChatNotice()
+    LaunchedEffect(speakingMessageId, playingChunkIndex) {
+        val activeMessageId = speakingMessageId ?: return@LaunchedEffect
+        val activeMessageIndex = state.messages.indexOfFirst { it.id == activeMessageId }
+        if (activeMessageIndex < 0) return@LaunchedEffect
+        val itemIndex = leadingItems + activeMessageIndex
+        val chunks = ttsPlaybackState?.chunks.orEmpty()
+        val activeChunk = playingChunkIndex ?: chunks.indexOfFirst { it.status == TtsChunkStatus.Playing }
+        val chunkProgress = if (chunks.isNotEmpty() && activeChunk in chunks.indices) {
+            val totalChars = chunks.sumOf { it.charCount.coerceAtLeast(1) }.coerceAtLeast(1)
+            val previousChars = chunks
+                .take(activeChunk)
+                .sumOf { it.charCount.coerceAtLeast(1) }
+            val activeChars = chunks[activeChunk].charCount.coerceAtLeast(1)
+            ((previousChars + (activeChars / 2f)) / totalChars.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+        var layoutInfo = listState.layoutInfo
+        var activeItem = layoutInfo.visibleItemsInfo.firstOrNull {
+            it.index == itemIndex || it.key == activeMessageId
+        }
+        if (activeItem == null) {
+            listState.animateScrollToItem(itemIndex)
+            delay(60)
+            layoutInfo = listState.layoutInfo
+            activeItem = layoutInfo.visibleItemsInfo.firstOrNull {
+                it.index == itemIndex || it.key == activeMessageId
+            }
+        }
+        val viewportHeight = (layoutInfo.viewportEndOffset - layoutInfo.viewportStartOffset)
+            .coerceAtLeast(1)
+        val messageHeight = activeItem?.size?.coerceAtLeast(1) ?: viewportHeight
+        val activeChunkCenterInMessage = messageHeight * chunkProgress
+        val desiredActiveY = viewportHeight * 0.45f
+        val scrollOffset = (activeChunkCenterInMessage - desiredActiveY)
+            .roundToInt()
+            .coerceAtLeast(0)
+        listState.animateScrollToItem(
+            index = itemIndex,
+            scrollOffset = scrollOffset,
+        )
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(contentPadding),
+            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(22.dp),
+        ) {
+            if (isTemporaryChat) {
+                item(key = "temporary-chat-notice") {
+                    TemporaryChatNotice()
+                }
+            }
+
+            if (state.messages.isEmpty() && !state.isSending) {
+                item {
+                    EmptyConversation(onSuggestion = onSuggestion)
+                }
+            }
+
+            items(
+                items = state.messages,
+                key = { it.id },
+            ) { message ->
+                MessageRow(
+                    message = message,
+                    onEditMessage = onEditMessage,
+                    onDeleteMessage = { pendingDeleteMessage = message },
+                    voiceOutputEnabled = state.voiceOutputEnabled,
+                    onSpeakMessage = onSpeakMessage,
+                    onStopSpeaking = onStopSpeaking,
+                    onPauseSpeaking = onPauseSpeaking,
+                    onResumeSpeaking = onResumeSpeaking,
+                    speakingMessageId = speakingMessageId,
+                    ttsPaused = ttsPaused,
+                    ttsPlaybackState = ttsPlaybackState?.takeIf { it.messageId == message.id },
+                )
+            }
+
+            if (state.isSending && state.messages.none { it.isStreaming }) {
+                item {
+                    TypingRow()
+                }
             }
         }
 
-        if (state.messages.isEmpty() && !state.isSending) {
-            item {
-                EmptyConversation(onSuggestion = onSuggestion)
-            }
-        }
-
-        items(
-            items = state.messages,
-            key = { it.id },
-        ) { message ->
-            MessageRow(
-                message = message,
-                onEditMessage = onEditMessage,
-                onDeleteMessage = { pendingDeleteMessage = message },
-                voiceOutputEnabled = state.voiceOutputEnabled,
-                onSpeakMessage = onSpeakMessage,
-                onStopSpeaking = onStopSpeaking,
-                onPauseSpeaking = onPauseSpeaking,
-                onResumeSpeaking = onResumeSpeaking,
-                speakingMessageId = speakingMessageId,
-                ttsPaused = ttsPaused,
-                ttsPlaybackState = ttsPlaybackState?.takeIf { it.messageId == message.id },
+        if (state.chatFastScrollEnabled && state.messages.size > 1) {
+            ChatFastScrollControls(
+                side = state.chatFastScrollSide,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(contentPadding),
+                canUseTts = state.voiceOutputEnabled &&
+                    (speakingMessageId != null || currentTtsTargetMessage() != null),
+                isTtsPlaying = speakingMessageId != null && !ttsPaused,
+                isTtsPaused = speakingMessageId != null && ttsPaused,
+                onToggleTts = ::toggleCurrentTtsMessage,
+                onUp = { scrollByMessage(-1) },
+                onDown = { scrollByMessage(1) },
             )
-        }
-
-        if (state.isSending && state.messages.none { it.isStreaming }) {
-            item {
-                TypingRow()
-            }
         }
     }
 
@@ -8710,6 +8901,90 @@ private fun EmptyConversation(onSuggestion: (String) -> Unit) {
 }
 
 @Composable
+private fun ChatFastScrollControls(
+    side: String,
+    modifier: Modifier = Modifier,
+    canUseTts: Boolean,
+    isTtsPlaying: Boolean,
+    isTtsPaused: Boolean,
+    onToggleTts: () -> Unit,
+    onUp: () -> Unit,
+    onDown: () -> Unit,
+) {
+    val alignment = if (side.normalizedChatFastScrollSide() == ChatFastScrollSideLeft) {
+        Alignment.BottomStart
+    } else {
+        Alignment.BottomEnd
+    }
+    Box(
+        modifier = modifier,
+        contentAlignment = alignment,
+    ) {
+        Column(
+            modifier = Modifier
+                .padding(horizontal = 8.dp, vertical = 12.dp)
+                .background(
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.12f),
+                    shape = RoundedCornerShape(24.dp),
+                )
+                .padding(vertical = 5.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            IconButton(
+                onClick = onToggleTts,
+                enabled = canUseTts,
+                modifier = Modifier.size(58.dp),
+                colors = IconButtonDefaults.iconButtonColors(
+                    containerColor = Color.Transparent,
+                    contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f),
+                    disabledContainerColor = Color.Transparent,
+                    disabledContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.28f),
+                ),
+            ) {
+                Icon(
+                    imageVector = if (isTtsPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                    contentDescription = when {
+                        isTtsPlaying -> "Pause current message"
+                        isTtsPaused -> "Resume current message"
+                        else -> "Read current message"
+                    },
+                    modifier = Modifier.size(38.dp),
+                )
+            }
+            IconButton(
+                onClick = onUp,
+                modifier = Modifier.size(58.dp),
+                colors = IconButtonDefaults.iconButtonColors(
+                    containerColor = Color.Transparent,
+                    contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f),
+                ),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.ArrowDropUp,
+                    contentDescription = "Previous message",
+                    modifier = Modifier.size(50.dp),
+                )
+            }
+            IconButton(
+                onClick = onDown,
+                modifier = Modifier.size(58.dp),
+                colors = IconButtonDefaults.iconButtonColors(
+                    containerColor = Color.Transparent,
+                    contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f),
+                ),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.ArrowDropDown,
+                    contentDescription = "Next message",
+                    modifier = Modifier.size(50.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun MessageRow(
     message: ChatMessage,
     onEditMessage: (String) -> Unit,
@@ -8734,11 +9009,6 @@ private fun MessageRow(
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
         verticalAlignment = Alignment.Top,
     ) {
-        if (!isUser) {
-            AppMark(modifier = Modifier.size(30.dp))
-            Spacer(modifier = Modifier.width(10.dp))
-        }
-
         if (isUser) {
             Column(horizontalAlignment = Alignment.End) {
                 Surface(
@@ -8782,7 +9052,7 @@ private fun MessageRow(
                 )
             }
         } else {
-            Column(modifier = Modifier.weight(1f)) {
+            Column(modifier = Modifier.fillMaxWidth()) {
                 Text(
                     text = "LM Studio",
                     style = MaterialTheme.typography.labelMedium,
@@ -11763,6 +12033,12 @@ private fun String.normalizedWatchMatchMode(): String =
         else -> "filter"
     }
 
+private fun String.normalizedChatFastScrollSide(): String =
+    when (trim().lowercase(Locale.getDefault()).replace("_", "-").replace(" ", "-")) {
+        "left", "start" -> ChatFastScrollSideLeft
+        else -> ChatFastScrollSideRight
+    }
+
 private fun String.normalizedWatchScheduleKind(): String =
     when (trim().lowercase(Locale.getDefault()).replace("_", "-").replace(" ", "-")) {
         "daily", "day", "every-day", "everyday" -> WatchScheduleDaily
@@ -12066,6 +12342,8 @@ private fun SettingsSheet(
     onAppendCapabilityGuideToSystemPromptChange: (Boolean) -> Unit,
     onAppendDateTimeToSystemPromptChange: (Boolean) -> Unit,
     onShareDefaultSelectionEnabledChange: (Boolean) -> Unit,
+    onChatFastScrollEnabledChange: (Boolean) -> Unit,
+    onChatFastScrollSideChange: (String) -> Unit,
     onSystemProfileSelect: (String) -> Unit,
     onSystemProfileNameChange: (String) -> Unit,
     onSystemPromptChange: (String) -> Unit,
@@ -12271,6 +12549,40 @@ private fun SettingsSheet(
                 checked = state.appendDateTimeToSystemPrompt,
                 onCheckedChange = onAppendDateTimeToSystemPromptChange,
             )
+            HorizontalDivider(color = DividerDefaults.color.copy(alpha = 0.45f))
+
+            Text(
+                text = "Chat navigation",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            ToolToggleRow(
+                title = "Fast scroll buttons",
+                description = "Show transparent up and down controls over the chat to jump one user or assistant message at a time.",
+                checked = state.chatFastScrollEnabled,
+                onCheckedChange = onChatFastScrollEnabledChange,
+            )
+            AnimatedVisibility(visible = state.chatFastScrollEnabled) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Button side",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = state.chatFastScrollSide.normalizedChatFastScrollSide() == ChatFastScrollSideLeft,
+                            onClick = { onChatFastScrollSideChange(ChatFastScrollSideLeft) },
+                            label = { Text("Left") },
+                        )
+                        FilterChip(
+                            selected = state.chatFastScrollSide.normalizedChatFastScrollSide() == ChatFastScrollSideRight,
+                            onClick = { onChatFastScrollSideChange(ChatFastScrollSideRight) },
+                            label = { Text("Right") },
+                        )
+                    }
+                }
+            }
             OutlinedButton(
                 onClick = { advancedGenerationExpanded = !advancedGenerationExpanded },
                 modifier = Modifier.fillMaxWidth(),
