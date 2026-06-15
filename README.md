@@ -43,7 +43,9 @@ from the GitHub releases page.
   reusable chat text presets for quickly appending common instructions.
 - Supports copy, edit, delete, and cancel actions in chat.
 - Adds optional transparent chat navigation buttons for moving between
-  messages and controlling read-aloud from either side of the screen.
+  messages, one-time send-and-read actions, and controlling read-aloud from
+  either side of the screen.
+- Can notify you when a response finishes while the app is in the background.
 - Imports and exports chat history as JSON.
 - Supports image attachments for vision-capable models.
 - Shares text, images, PDFs, DOC/DOCX, and XLS/XLSX files into the app from
@@ -51,9 +53,10 @@ from the GitHub releases page.
 - Converts supported documents into text, and can render PDFs as image
   attachments for vision-capable models.
 - Adds optional voice input, text-to-speech output, automatic answer read-aloud,
-  Supertonic TTS engine selection, chunked local playback controls with
-  pause/resume, auto-scroll during read-aloud, and screen-awake playback for
-  long assistant answers. For best performance, use the
+  one-time auto-read send, Supertonic TTS engine selection, chunked local
+  playback controls with pause/resume, resume points, retry recovery,
+  auto-scroll during read-aloud, and screen-awake playback for long assistant
+  answers. For best performance, use the
   [MindyLab optimized Supertonic Android engine](https://github.com/mindylab/supersonic_android_all/releases/latest),
   which includes service isolation and request-level processing controls used by
   LMSMOB Chat.
@@ -105,8 +108,8 @@ tool data.
 ## Roadmap
 
 The 2026 roadmap now builds on the first phone-assistant tools shipped in
-v1.28, the Watch Jobs release in v1.40, and scheduled prompt Watch Jobs in
-v1.60:
+v1.28, the Watch Jobs release in v1.40, scheduled prompt Watch Jobs in v1.60,
+and TTS send/recovery improvements in v1.61:
 
 - Web tools already work through compatible LM Studio MCP/plugin setup, with a
   tested local-web MCP server available in

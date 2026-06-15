@@ -58,11 +58,11 @@ jobs:
           LMSMOB Chat is an Android client for LM Studio local models.
 
           Highlights:
-          - Optional transparent chat navigation buttons jump between messages.
-          - Fast-scroll controls can be placed on the left or right side of the chat.
-          - Read-aloud can be started, paused, or resumed from the chat navigation overlay.
-          - TTS playback now keeps the screen awake while active.
-          - Long read-aloud playback can auto-scroll toward the currently playing chunk.
+          - Background notifications can tell you when a chat response finishes.
+          - Long-press send can read the next answer once without changing global auto-read.
+          - TTS playback can resume from the next unfinished chunk.
+          - TTS chunk preparation and playback recover from small transient failures.
+          - Shorter TTS watchdog timeouts reduce waiting on stalled synthesis.
           - Tested with the MindyLab LM Studio tools repository.
 
           Demo: https://youtu.be/mtZJ2uDz3hY

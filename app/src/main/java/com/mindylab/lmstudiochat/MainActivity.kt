@@ -67,6 +67,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.Image
@@ -86,6 +87,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -205,6 +207,8 @@ import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
@@ -255,6 +259,8 @@ private const val ChatAppendPresetSampleName = "Summarize"
 private const val ChatAppendPresetSampleText = "summarize this text"
 private const val ChatFastScrollSideLeft = "left"
 private const val ChatFastScrollSideRight = "right"
+private const val ChatResponseChannelId = "chat_responses"
+private const val ChatResponseNotificationId = 0x4C4D5343
 private const val WatchScheduleInterval = "interval"
 private const val WatchScheduleDaily = "daily"
 private const val WatchScheduleWeekly = "weekly"
@@ -320,11 +326,12 @@ private const val VoiceOutputChunkStepChars = 20
 private const val VoiceOutputDefaultStartBufferChunks = 2
 private const val VoiceOutputMinStartBufferChunks = 1
 private const val VoiceOutputMaxStartBufferChunks = 3
-private const val VoiceOutputSynthesisTimeoutMs = 20000L
-private const val VoiceOutputEngineWatchdogTimeoutMs = 18000L
+private const val VoiceOutputSynthesisTimeoutMs = 15000L
+private const val VoiceOutputEngineWatchdogTimeoutMs = 15000L
 private const val VoiceOutputPreparedWaitTimeoutMs = 45000L
 private const val VoiceOutputSynthesisMaxRetries = 1
 private const val VoiceOutputSynthesisRetryDelayMs = 350L
+private const val VoiceOutputSilentChunkRecoveryLimit = 2
 private const val TtsChunkUtteranceSeparator = "::lmsmob_tts_chunk::"
 private const val TtsSynthesisUtterancePrefix = "synth"
 private const val TtsLogTag = "LMSMOB_TTS"
@@ -523,6 +530,8 @@ class MainActivity : ComponentActivity() {
                 var pendingShareContent by remember { mutableStateOf<PreparedShareContent?>(null) }
                 val uiScope = rememberCoroutineScope()
                 val mainHandler = remember { Handler(Looper.getMainLooper()) }
+                var appInForeground by remember { mutableStateOf(true) }
+                var autoReadNextAssistantMessage by remember { mutableStateOf(false) }
                 var ttsReady by remember { mutableStateOf(false) }
                 var speakingMessageId by remember { mutableStateOf<String?>(null) }
                 var ttsPaused by remember { mutableStateOf(false) }
@@ -530,6 +539,7 @@ class MainActivity : ComponentActivity() {
                 var ttsMediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
                 val ttsSynthesisResults = remember { mutableMapOf<String, CompletableDeferred<Boolean>>() }
                 var ttsPlaybackState by remember { mutableStateOf<TtsPlaybackState?>(null) }
+                var ttsResumePoints by remember { mutableStateOf<Map<String, TtsResumePoint>>(emptyMap()) }
                 val ttsRunCounter = remember { AtomicLong(0L) }
                 var ttsVoiceOptions by remember { mutableStateOf<List<VoiceOutputVoiceOption>>(emptyList()) }
                 val selectedTtsEnginePackage = state.voiceOutputEngine.voiceOutputEnginePackageName()
@@ -543,6 +553,20 @@ class MainActivity : ComponentActivity() {
                     ?.let { context.isPackageInstalled(it) }
                     ?: true
                 val effectiveTtsEnginePackage = selectedTtsEnginePackage.takeIf { selectedTtsEngineAvailable }
+                DisposableEffect(Unit) {
+                    val observer = LifecycleEventObserver { _, event ->
+                        appInForeground = when (event) {
+                            Lifecycle.Event.ON_START,
+                            Lifecycle.Event.ON_RESUME -> true
+                            Lifecycle.Event.ON_STOP -> false
+                            else -> appInForeground
+                        }
+                    }
+                    lifecycle.addObserver(observer)
+                    onDispose {
+                        lifecycle.removeObserver(observer)
+                    }
+                }
                 val textToSpeech = remember(effectiveTtsEnginePackage, selectedTtsLanguage) {
                     ttsReady = false
                     val listener = TextToSpeech.OnInitListener { status ->
@@ -666,6 +690,23 @@ class MainActivity : ComponentActivity() {
                     if (text.isBlank()) return
                     val chunks = text.toVoiceOutputChunks(selectedTtsChunkSize)
                     if (chunks.isEmpty()) return
+                    val resumePoint = ttsResumePoints[messageId]
+                    val textHash = text.hashCode()
+                    val resumeChunkIndex = resumePoint
+                        ?.takeIf {
+                            it.textHash == textHash &&
+                                it.chunkSize == selectedTtsChunkSize &&
+                                it.chunkCount == chunks.size
+                        }
+                        ?.nextChunkIndex
+                        ?.coerceIn(0, chunks.size)
+                        ?: 0
+                    val playbackStartIndex = if (resumeChunkIndex in 1 until chunks.size) {
+                        resumeChunkIndex
+                    } else {
+                        if (resumePoint != null) ttsResumePoints = ttsResumePoints - messageId
+                        0
+                    }
                     if (!selectedTtsEngineAvailable) {
                         viewModel.showError("Supertonic TTS engine is not installed. Install it or switch Voice output engine back to System.")
                         return
@@ -724,6 +765,11 @@ class MainActivity : ComponentActivity() {
                                 index = index,
                                 preview = chunk.toTtsChunkPreview(),
                                 charCount = chunk.length,
+                                status = if (index < playbackStartIndex) {
+                                    TtsChunkStatus.Complete
+                                } else {
+                                    TtsChunkStatus.Pending
+                                },
                             )
                         },
                     )
@@ -800,7 +846,7 @@ class MainActivity : ComponentActivity() {
                                 delay(VoiceOutputSynthesisRetryDelayMs)
                             }
                         }
-                        ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
+                        ttsPlaybackState = ttsPlaybackState?.withChunkStatus(chunkId, TtsChunkStatus.Error)
                         return null
                     }
 
@@ -822,13 +868,20 @@ class MainActivity : ComponentActivity() {
                             if (ttsMediaPlayer === completedPlayer) ttsMediaPlayer = null
                             ttsPaused = false
                             ttsPlaybackState = ttsPlaybackState?.withChunkStatus(chunkId, TtsChunkStatus.Complete)
+                            val nextResumePoint = TtsResumePoint(
+                                textHash = textHash,
+                                chunkSize = selectedTtsChunkSize,
+                                chunkCount = chunks.size,
+                                nextChunkIndex = (index + 1).coerceAtMost(chunks.size),
+                            )
+                            ttsResumePoints = ttsResumePoints + (messageId to nextResumePoint)
                             done.complete(true)
                         }
                         player.setOnErrorListener { errorPlayer, _, _ ->
                             errorPlayer.release()
                             if (ttsMediaPlayer === errorPlayer) ttsMediaPlayer = null
                             ttsPaused = false
-                            ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
+                            ttsPlaybackState = ttsPlaybackState?.withChunkStatus(chunkId, TtsChunkStatus.Error)
                             done.complete(false)
                             true
                         }
@@ -842,7 +895,7 @@ class MainActivity : ComponentActivity() {
                                 player.release()
                                 if (ttsMediaPlayer === player) ttsMediaPlayer = null
                                 ttsPaused = false
-                                ttsPlaybackState = ttsPlaybackState?.withChunksFromStatus(chunkId, TtsChunkStatus.Error)
+                                ttsPlaybackState = ttsPlaybackState?.withChunkStatus(chunkId, TtsChunkStatus.Error)
                                 false
                             },
                         )
@@ -854,10 +907,20 @@ class MainActivity : ComponentActivity() {
                             CompletableDeferred<File?>()
                         }
                         var producerJob: Job? = null
+                        var silentChunkRecoveries = 0
                         fun isCurrentRun(): Boolean {
                             val currentPlayback = ttsPlaybackState
                             return currentPlayback?.messageId == messageId &&
                                 currentPlayback.runId == runId
+                        }
+                        fun canSilentlyRecoverChunk(): Boolean =
+                            silentChunkRecoveries < VoiceOutputSilentChunkRecoveryLimit
+                        fun noteSilentChunkRecovery(index: Int, reason: String) {
+                            silentChunkRecoveries += 1
+                            Log.w(
+                                TtsLogTag,
+                                "Retrying TTS chunk ${index + 1} of ${chunks.size} after $reason failure ($silentChunkRecoveries/$VoiceOutputSilentChunkRecoveryLimit)",
+                            )
                         }
                         suspend fun synthesizeAndStore(index: Int): Boolean {
                             val file = synthesizeChunk(index)
@@ -876,38 +939,57 @@ class MainActivity : ComponentActivity() {
                             producerJob = launch {
                                 for (index in fromIndex until chunks.size) {
                                     if (!isCurrentRun()) return@launch
-                                    if (!synthesizeAndStore(index)) return@launch
+                                    synthesizeAndStore(index)
                                 }
                             }
                         }
                         try {
-                            val preloadCount = chunks.size.coerceAtMost(selectedTtsStartBuffer)
-                            repeat(preloadCount) { index ->
+                            val preloadEndIndex = (playbackStartIndex + selectedTtsStartBuffer)
+                                .coerceAtMost(chunks.size)
+                            for (index in playbackStartIndex until preloadEndIndex) {
                                 if (!isCurrentRun()) return@launch
-                                if (!synthesizeAndStore(index)) {
-                                    speakingMessageId = null
-                                    viewModel.showError("Could not prepare text-to-speech chunk ${index + 1}.")
-                                    return@launch
-                                }
+                                synthesizeAndStore(index)
                             }
-                            startProducer(preloadCount)
+                            startProducer(preloadEndIndex)
                             speakingMessageId = messageId
-                            for (index in chunks.indices) {
+                            for (index in playbackStartIndex until chunks.size) {
                                 if (!isCurrentRun()) return@launch
-                                val file = preparedFileFor(index)
-                                if (file == null) {
-                                    speakingMessageId = null
-                                    viewModel.showError("Could not prepare text-to-speech chunk ${index + 1}.")
-                                    return@launch
+                                var file = preparedFileFor(index)
+                                while (file == null) {
+                                    if (!canSilentlyRecoverChunk()) {
+                                        speakingMessageId = null
+                                        viewModel.showError("Could not prepare text-to-speech chunk ${index + 1}.")
+                                        return@launch
+                                    }
+                                    noteSilentChunkRecovery(index, "prepare")
+                                    file = synthesizeChunk(index)
                                 }
-                                val played = playPreparedChunk(index, file)
-                                file.delete()
-                                if (!played) {
-                                    speakingMessageId = null
-                                    viewModel.showError("Could not play text-to-speech chunk ${index + 1}.")
-                                    return@launch
+                                var played = false
+                                while (!played) {
+                                    val fileToPlay = file ?: synthesizeChunk(index)
+                                    if (fileToPlay == null) {
+                                        if (!canSilentlyRecoverChunk()) {
+                                            speakingMessageId = null
+                                            viewModel.showError("Could not prepare text-to-speech chunk ${index + 1}.")
+                                            return@launch
+                                        }
+                                        noteSilentChunkRecovery(index, "prepare")
+                                        continue
+                                    }
+                                    played = playPreparedChunk(index, fileToPlay)
+                                    fileToPlay.delete()
+                                    file = null
+                                    if (!played) {
+                                        if (!canSilentlyRecoverChunk()) {
+                                            speakingMessageId = null
+                                            viewModel.showError("Could not play text-to-speech chunk ${index + 1}.")
+                                            return@launch
+                                        }
+                                        noteSilentChunkRecovery(index, "playback")
+                                    }
                                 }
                             }
+                            ttsResumePoints = ttsResumePoints - messageId
                             speakingMessageId = null
                         } catch (cancelled: CancellationException) {
                             preparedFiles.values.forEach { it.delete() }
@@ -1043,18 +1125,24 @@ class MainActivity : ComponentActivity() {
                     state.voiceOutputChunkSize,
                     state.voiceOutputStartBuffer,
                     state.autoReadAnswersEnabled,
+                    autoReadNextAssistantMessage,
                 ) {
                     val lastMessage = state.messages.lastOrNull()
                     if (
-                        state.voiceOutputEnabled &&
-                        state.autoReadAnswersEnabled &&
                         lastMessage != null &&
                         lastMessage.role == MessageRole.Assistant &&
                         !lastMessage.isStreaming &&
                         lastMessage.id != lastAutoSpokenMessageId
                     ) {
-                        lastAutoSpokenMessageId = lastMessage.id
-                        speakAssistantMessage(lastMessage.id, lastMessage.content)
+                        val shouldRead = state.voiceOutputEnabled &&
+                            (state.autoReadAnswersEnabled || autoReadNextAssistantMessage)
+                        if (shouldRead) {
+                            lastAutoSpokenMessageId = lastMessage.id
+                            speakAssistantMessage(lastMessage.id, lastMessage.content)
+                        }
+                        if (autoReadNextAssistantMessage) {
+                            autoReadNextAssistantMessage = false
+                        }
                     }
                 }
                 val contactsPermissionLauncher = rememberLauncherForActivityResult(
@@ -1069,7 +1157,7 @@ class MainActivity : ComponentActivity() {
                     ActivityResultContracts.RequestPermission(),
                 ) { granted ->
                     if (!granted) {
-                        viewModel.showError("Notification permission is required before Watch Job alerts can appear.")
+                        viewModel.showError("Notification permission is required before background reply and Watch Job alerts can appear.")
                     }
                 }
                 fun ensureWatchJobAccess() {
@@ -1078,6 +1166,19 @@ class MainActivity : ComponentActivity() {
                     }
                     if (!context.isNotificationListenerEnabled()) {
                         context.openNotificationListenerSettings(viewModel)
+                    }
+                }
+                fun sendChatMessage(autoTts: Boolean = false) {
+                    if (!context.hasPostNotificationsPermission()) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                    if (autoTts) {
+                        autoReadNextAssistantMessage = true
+                    }
+                    viewModel.sendInput { assistantMessage ->
+                        if (!appInForeground) {
+                            context.showChatResponseFinishedNotification(assistantMessage)
+                        }
                     }
                 }
                 val localFolderLauncher = rememberLauncherForActivityResult(
@@ -1115,9 +1216,10 @@ class MainActivity : ComponentActivity() {
                 LmStudioApp(
                     state = state,
                     onInputChange = viewModel::updateInput,
-                    onSend = viewModel::sendInput,
+                    onSend = { sendChatMessage(autoTts = false) },
+                    onSendAutoTts = { sendChatMessage(autoTts = true) },
                     onCancelSend = viewModel::cancelSending,
-                    onSuggestion = viewModel::sendPrompt,
+                    onSuggestion = { prompt -> viewModel.sendPrompt(prompt) },
                     onNewChat = viewModel::newChat,
                     onTemporaryChat = viewModel::temporaryChat,
                     onSelectChat = viewModel::selectChat,
@@ -1421,6 +1523,13 @@ data class TtsChunkProgress(
 ) {
     val railWeight: Float = charCount.coerceAtLeast(1).toFloat()
 }
+
+data class TtsResumePoint(
+    val textHash: Int,
+    val chunkSize: Int,
+    val chunkCount: Int,
+    val nextChunkIndex: Int,
+)
 
 data class TtsPlaybackState(
     val messageId: String,
@@ -1852,8 +1961,8 @@ class ChatViewModel(
         }
     }
 
-    fun sendInput() {
-        sendPrompt(_uiState.value.input)
+    fun sendInput(onResponseComplete: ((ChatMessage) -> Unit)? = null) {
+        sendPrompt(_uiState.value.input, onResponseComplete)
     }
 
     fun cancelSending() {
@@ -1897,7 +2006,10 @@ class ChatViewModel(
         }
     }
 
-    fun sendPrompt(prompt: String) {
+    fun sendPrompt(
+        prompt: String,
+        onResponseComplete: ((ChatMessage) -> Unit)? = null,
+    ) {
         val trimmedPrompt = prompt.trim()
         val state = _uiState.value
         val attachedImages = state.attachedImages
@@ -2153,13 +2265,21 @@ class ChatViewModel(
                         if (!answer.modelId.isNullOrBlank()) {
                             settingsStore.model = answer.modelId
                         }
+                        val finalAttachments = (answer.attachments + streamImageAttachments)
+                            .distinctBy { it.identityKey() }
                         updateAssistant(
                             content = answer.content,
                             isStreaming = false,
                             answer = answer,
-                            attachments = (answer.attachments + streamImageAttachments)
-                                .distinctBy { it.identityKey() },
+                            attachments = finalAttachments,
                             persist = true,
+                        )
+                        onResponseComplete?.invoke(
+                            assistantPlaceholder.copy(
+                                content = answer.content,
+                                attachments = finalAttachments,
+                                isStreaming = false,
+                            ),
                         )
                     },
                         onFailure = { throwable ->
@@ -2183,6 +2303,7 @@ class ChatViewModel(
                     if (result.exceptionOrNull()?.let { stopRequested || it.isChatCancellation() } == true) {
                         markCurrentResponseStopped()
                     } else {
+                        var completedAssistantMessage: ChatMessage? = null
                         _uiState.update { current ->
                             result.fold(
                                 onSuccess = { answer ->
@@ -2194,6 +2315,7 @@ class ChatViewModel(
                                         content = answer.content,
                                         attachments = answer.attachments,
                                     )
+                                    completedAssistantMessage = assistantMessage
                                     val responseSessions = current.sessions.map { session ->
                                         if (session.id == activeSessionId) {
                                             session.copy(
@@ -2224,6 +2346,7 @@ class ChatViewModel(
                                 },
                             )
                         }
+                        completedAssistantMessage?.let { onResponseComplete?.invoke(it) }
                     }
                 }
             } finally {
@@ -5164,6 +5287,47 @@ private fun Context.hasPostNotificationsPermission(): Boolean =
     Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
         ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
+private fun Context.showChatResponseFinishedNotification(message: ChatMessage) {
+    if (!hasPostNotificationsPermission()) return
+    val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    manager.createNotificationChannel(
+        NotificationChannel(
+            ChatResponseChannelId,
+            "Chat responses",
+            NotificationManager.IMPORTANCE_DEFAULT,
+        ).apply {
+            description = "Notifications when LMSMOB Chat finishes a response in the background."
+        },
+    )
+    val pendingIntent = PendingIntent.getActivity(
+        this,
+        ChatResponseNotificationId,
+        Intent(this, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+    val detail = message.content.chatResponseNotificationPreview()
+    val notification = Notification.Builder(this, ChatResponseChannelId)
+        .setSmallIcon(R.drawable.ml_logo)
+        .setContentTitle("Response ready")
+        .setContentText(detail)
+        .setStyle(Notification.BigTextStyle().bigText(detail))
+        .setContentIntent(pendingIntent)
+        .setAutoCancel(true)
+        .setCategory(Notification.CATEGORY_MESSAGE)
+        .setVisibility(Notification.VISIBILITY_PUBLIC)
+        .build()
+    manager.notify(message.id.hashCode(), notification)
+}
+
+private fun String.chatResponseNotificationPreview(): String =
+    speakableAnswerText()
+        .lineSequence()
+        .map { it.trim() }
+        .firstOrNull { it.isNotBlank() }
+        ?.take(180)
+        ?: "LM Studio finished responding."
+
 private fun Context.lookupContacts(query: String): String {
     if (!hasContactsPermission()) throw IOException("Contacts permission is not granted.")
     if (query.isBlank()) throw IOException("Contact search query is missing.")
@@ -7714,6 +7878,7 @@ fun LmStudioApp(
     state: ChatUiState,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
+    onSendAutoTts: () -> Unit,
     onCancelSend: () -> Unit,
     onSuggestion: (String) -> Unit,
     onNewChat: () -> Unit,
@@ -8000,6 +8165,7 @@ fun LmStudioApp(
                     reasoningEnabled = state.reasoningEnabled,
                     onInputChange = onInputChange,
                     onSend = onSend,
+                    onSendAutoTts = onSendAutoTts,
                     onCancelSend = onCancelSend,
                     onPickImage = onPickImage,
                     onTakePhoto = onTakePhoto,
@@ -11016,6 +11182,7 @@ private fun ChatComposer(
     reasoningEnabled: Boolean,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
+    onSendAutoTts: () -> Unit,
     onCancelSend: () -> Unit,
     onPickImage: () -> Unit,
     onTakePhoto: () -> Unit,
@@ -11031,10 +11198,16 @@ private fun ChatComposer(
     val canSend = (input.isNotBlank() || attachedImages.isNotEmpty() || attachedDocumentText != null) && !isSending
     var previewAttachment by remember { mutableStateOf<ChatImageAttachment?>(null) }
     var presetsExpanded by remember { mutableStateOf(false) }
+    var sendOptionsExpanded by remember { mutableStateOf(false) }
 
     LaunchedEffect(state.chatAppendPresets.isEmpty()) {
         if (state.chatAppendPresets.isEmpty()) {
             presetsExpanded = false
+        }
+    }
+    LaunchedEffect(canSend, isSending) {
+        if (!canSend || isSending) {
+            sendOptionsExpanded = false
         }
     }
 
@@ -11145,88 +11318,98 @@ private fun ChatComposer(
                 },
             )
 
-            Surface(
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.75f),
-                shape = RoundedCornerShape(26.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Row(
-                    modifier = Modifier.padding(start = 18.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
-                    verticalAlignment = Alignment.Bottom,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    BasicTextField(
-                        value = input,
-                        onValueChange = onInputChange,
+            Box(modifier = Modifier.fillMaxWidth()) {
+                if (sendOptionsExpanded && canSend && !isSending) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                        shape = RoundedCornerShape(50.dp),
+                        tonalElevation = 4.dp,
+                        shadowElevation = 6.dp,
                         modifier = Modifier
-                            .weight(1f)
-                            .heightIn(min = 32.dp, max = 132.dp)
-                            .padding(vertical = 6.dp),
-                        textStyle = TextStyle(
-                            color = MaterialTheme.colorScheme.onSurface,
-                            fontSize = 16.sp,
-                            lineHeight = 22.sp,
-                        ),
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                        keyboardActions = KeyboardActions(
-                            onSend = {
-                                if (canSend) {
-                                    focusManager.clearFocus()
-                                    onSend()
-                                }
+                            .align(Alignment.TopEnd)
+                            .padding(end = 5.dp)
+                            .offset(y = (-34).dp)
+                            .clickable {
+                                sendOptionsExpanded = false
+                                focusManager.clearFocus()
+                                onSendAutoTts()
                             },
-                        ),
-                        decorationBox = { innerTextField ->
-                            Box(
-                                modifier = Modifier.fillMaxWidth(),
-                                contentAlignment = Alignment.CenterStart,
-                            ) {
-                                if (input.isBlank()) {
-                                    Text(
-                                        text = "Message LM Studio",
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        style = MaterialTheme.typography.bodyLarge,
-                                    )
-                                }
-                                innerTextField()
-                            }
-                        },
-                    )
-
-                    IconButton(
-                        onClick = {
-                            focusManager.clearFocus()
-                            if (isSending) {
-                                onCancelSend()
-                            } else {
-                                onSend()
-                            }
-                        },
-                        enabled = isSending || canSend,
-                        colors = IconButtonDefaults.filledIconButtonColors(
-                            containerColor = if (isSending) {
-                                MaterialTheme.colorScheme.errorContainer
-                            } else {
-                                MaterialTheme.colorScheme.primary
-                            },
-                            contentColor = if (isSending) {
-                                MaterialTheme.colorScheme.onErrorContainer
-                            } else {
-                                MaterialTheme.colorScheme.onPrimary
-                            },
-                        ),
                     ) {
-                        if (isSending) {
-                            Icon(
-                                imageVector = Icons.Filled.Stop,
-                                contentDescription = "Stop response",
-                            )
-                        } else {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Send,
-                                contentDescription = "Send",
-                            )
-                        }
+                        Text(
+                            text = "AUTO TTS",
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.75f),
+                    shape = RoundedCornerShape(26.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(start = 18.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+                        verticalAlignment = Alignment.Bottom,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        BasicTextField(
+                            value = input,
+                            onValueChange = onInputChange,
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 32.dp, max = 132.dp)
+                                .padding(vertical = 6.dp),
+                            textStyle = TextStyle(
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontSize = 16.sp,
+                                lineHeight = 22.sp,
+                            ),
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                            keyboardActions = KeyboardActions(
+                                onSend = {
+                                    if (canSend) {
+                                        focusManager.clearFocus()
+                                        sendOptionsExpanded = false
+                                        onSend()
+                                    }
+                                },
+                            ),
+                            decorationBox = { innerTextField ->
+                                Box(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    contentAlignment = Alignment.CenterStart,
+                                ) {
+                                    if (input.isBlank()) {
+                                        Text(
+                                            text = "Message LM Studio",
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                        )
+                                    }
+                                    innerTextField()
+                                }
+                            },
+                        )
+
+                        ChatSendButton(
+                            isSending = isSending,
+                            canSend = canSend,
+                            onSend = {
+                                sendOptionsExpanded = false
+                                focusManager.clearFocus()
+                                onSend()
+                            },
+                            onCancelSend = {
+                                sendOptionsExpanded = false
+                                focusManager.clearFocus()
+                                onCancelSend()
+                            },
+                            onShowAutoTts = {
+                                sendOptionsExpanded = true
+                            },
+                        )
                     }
                 }
             }
@@ -11239,6 +11422,67 @@ private fun ChatComposer(
             attachment = attachment,
             onDismiss = { previewAttachment = null },
         )
+    }
+}
+
+@Composable
+private fun ChatSendButton(
+    isSending: Boolean,
+    canSend: Boolean,
+    onSend: () -> Unit,
+    onCancelSend: () -> Unit,
+    onShowAutoTts: () -> Unit,
+) {
+    val enabled = isSending || canSend
+    val containerColor = when {
+        isSending -> MaterialTheme.colorScheme.errorContainer
+        canSend -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.surfaceVariant
+    }
+    val contentColor = when {
+        isSending -> MaterialTheme.colorScheme.onErrorContainer
+        canSend -> MaterialTheme.colorScheme.onPrimary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+    }
+    Surface(
+        shape = CircleShape,
+        color = containerColor,
+        contentColor = contentColor,
+        modifier = Modifier
+            .size(48.dp)
+            .then(
+                if (enabled) {
+                    Modifier.pointerInput(isSending, canSend) {
+                        detectTapGestures(
+                            onLongPress = {
+                                if (!isSending && canSend) {
+                                    onShowAutoTts()
+                                }
+                            },
+                            onTap = {
+                                if (isSending) {
+                                    onCancelSend()
+                                } else if (canSend) {
+                                    onSend()
+                                }
+                            },
+                        )
+                    }
+                } else {
+                    Modifier
+                },
+            ),
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Icon(
+                imageVector = if (isSending) {
+                    Icons.Filled.Stop
+                } else {
+                    Icons.AutoMirrored.Filled.Send
+                },
+                contentDescription = if (isSending) "Stop response" else "Send",
+            )
+        }
     }
 }
 
